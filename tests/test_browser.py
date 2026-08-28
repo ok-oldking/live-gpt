@@ -117,7 +117,7 @@ class BrowserMonitorTests(unittest.TestCase):
             state,
         )
 
-        page.bring_to_front.assert_called_once_with()
+        page.bring_to_front.assert_not_called()
         composer.wait_for.assert_called_once_with(
             state="visible",
             timeout=5_000,
@@ -129,6 +129,114 @@ class BrowserMonitorTests(unittest.TestCase):
             [(True, "Hello from Live GPT", "Sent to ChatGPT")],
         )
         self.assertIsNotNone(state.active_response)
+
+    def test_dictation_press_clicks_chatgpt_microphone(self) -> None:
+        composer = Mock()
+        composer.evaluate.return_value = "Existing text"
+        microphone = Mock()
+        microphone.is_visible.return_value = True
+
+        page = Mock()
+        page.is_closed.return_value = False
+        page.url = "https://chatgpt.com/c/conversation"
+
+        def locate(selector: str) -> Mock:
+            if selector == "#prompt-textarea":
+                return Mock(first=composer)
+            return Mock(last=microphone)
+
+        page.locator.side_effect = locate
+        browser = Mock(contexts=[Mock(pages=[page])])
+        monitor = BrowserMonitor()
+        results: list[tuple[bool, str]] = []
+        monitor.dictation_started.connect(
+            lambda success, message: results.append((success, message))
+        )
+
+        monitor.request_start_dictation(str(id(page)))
+        monitor._process_dictation_requests(browser, FakePlaywrightError)
+
+        page.bring_to_front.assert_not_called()
+        microphone.click.assert_called_once_with(timeout=5_000)
+        self.assertEqual(
+            monitor._dictation_initial_text[str(id(page))],
+            "Existing text",
+        )
+        self.assertEqual(results, [(True, "Browser dictation is listening")])
+
+    def test_clear_request_empties_background_chatgpt_composer(self) -> None:
+        composer = Mock()
+        page = Mock()
+        page.is_closed.return_value = False
+        page.url = "https://chatgpt.com/c/conversation"
+        page.locator.return_value = Mock(first=composer)
+        browser = Mock(contexts=[Mock(pages=[page])])
+        monitor = BrowserMonitor()
+        results: list[tuple[bool, str]] = []
+        monitor.clear_finished.connect(
+            lambda success, message: results.append((success, message))
+        )
+
+        monitor.request_clear(str(id(page)))
+        monitor._process_clear_requests(browser, FakePlaywrightError)
+
+        composer.wait_for.assert_called_once_with(
+            state="visible",
+            timeout=5_000,
+        )
+        composer.fill.assert_called_once_with("")
+        page.bring_to_front.assert_not_called()
+        self.assertEqual(results, [(True, "Text cleared")])
+
+    def test_dictation_release_clicks_done_and_returns_composer_text(self) -> None:
+        composer = Mock()
+        composer.evaluate.return_value = "Dictated in ChatGPT"
+        done = Mock()
+        done.is_visible.return_value = True
+
+        page = Mock()
+        page.is_closed.return_value = False
+        page.url = "https://chatgpt.com/c/conversation"
+
+        unavailable = Mock()
+        unavailable.is_visible.return_value = False
+
+        def locate(selector: str) -> Mock:
+            if selector == "#prompt-textarea":
+                return Mock(first=composer)
+            if selector == 'button[aria-label="Submit dictation"]':
+                return Mock(last=done)
+            return Mock(last=unavailable)
+
+        page.locator.side_effect = locate
+        browser = Mock(contexts=[Mock(pages=[page])])
+        monitor = BrowserMonitor()
+        monitor._dictation_initial_text[str(id(page))] = ""
+        results: list[tuple[bool, str, str]] = []
+        monitor.dictation_finished.connect(
+            lambda success, text, message: results.append(
+                (success, text, message)
+            )
+        )
+
+        monitor.request_finish_dictation(str(id(page)))
+        monitor._process_dictation_requests(browser, FakePlaywrightError)
+
+        done.click.assert_called_once_with(timeout=5_000)
+        page.locator.assert_any_call(
+            'button[aria-label="Submit dictation"]'
+        )
+        page.wait_for_function.assert_called_once()
+        self.assertEqual(
+            results,
+            [
+                (
+                    True,
+                    "Dictated in ChatGPT",
+                    "Dictation copied from ChatGPT",
+                )
+            ],
+        )
 
     def test_completed_response_is_read_aloud(self) -> None:
         page = Mock()
@@ -219,7 +327,10 @@ class BrowserMonitorTests(unittest.TestCase):
         state.active_reading.quiet_since = time.monotonic() - 5
         monitor._poll_active_reading(state)
 
-        self.assertEqual(subtitles, ["First subtitle.", "Second subtitle."])
+        self.assertEqual(
+            subtitles,
+            ["First subtitle.\nSecond subtitle.", "Second subtitle."],
+        )
         self.assertEqual(finished, [(True, "Read aloud complete")])
         self.assertIsNone(state.active_reading)
 
@@ -242,15 +353,23 @@ class BrowserMonitorTests(unittest.TestCase):
         self.assertEqual(subtitles, [])
         self.assertIsNotNone(state.active_reading)
 
-    def test_subtitle_uses_two_near_full_width_lines(self) -> None:
+    def test_subtitle_rolls_forward_one_line_at_a_time(self) -> None:
         text = " ".join(f"word{index}" for index in range(40)) + "."
 
-        subtitles = BrowserMonitor._subtitle_segments(text)
+        lines = BrowserMonitor._subtitle_segments(text)
+        weights = [max(len(line), 12) for line in lines]
+        first = BrowserMonitor._subtitle_at_progress(lines, 0.0)
+        after_first_line = BrowserMonitor._subtitle_at_progress(
+            lines,
+            (weights[0] + 0.1) / sum(weights),
+        )
 
-        first_lines = subtitles[0].splitlines()
+        first_lines = first.splitlines()
+        next_lines = after_first_line.splitlines()
         self.assertEqual(len(first_lines), 2)
-        self.assertGreater(len(first_lines[0]), 60)
-        self.assertGreater(len(first_lines[1]), 60)
+        self.assertEqual(len(next_lines), 2)
+        self.assertEqual(first_lines[1], next_lines[0])
+        self.assertLessEqual(max(map(len, lines)), 54)
 
     def test_read_aloud_uses_more_actions_menu(self) -> None:
         turn = Mock()

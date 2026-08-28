@@ -11,7 +11,11 @@ from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
-from live_gpt.app import TranscriptEditor, TrayController  # noqa: E402
+from live_gpt.app import (  # noqa: E402
+    OverlayWindow,
+    TranscriptEditor,
+    TrayController,
+)
 
 
 class TranscriptEditorTests(unittest.TestCase):
@@ -54,24 +58,104 @@ class TranscriptEditorTests(unittest.TestCase):
         self.assertEqual(sent, [])
         self.assertEqual(self.editor.toPlainText(), "First line\n")
 
-    def test_reading_subtitle_restores_full_response(self) -> None:
+    def test_reading_restores_full_response(self) -> None:
         full_response = "First sentence. Second sentence. Final sentence."
         self.editor.begin_response()
         self.editor.update_response(full_response)
 
         self.editor.begin_reading()
-        self.editor.update_reading_subtitle("Second sentence.")
 
-        self.assertEqual(self.editor.toPlainText(), "Second sentence.")
-        self.assertTrue(self.editor.property("readingMode"))
+        self.assertEqual(self.editor.toPlainText(), "")
 
         self.editor.finish_reading()
 
         self.assertEqual(self.editor.toPlainText(), full_response)
-        self.assertFalse(self.editor.property("readingMode"))
 
 
 class TrayControllerBrowserTests(unittest.TestCase):
+    def test_clear_queues_selected_browser_composer(self) -> None:
+        controller = TrayController.__new__(TrayController)
+        controller.window = Mock()
+        controller.browser_monitor = Mock()
+        controller.selected_chatgpt_tab_id = "selected-tab"
+
+        controller._handle_clear_requested()
+
+        controller.browser_monitor.request_clear.assert_called_once_with(
+            "selected-tab"
+        )
+        controller.window.status_label.setText.assert_called_once_with(
+            "Clearing ChatGPT input…"
+        )
+
+    def test_reading_uses_two_dedicated_subtitle_labels(self) -> None:
+        window = OverlayWindow()
+        try:
+            window.transcript_area.begin_response()
+            window.transcript_area.update_response("The complete response")
+
+            window.begin_reading("Preparing Read aloud…")
+            window.set_reading_subtitle("Current subtitle\nNext subtitle")
+
+            self.assertTrue(window.transcript_area.isHidden())
+            self.assertFalse(window.subtitle_panel.isHidden())
+            self.assertEqual(
+                window.subtitle_line_one.text(),
+                "Current subtitle",
+            )
+            self.assertEqual(
+                window.subtitle_line_two.text(),
+                "Next subtitle",
+            )
+
+            window.finish_reading(True, "Read aloud complete")
+
+            self.assertFalse(window.transcript_area.isHidden())
+            self.assertTrue(window.subtitle_panel.isHidden())
+            self.assertEqual(
+                window.transcript_area.toPlainText(),
+                "The complete response",
+            )
+        finally:
+            window.close()
+
+    def test_microphone_press_and_release_queue_browser_dictation(self) -> None:
+        controller = TrayController.__new__(TrayController)
+        controller.window = Mock()
+        controller.window.transcript_area.is_showing_response = False
+        controller.browser_monitor = Mock()
+        controller.selected_chatgpt_tab_id = "selected-tab"
+        controller.dictation_tab_id = None
+
+        controller.start_dictation()
+        controller.finish_dictation()
+
+        controller.browser_monitor.request_start_dictation.assert_called_once_with(
+            "selected-tab"
+        )
+        controller.browser_monitor.request_finish_dictation.assert_called_once_with(
+            "selected-tab"
+        )
+        self.assertIsNone(controller.dictation_tab_id)
+
+    def test_finished_dictation_populates_app_input(self) -> None:
+        controller = TrayController.__new__(TrayController)
+        controller.window = Mock()
+
+        controller._on_dictation_finished(
+            True,
+            "Text recognized by ChatGPT",
+            "Dictation copied from ChatGPT",
+        )
+
+        controller.window.set_transcript.assert_called_once_with(
+            "Text recognized by ChatGPT"
+        )
+        controller.window.set_microphone_state.assert_called_once_with(
+            "saved",
+            "Dictation copied from ChatGPT",
+        )
+
     @patch("live_gpt.app.open_remote_debugging_settings")
     @patch("live_gpt.app.discover_cdp_endpoint")
     def test_live_endpoint_retries_without_opening_settings(

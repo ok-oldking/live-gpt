@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from queue import Empty, Queue
@@ -85,6 +86,17 @@ class _SendRequest:
     text: str
 
 
+@dataclass(frozen=True)
+class _DictationRequest:
+    action: str
+    tab_id: str
+
+
+@dataclass(frozen=True)
+class _ClearRequest:
+    tab_id: str
+
+
 @dataclass
 class _ActiveResponse:
     page: Any
@@ -128,23 +140,49 @@ class BrowserMonitor(QThread):
     reading_started = Signal(str)
     reading_changed = Signal(str)
     reading_finished = Signal(bool, str)
+    dictation_started = Signal(bool, str)
+    dictation_finished = Signal(bool, str, str)
+    clear_finished = Signal(bool, str)
 
     def __init__(self) -> None:
         super().__init__()
         self._stop_requested = False
         self._retry_connection_requested = False
         self._send_requests: Queue[_SendRequest] = Queue()
+        self._dictation_requests: Queue[_DictationRequest] = Queue()
+        self._clear_requests: Queue[_ClearRequest] = Queue()
+        self._wake_event = threading.Event()
+        self._dictation_initial_text: dict[str, str] = {}
         self._last_status = ""
 
     def request_stop(self) -> None:
         self._stop_requested = True
+        self._wake_event.set()
 
     def request_retry_connection(self) -> None:
         self._retry_connection_requested = True
+        self._wake_event.set()
 
     def request_send(self, tab_id: str, text: str) -> None:
         """Queue text for the selected ChatGPT page on the worker thread."""
         self._send_requests.put(_SendRequest(tab_id=tab_id, text=text))
+        self._wake_event.set()
+
+    def request_start_dictation(self, tab_id: str) -> None:
+        self._dictation_requests.put(
+            _DictationRequest(action="start", tab_id=tab_id)
+        )
+        self._wake_event.set()
+
+    def request_finish_dictation(self, tab_id: str) -> None:
+        self._dictation_requests.put(
+            _DictationRequest(action="finish", tab_id=tab_id)
+        )
+        self._wake_event.set()
+
+    def request_clear(self, tab_id: str) -> None:
+        self._clear_requests.put(_ClearRequest(tab_id=tab_id))
+        self._wake_event.set()
 
     def run(self) -> None:
         try:
@@ -181,6 +219,14 @@ class BrowserMonitor(QThread):
                     if self._is_connected(state.browser)
                     else None
                 )
+                self._process_dictation_requests(
+                    connected_browser,
+                    PlaywrightError,
+                )
+                self._process_clear_requests(
+                    connected_browser,
+                    PlaywrightError,
+                )
                 self._process_send_requests(
                     connected_browser,
                     PlaywrightError,
@@ -192,7 +238,8 @@ class BrowserMonitor(QThread):
                     state.active_response is not None
                     or state.active_reading is not None
                 )
-                self.msleep(250 if is_busy else 1_500)
+                self._wake_event.wait(0.25 if is_busy else 1.5)
+                self._wake_event.clear()
 
         logger.info("Browser monitor stopped")
 
@@ -310,6 +357,114 @@ class BrowserMonitor(QThread):
         if state.last_tabs != []:
             state.last_tabs = []
             self.tabs_changed.emit([])
+
+    def _process_dictation_requests(
+        self,
+        browser: Any | None,
+        playwright_error: type[Exception],
+    ) -> None:
+        while True:
+            try:
+                request = self._dictation_requests.get_nowait()
+            except Empty:
+                return
+
+            if browser is None:
+                self._emit_dictation_failure(
+                    request.action,
+                    "Browser is not connected",
+                )
+                continue
+
+            page = self._find_chatgpt_page(
+                browser,
+                request.tab_id,
+                playwright_error,
+            )
+            if page is None:
+                self._emit_dictation_failure(
+                    request.action,
+                    "Selected ChatGPT window is no longer available",
+                )
+                continue
+
+            try:
+                if request.action == "start":
+                    initial_text = self._read_composer_text(page)
+                    self._start_browser_dictation(page)
+                    self._dictation_initial_text[request.tab_id] = initial_text
+                    self.dictation_started.emit(
+                        True,
+                        "Browser dictation is listening",
+                    )
+                else:
+                    initial_text = self._dictation_initial_text.pop(
+                        request.tab_id,
+                        "",
+                    )
+                    text = self._finish_browser_dictation(
+                        page,
+                        initial_text,
+                    )
+                    self.dictation_finished.emit(
+                        True,
+                        text,
+                        "Dictation copied from ChatGPT",
+                    )
+            except Exception as error:
+                logger.error(
+                    f"Unable to {request.action} browser dictation",
+                    error,
+                )
+                self._emit_dictation_failure(
+                    request.action,
+                    f"Could not {request.action} browser dictation: {error}",
+                )
+
+    def _emit_dictation_failure(self, action: str, message: str) -> None:
+        if action == "start":
+            self.dictation_started.emit(False, message)
+        else:
+            self.dictation_finished.emit(False, "", message)
+
+    def _process_clear_requests(
+        self,
+        browser: Any | None,
+        playwright_error: type[Exception],
+    ) -> None:
+        while True:
+            try:
+                request = self._clear_requests.get_nowait()
+            except Empty:
+                return
+
+            if browser is None:
+                self.clear_finished.emit(False, "Browser is not connected")
+                continue
+
+            page = self._find_chatgpt_page(
+                browser,
+                request.tab_id,
+                playwright_error,
+            )
+            if page is None:
+                self.clear_finished.emit(
+                    False,
+                    "Selected ChatGPT window is no longer available",
+                )
+                continue
+
+            try:
+                self._clear_chatgpt_composer(page)
+            except Exception as error:
+                logger.error("Unable to clear ChatGPT input", error)
+                self.clear_finished.emit(
+                    False,
+                    f"Could not clear ChatGPT input: {error}",
+                )
+                continue
+
+            self.clear_finished.emit(True, "Text cleared")
 
     def _process_send_requests(
         self,
@@ -567,7 +722,6 @@ class BrowserMonitor(QThread):
 
     @staticmethod
     def _send_to_chatgpt_page(page: Any, text: str) -> None:
-        page.bring_to_front()
         composer = page.locator("#prompt-textarea").first
         composer.wait_for(state="visible", timeout=5_000)
         composer.fill(text)
@@ -577,6 +731,110 @@ class BrowserMonitor(QThread):
         ).first
         send_button.wait_for(state="visible", timeout=5_000)
         send_button.click(timeout=5_000)
+
+    @staticmethod
+    def _clear_chatgpt_composer(page: Any) -> None:
+        composer = page.locator("#prompt-textarea").first
+        composer.wait_for(state="visible", timeout=5_000)
+        composer.fill("")
+
+    @staticmethod
+    def _read_composer_text(page: Any) -> str:
+        composer = page.locator("#prompt-textarea").first
+        composer.wait_for(state="visible", timeout=5_000)
+        text = composer.evaluate(
+            """
+            element => {
+                if (typeof element.value === 'string') {
+                    return element.value;
+                }
+                return element.innerText || element.textContent || '';
+            }
+            """
+        )
+        return str(text or "").strip()
+
+    @classmethod
+    def _start_browser_dictation(cls, page: Any) -> None:
+        button = cls._first_visible_locator(
+            page,
+            (
+                'button[aria-label="Start dictation"]',
+                'button[data-testid="composer-speech-button"]',
+                'button[data-testid="dictation-button"]',
+            ),
+            timeout=5_000,
+        )
+        if button is None:
+            raise RuntimeError("ChatGPT's dictation microphone was not found")
+        button.click(timeout=5_000)
+
+    @classmethod
+    def _finish_browser_dictation(
+        cls,
+        page: Any,
+        initial_text: str,
+    ) -> str:
+        button = cls._first_visible_locator(
+            page,
+            (
+                'button[aria-label="Submit dictation"]',
+                'button[aria-label="Done"]',
+                'button[aria-label="Stop dictation"]',
+                'button[aria-label="Finish dictation"]',
+                'button[aria-label="Stop recording"]',
+                'button[data-testid="composer-dictation-done-button"]',
+                'button[data-testid="dictation-done-button"]',
+                'button:text-is("Done")',
+            ),
+            timeout=15_000,
+        )
+        if button is None:
+            raise RuntimeError("ChatGPT's dictation Done button was not found")
+        button.click(timeout=5_000)
+
+        page.wait_for_function(
+            """
+            previous => {
+                const composer = document.querySelector('#prompt-textarea');
+                if (!composer) return false;
+                const text = typeof composer.value === 'string'
+                    ? composer.value
+                    : (composer.innerText || composer.textContent || '');
+                return text.trim().length > 0 && text.trim() !== previous;
+            }
+            """,
+            arg=initial_text.strip(),
+            timeout=20_000,
+        )
+        text = cls._read_composer_text(page)
+        stable_polls = 0
+        deadline = time.monotonic() + 3.0
+        while stable_polls < 2 and time.monotonic() < deadline:
+            page.wait_for_timeout(200)
+            current_text = cls._read_composer_text(page)
+            if current_text == text:
+                stable_polls += 1
+            else:
+                text = current_text
+                stable_polls = 0
+        return text
+
+    @classmethod
+    def _first_visible_locator(
+        cls,
+        page: Any,
+        selectors: tuple[str, ...],
+        timeout: int,
+    ) -> Any | None:
+        deadline = time.monotonic() + timeout / 1_000
+        while time.monotonic() < deadline:
+            for selector in selectors:
+                locator = page.locator(selector).last
+                if cls._locator_is_visible(locator):
+                    return locator
+            page.wait_for_timeout(100)
+        return None
 
     @staticmethod
     def _assistant_turn_marker(page: Any) -> str | None:
@@ -710,65 +968,32 @@ class BrowserMonitor(QThread):
     @staticmethod
     def _subtitle_segments(
         text: str,
-        target_length: int = 164,
+        target_length: int = 54,
     ) -> tuple[str, ...]:
         normalized = re.sub(r"\s+", " ", text).strip()
         if not normalized:
             return ()
 
-        sentences = re.split(r"(?<=[.!?。！？])\s+", normalized)
-        segments: list[str] = []
+        units: list[str] = []
+        for word in normalized.split():
+            while len(word) > target_length:
+                units.append(word[:target_length])
+                word = word[target_length:]
+            if word:
+                units.append(word)
+
+        lines: list[str] = []
         current = ""
-        for sentence in sentences:
-            words = sentence.split()
-            if not words:
-                continue
-            pieces: list[str] = []
-            piece = ""
-            for word in words:
-                candidate = f"{piece} {word}".strip()
-                if piece and len(candidate) > target_length:
-                    pieces.append(piece)
-                    piece = word
-                else:
-                    piece = candidate
-            if piece:
-                pieces.append(piece)
-
-            for piece in pieces:
-                candidate = f"{current} {piece}".strip()
-                if current and len(candidate) > target_length:
-                    segments.append(current)
-                    current = piece
-                else:
-                    current = candidate
+        for unit in units:
+            candidate = f"{current} {unit}".strip()
+            if current and len(candidate) > target_length:
+                lines.append(current)
+                current = unit
+            else:
+                current = candidate
         if current:
-            segments.append(current)
-        return tuple(
-            BrowserMonitor._balance_subtitle_lines(segment)
-            for segment in segments
-        )
-
-    @staticmethod
-    def _balance_subtitle_lines(subtitle: str) -> str:
-        if len(subtitle) <= 52:
-            return subtitle
-        words = subtitle.split()
-        if len(words) < 2:
-            midpoint = len(subtitle) // 2
-            return f"{subtitle[:midpoint]}\n{subtitle[midpoint:]}"
-
-        best_index = min(
-            range(1, len(words)),
-            key=lambda index: abs(
-                len(" ".join(words[:index]))
-                - len(" ".join(words[index:]))
-            ),
-        )
-        return (
-            f"{' '.join(words[:best_index])}\n"
-            f"{' '.join(words[best_index:])}"
-        )
+            lines.append(current)
+        return tuple(lines)
 
     @staticmethod
     def _subtitle_at_progress(
@@ -777,13 +1002,13 @@ class BrowserMonitor(QThread):
     ) -> str:
         if not subtitles:
             return ""
-        weights = [max(len(subtitle), 12) for subtitle in subtitles]
+        weights = [max(len(line), 12) for line in subtitles]
         target = min(max(fraction, 0.0), 1.0) * sum(weights)
         cumulative = 0
-        for subtitle, weight in zip(subtitles, weights, strict=True):
+        for index, weight in enumerate(weights):
             cumulative += weight
             if target < cumulative:
-                return subtitle
+                return "\n".join(subtitles[index:index + 2])
         return subtitles[-1]
 
     @staticmethod

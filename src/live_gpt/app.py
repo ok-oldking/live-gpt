@@ -4,14 +4,12 @@ import os
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QPoint, QSize, QTimer, Signal, Qt
+from PySide6.QtCore import QPoint, QSize, Signal, Qt
 from PySide6.QtGui import (
     QAction,
-    QActionGroup,
     QCloseEvent,
     QIcon,
     QMouseEvent,
-    QTextBlockFormat,
     QTextCursor,
 )
 from PySide6.QtWidgets import (
@@ -30,25 +28,17 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .audio import (
-    AudioDevice,
-    AudioRecorder,
-    list_playback_devices,
-    list_recording_devices,
-)
 from .browser import (
     BrowserMonitor,
     discover_cdp_endpoint,
     open_remote_debugging_settings,
 )
 from .logger import Logger, config_logger, shutdown_logger
-from .speech import SpeechTranscriber
 
 
 ASSET_DIRECTORY = Path(__file__).resolve().parent / "assets"
 ICON_PATH = ASSET_DIRECTORY / "app-icon.ico"
 MICROPHONE_ICON_PATH = ASSET_DIRECTORY / "microphone.svg"
-SETTINGS_ICON_PATH = ASSET_DIRECTORY / "settings.svg"
 HIDE_ICON_PATH = ASSET_DIRECTORY / "hide.svg"
 EXIT_ICON_PATH = ASSET_DIRECTORY / "exit.svg"
 SEND_ICON_PATH = ASSET_DIRECTORY / "send.svg"
@@ -126,7 +116,6 @@ class TranscriptEditor(QPlainTextEdit):
         self._response_mode = True
         self._response_complete = False
         self._full_response_text = ""
-        self._set_reading_style(False)
         self.setReadOnly(True)
         self.clear()
         self._sync_action_visibility()
@@ -149,39 +138,16 @@ class TranscriptEditor(QPlainTextEdit):
         self._response_mode = True
         self._response_complete = False
         self.setReadOnly(True)
-        self._set_reading_style(True)
         self.clear()
 
-    def update_reading_subtitle(self, subtitle: str) -> None:
-        if self.toPlainText() == subtitle:
-            return
-        self.setPlainText(subtitle)
-        cursor = self.textCursor()
-        cursor.select(QTextCursor.SelectionType.Document)
-        block_format = QTextBlockFormat()
-        block_format.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        cursor.mergeBlockFormat(block_format)
-        cursor.clearSelection()
-        cursor.movePosition(QTextCursor.MoveOperation.Start)
-        self.setTextCursor(cursor)
-
     def finish_reading(self) -> None:
-        self._set_reading_style(False)
         self.setPlainText(self._full_response_text)
         self._response_complete = True
-
-    def _set_reading_style(self, reading: bool) -> None:
-        self.setProperty("readingMode", reading)
-        style = self.style()
-        style.unpolish(self)
-        style.polish(self)
-        self.update()
 
     def begin_composing(self) -> None:
         self._response_mode = False
         self._response_complete = False
         self._full_response_text = ""
-        self._set_reading_style(False)
         self.setReadOnly(False)
         self.clear()
         self._sync_action_visibility()
@@ -196,9 +162,9 @@ class TranscriptEditor(QPlainTextEdit):
 class OverlayWindow(QMainWindow):
     exit_requested = Signal()
     hide_requested = Signal()
-    settings_requested = Signal()
-    recording_requested = Signal()
-    recording_stop_requested = Signal()
+    dictation_requested = Signal()
+    dictation_finish_requested = Signal()
+    clear_requested = Signal()
     send_requested = Signal(str)
     open_remote_debugging_requested = Signal()
     chatgpt_tab_selected = Signal(str)
@@ -258,16 +224,6 @@ class OverlayWindow(QMainWindow):
         title_layout.addWidget(self.remote_debugging_button)
         title_layout.addStretch()
 
-        self.settings_button = QPushButton()
-        self.settings_button.setObjectName("settingsButton")
-        self._configure_icon_button(
-            self.settings_button,
-            SETTINGS_ICON_PATH,
-            "Settings",
-        )
-        self.settings_button.clicked.connect(self.settings_requested.emit)
-        title_layout.addWidget(self.settings_button)
-
         self.hide_button = QPushButton()
         self.hide_button.setObjectName("hideButton")
         self._configure_icon_button(
@@ -288,15 +244,36 @@ class OverlayWindow(QMainWindow):
         self.exit_button.clicked.connect(self.exit_requested.emit)
         title_layout.addWidget(self.exit_button)
 
-        self.status_label = QLabel("Preparing speech model...")
+        self.status_label = QLabel("Looking for ChatGPT windows…")
         self.status_label.setObjectName("overlayStatus")
         self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self.transcript_area = TranscriptEditor()
         self.transcript_area.setObjectName("transcriptArea")
         self.transcript_area.setPlaceholderText(
-            "Recognized speech will appear here in real time"
+            "Hold the microphone to dictate through ChatGPT"
         )
+
+        self.subtitle_panel = QFrame()
+        self.subtitle_panel.setObjectName("subtitlePanel")
+        subtitle_layout = QVBoxLayout(self.subtitle_panel)
+        subtitle_layout.setContentsMargins(16, 8, 16, 8)
+        subtitle_layout.setSpacing(0)
+        self.subtitle_line_one = QLabel()
+        self.subtitle_line_one.setObjectName("subtitleLine")
+        self.subtitle_line_one.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        )
+        self.subtitle_line_one.setWordWrap(False)
+        self.subtitle_line_two = QLabel()
+        self.subtitle_line_two.setObjectName("subtitleLine")
+        self.subtitle_line_two.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        )
+        self.subtitle_line_two.setWordWrap(False)
+        subtitle_layout.addWidget(self.subtitle_line_one, 1)
+        subtitle_layout.addWidget(self.subtitle_line_two, 1)
+        self.subtitle_panel.hide()
 
         self.microphone_button = QPushButton()
         self.microphone_button.setObjectName("microphoneButton")
@@ -304,26 +281,27 @@ class OverlayWindow(QMainWindow):
         self.microphone_button.setIcon(QIcon(str(MICROPHONE_ICON_PATH)))
         self.microphone_button.setIconSize(QSize(26, 26))
         self.microphone_button.setFixedSize(56, 56)
-        self.microphone_button.setAccessibleName("Hold to record")
+        self.microphone_button.setAccessibleName("Hold to dictate")
         self.microphone_button.setEnabled(False)
         self.microphone_button.setToolTip(
-            "Press and hold to record from the default microphone"
+            "Press and hold to use ChatGPT dictation"
         )
-        self.microphone_button.pressed.connect(self.recording_requested.emit)
+        self.microphone_button.pressed.connect(self.dictation_requested.emit)
         self.microphone_button.released.connect(
-            self.recording_stop_requested.emit
+            self.dictation_finish_requested.emit
         )
 
         self.send_button = self.transcript_area.send_button
         self.send_button.clicked.connect(self._request_send)
 
         self.clear_button = self.transcript_area.clear_button
-        self.clear_button.clicked.connect(self.clear_transcript)
+        self.clear_button.clicked.connect(self._request_clear)
 
         panel_layout.addLayout(title_layout)
         recording_layout = QHBoxLayout()
         recording_layout.setSpacing(16)
         recording_layout.addWidget(self.transcript_area, 1)
+        recording_layout.addWidget(self.subtitle_panel, 1)
 
         recording_layout.addWidget(
             self.microphone_button,
@@ -380,8 +358,15 @@ class OverlayWindow(QMainWindow):
                 font-size: 15px;
                 selection-background-color: rgba(76, 201, 240, 130);
             }
-            QPlainTextEdit#transcriptArea[readingMode="true"] {
-                padding: 14px;
+            QFrame#subtitlePanel {
+                background-color: rgba(5, 10, 28, 145);
+                border: 1px solid rgba(130, 165, 230, 75);
+                border-radius: 10px;
+            }
+            QLabel#subtitleLine {
+                color: #f5f7ff;
+                background: transparent;
+                border: none;
                 font-size: 22px;
                 font-weight: 600;
             }
@@ -396,7 +381,6 @@ class OverlayWindow(QMainWindow):
             QPushButton:hover {
                 background-color: rgba(76, 201, 240, 150);
             }
-            QPushButton#settingsButton,
             QPushButton#hideButton,
             QPushButton#exitButton {
                 min-width: 36px;
@@ -473,15 +457,16 @@ class OverlayWindow(QMainWindow):
         message: str | None = None,
     ) -> None:
         labels = {
-            "idle": "Press and hold the microphone to record",
-            "recording": "Recording... release to stop",
-            "saved": message or "Recording saved",
-            "error": "Microphone unavailable",
+            "idle": "Press and hold the microphone to dictate",
+            "recording": "ChatGPT is listening… release to finish",
+            "saved": "Dictation copied from ChatGPT",
+            "error": "Browser dictation unavailable",
         }
-        self.status_label.setText(labels[state])
+        label = message or labels[state]
+        self.status_label.setText(label)
         self.microphone_button.setProperty("recordingState", state)
-        self.microphone_button.setAccessibleName(labels[state])
-        self.microphone_button.setToolTip(message or labels[state])
+        self.microphone_button.setAccessibleName(label)
+        self.microphone_button.setToolTip(label)
         style = self.microphone_button.style()
         style.unpolish(self.microphone_button)
         style.polish(self.microphone_button)
@@ -501,6 +486,7 @@ class OverlayWindow(QMainWindow):
             self.chatgpt_tab_combo.addItem("No ChatGPT windows")
             self.chatgpt_tab_combo.setEnabled(False)
             self.remote_debugging_button.setVisible(True)
+            self.microphone_button.setEnabled(False)
         else:
             for tab in tabs:
                 self.chatgpt_tab_combo.addItem(tab["title"], tab["id"])
@@ -512,6 +498,7 @@ class OverlayWindow(QMainWindow):
                 )
             self.chatgpt_tab_combo.setEnabled(True)
             self.remote_debugging_button.setVisible(False)
+            self.microphone_button.setEnabled(True)
             selected_index = self.chatgpt_tab_combo.findData(selected_id)
             self.chatgpt_tab_combo.setCurrentIndex(
                 selected_index if selected_index >= 0 else 0
@@ -554,16 +541,24 @@ class OverlayWindow(QMainWindow):
 
     def begin_reading(self, message: str) -> None:
         self.transcript_area.begin_reading()
+        self.subtitle_line_one.clear()
+        self.subtitle_line_two.clear()
+        self.transcript_area.hide()
+        self.subtitle_panel.show()
         self.microphone_button.setVisible(False)
         self.status_label.setText(message)
 
     def set_reading_subtitle(self, subtitle: str) -> None:
-        self.transcript_area.update_reading_subtitle(subtitle)
+        lines = subtitle.splitlines()
+        self.subtitle_line_one.setText(lines[0] if lines else "")
+        self.subtitle_line_two.setText(lines[1] if len(lines) > 1 else "")
         self.status_label.setText("Reading aloud…")
 
     def finish_reading(self, success: bool, message: str) -> None:
         del success
         self.transcript_area.finish_reading()
+        self.subtitle_panel.hide()
+        self.transcript_area.show()
         self.microphone_button.setVisible(True)
         self.status_label.setText(message)
 
@@ -575,6 +570,10 @@ class OverlayWindow(QMainWindow):
     def clear_transcript(self) -> None:
         self.transcript_area.clear()
         self.status_label.setText("Text cleared")
+
+    def _request_clear(self) -> None:
+        self.clear_transcript()
+        self.clear_requested.emit()
 
     def _request_send(self) -> None:
         text = self.transcript_area.toPlainText().strip()
@@ -624,32 +623,22 @@ class OverlayWindow(QMainWindow):
 
 
 class TrayController:
-    def __init__(
-        self,
-        application: QApplication,
-        recorder: AudioRecorder | None = None,
-        transcriber: SpeechTranscriber | None = None,
-    ) -> None:
+    def __init__(self, application: QApplication) -> None:
         logger.debug("Creating tray controller")
         self.application = application
-        self.recorder = recorder or AudioRecorder()
-        self.transcriber = transcriber or SpeechTranscriber()
-        self.playback_device: int | None = None
-        self.recording_devices: list[AudioDevice] = []
-        self.playback_devices: list[AudioDevice] = []
         self.icon = QIcon(str(ICON_PATH))
         self.window = OverlayWindow()
         self.browser_monitor = BrowserMonitor()
         self.selected_chatgpt_tab_id: str | None = None
-        self.settings_menu = QMenu(self.window)
+        self.dictation_tab_id: str | None = None
 
         self.application.setWindowIcon(self.icon)
         self.window.setWindowIcon(self.icon)
         self.window.exit_requested.connect(self._exit_application)
         self.window.hide_requested.connect(self.hide_window)
-        self.window.settings_requested.connect(self.show_settings)
-        self.window.recording_requested.connect(self.start_recording)
-        self.window.recording_stop_requested.connect(self.stop_recording)
+        self.window.dictation_requested.connect(self.start_dictation)
+        self.window.dictation_finish_requested.connect(self.finish_dictation)
+        self.window.clear_requested.connect(self._handle_clear_requested)
         self.window.send_requested.connect(self._handle_send_requested)
         self.window.open_remote_debugging_requested.connect(
             self._open_remote_debugging_settings
@@ -679,20 +668,16 @@ class TrayController:
         self.browser_monitor.reading_finished.connect(
             self.window.finish_reading
         )
-        self.transcriber.transcript_changed.connect(self.window.set_transcript)
-        self.transcriber.ready_changed.connect(self._on_transcriber_ready)
-        self.transcriber.status_changed.connect(self._on_transcriber_status)
-        self.transcriber.failed.connect(self._on_transcriber_error)
-        self.recorder.audio_chunk_callback = self.transcriber.feed_audio
-        self.recorder.recording_started_callback = (
-            self.transcriber.start_session
+        self.browser_monitor.dictation_started.connect(
+            self._on_dictation_started
         )
-        self.recorder.recording_stopped_callback = (
-            self.transcriber.finish_session
+        self.browser_monitor.dictation_finished.connect(
+            self._on_dictation_finished
+        )
+        self.browser_monitor.clear_finished.connect(
+            self._on_clear_finished
         )
 
-        self._populate_settings_menu()
-        self.transcriber.prepare()
         self.browser_monitor.start()
 
         self.menu = QMenu()
@@ -726,214 +711,58 @@ class TrayController:
         logger.info("Hiding the overlay window")
         self.window.hide()
 
-    def show_settings(self) -> None:
-        logger.info("Showing audio device settings")
-        self._populate_settings_menu()
-        button = self.window.settings_button
-        menu_size = self.settings_menu.sizeHint()
-        menu_position = button.mapToGlobal(
-            QPoint(
-                button.width() - menu_size.width(),
-                -menu_size.height() - 6,
+    def start_dictation(self) -> None:
+        tab_id = self.selected_chatgpt_tab_id
+        if tab_id is None:
+            self.window.set_microphone_state(
+                "error",
+                "Select a ChatGPT window first",
             )
-        )
-        self.settings_menu.popup(menu_position)
-
-    def _populate_settings_menu(self) -> None:
-        self.settings_menu.clear()
-
-        try:
-            recording_devices = list_recording_devices()
-            playback_devices = list_playback_devices()
-        except Exception as error:
-            logger.error("Unable to list audio devices", error)
-            unavailable = self.settings_menu.addAction(
-                "Audio devices unavailable"
-            )
-            unavailable.setEnabled(False)
             return
 
-        self.recording_devices = recording_devices
-        self.playback_devices = playback_devices
-
-        if self.recorder.input_device is None:
-            default_recording_device = next(
-                (
-                    device
-                    for device in recording_devices
-                    if device.is_system_default
-                ),
-                None,
-            )
-            if default_recording_device is not None:
-                self.recorder.input_device = default_recording_device.index
-                logger.info(
-                    "Using system default recording device "
-                    f"index={default_recording_device.index} "
-                    f"name={default_recording_device.name!r}"
-                )
-
-        if self.playback_device is None:
-            default_playback_device = next(
-                (
-                    device
-                    for device in playback_devices
-                    if device.is_system_default
-                ),
-                None,
-            )
-            if default_playback_device is not None:
-                self.playback_device = default_playback_device.index
-                logger.info(
-                    "Using system default playback device "
-                    f"index={default_playback_device.index} "
-                    f"name={default_playback_device.name!r}"
-                )
-
-        recording_menu = self.settings_menu.addMenu("Recording device")
-        self._add_device_actions(
-            recording_menu,
-            recording_devices,
-            self.recorder.input_device,
-            self._select_recording_device,
-        )
-
-        playback_menu = self.settings_menu.addMenu("Playback device")
-        self._add_device_actions(
-            playback_menu,
-            playback_devices,
-            self.playback_device,
-            self._select_playback_device,
-        )
-
-    def _add_device_actions(
-        self,
-        menu: QMenu,
-        devices: list[AudioDevice],
-        selected_device: int | None,
-        selection_handler,
-    ) -> None:
-        action_group = QActionGroup(menu)
-        action_group.setExclusive(True)
-
-        for device in devices:
-            default_label = " (System Default)" if device.is_system_default else ""
-            label = f"{device.name}{default_label}".replace("&", "&&")
-            action = menu.addAction(label)
-            action.setCheckable(True)
-            action.setChecked(device.index == selected_device)
-            action.triggered.connect(
-                lambda checked, index=device.index: (
-                    checked and selection_handler(index)
-                )
-            )
-            action_group.addAction(action)
-
-        if not devices:
-            unavailable = menu.addAction("No devices found")
-            unavailable.setEnabled(False)
-
-    def _select_recording_device(self, device_index: int | None) -> None:
-        if self.recorder.is_recording:
-            logger.warning("Cannot change recording device while recording")
-            return
-        self.recorder.input_device = device_index
-        logger.info(
-            "Selected recording device "
-            f"{self._describe_device(self.recording_devices, device_index)}"
-        )
-
-    def _select_playback_device(self, device_index: int | None) -> None:
-        self.playback_device = device_index
-        logger.info(
-            "Selected playback device "
-            f"{self._describe_device(self.playback_devices, device_index)}"
-        )
-
-    @staticmethod
-    def _describe_device(
-        devices: list[AudioDevice],
-        device_index: int | None,
-    ) -> str:
-        device = next(
-            (device for device in devices if device.index == device_index),
-            None,
-        )
-        if device is None:
-            return f"index={device_index} name=<unknown>"
-        return f"index={device.index} name={device.name!r}"
-
-    def start_recording(self) -> None:
-        selected_device = self._describe_device(
-            self.recording_devices,
-            self.recorder.input_device,
-        )
-        logger.info(f"Microphone button pressed selected_device={selected_device}")
-        if not self.transcriber.is_ready:
-            logger.warning("Recording ignored because speech model is not ready")
-            self.window.status_label.setText("Speech model is still preparing...")
-            return
+        logger.info(f"Starting ChatGPT dictation tab_id={tab_id!r}")
         if self.window.transcript_area.is_showing_response:
             self.window.transcript_area.begin_composing()
-        try:
-            self.recorder.start()
-        except Exception as error:
-            self.transcriber.finish_session()
-            logger.error(
-                "Unable to start microphone recording "
-                f"selected_device={selected_device}",
-                error,
-            )
-            self.window.set_microphone_state("error", str(error))
-            QTimer.singleShot(2_000, self._reset_microphone_state)
-            return
-
-        self.window.set_microphone_state("recording")
-
-    def stop_recording(self) -> None:
-        if not self.recorder.is_recording:
-            return
-
-        logger.info("Microphone button released")
-        try:
-            result = self.recorder.stop()
-        except Exception as error:
-            self.transcriber.finish_session()
-            logger.error("Unable to stop microphone recording", error)
-            self.window.set_microphone_state("error", str(error))
-            QTimer.singleShot(2_000, self._reset_microphone_state)
-            return
-
-        if result is None:
-            self.window.set_microphone_state("error", "No audio was captured")
-            QTimer.singleShot(2_000, self._reset_microphone_state)
-            return
-
+        self.dictation_tab_id = tab_id
         self.window.set_microphone_state(
-            "saved",
-            f"Saved {result.duration_seconds:.1f}s recording",
+            "recording",
+            "Starting ChatGPT dictation…",
         )
-        self.window.microphone_button.setToolTip(str(result.path))
-        QTimer.singleShot(1_500, self._reset_microphone_state)
+        self.browser_monitor.request_start_dictation(tab_id)
 
-    def _reset_microphone_state(self) -> None:
-        if not self.recorder.is_recording:
-            self.window.set_microphone_state("idle")
+    def finish_dictation(self) -> None:
+        tab_id = self.dictation_tab_id
+        if tab_id is None:
+            return
 
-    def _on_transcriber_ready(self, ready: bool) -> None:
-        self.window.microphone_button.setEnabled(ready)
-        if ready:
-            self.window.set_microphone_state("idle")
+        self.dictation_tab_id = None
+        logger.info(f"Finishing ChatGPT dictation tab_id={tab_id!r}")
+        self.window.set_microphone_state(
+            "recording",
+            "Finishing ChatGPT dictation…",
+        )
+        self.browser_monitor.request_finish_dictation(tab_id)
 
-    def _on_transcriber_status(self, message: str) -> None:
-        if not self.recorder.is_recording:
-            self.window.status_label.setText(message)
+    def _on_dictation_started(self, success: bool, message: str) -> None:
+        if success:
+            self.window.set_microphone_state("recording", message)
+            return
 
-    def _on_transcriber_error(self, message: str) -> None:
-        logger.error(f"Speech recognition error: {message}")
-        self.window.microphone_button.setEnabled(False)
+        self.dictation_tab_id = None
         self.window.set_microphone_state("error", message)
-        self.window.status_label.setText("Speech recognition unavailable")
+
+    def _on_dictation_finished(
+        self,
+        success: bool,
+        text: str,
+        message: str,
+    ) -> None:
+        if not success:
+            self.window.set_microphone_state("error", message)
+            return
+
+        self.window.set_transcript(text)
+        self.window.set_microphone_state("saved", message)
 
     def _handle_send_requested(self, text: str) -> None:
         tab_id = self.selected_chatgpt_tab_id
@@ -948,6 +777,22 @@ class TrayController:
         self.window.send_button.setEnabled(False)
         self.window.status_label.setText("Sending to ChatGPT…")
         self.browser_monitor.request_send(tab_id, text)
+
+    def _handle_clear_requested(self) -> None:
+        tab_id = self.selected_chatgpt_tab_id
+        if tab_id is None:
+            self.window.status_label.setText(
+                "Text cleared locally; no ChatGPT window selected"
+            )
+            return
+
+        logger.info(f"Clearing ChatGPT input tab_id={tab_id!r}")
+        self.window.status_label.setText("Clearing ChatGPT input…")
+        self.browser_monitor.request_clear(tab_id)
+
+    def _on_clear_finished(self, success: bool, message: str) -> None:
+        del success
+        self.window.status_label.setText(message)
 
     def _select_chatgpt_tab(self, tab_id: str) -> None:
         self.selected_chatgpt_tab_id = tab_id
@@ -988,12 +833,9 @@ class TrayController:
     def _exit_application(self, checked: bool = False) -> None:
         del checked
         logger.info("Exit requested")
-        if self.recorder.is_recording:
-            self.stop_recording()
         self.browser_monitor.request_stop()
         if not self.browser_monitor.wait(17_000):
             logger.warning("Browser monitor did not stop before application exit")
-        self.transcriber.close()
         self.application.quit()
 
 

@@ -10,31 +10,29 @@ live-gpt
 
 The app starts as a translucent, always-on-top overlay centered above the
 bottom of the screen and also places an icon in the Windows system tray. Drag
-any non-button area to reposition it. Use the overlay's **Settings**, **Hide**,
-and **Exit** buttons, or double-click the tray icon to restore a hidden overlay.
-Press and hold the microphone button to capture audio; releasing it saves a
-WAV file in the `recordings` directory.
-Use **Settings** to choose the recording and playback devices, or leave either
-one on the first device marked **(System Default)**.
-Recording prefers 16 kHz and automatically falls back to the selected
-microphone's native sample rate when required by Windows.
+any non-button area to reposition it. Use the overlay's **Hide** and **Exit**
+buttons, or double-click the tray icon to restore a hidden overlay.
 
-Live transcription uses the small bilingual Chinese-English streaming
-Zipformer model from sherpa-onnx. The model is downloaded into `models/` on
-first launch, then reused offline. Partial and final recognition results appear
-in the overlay while the microphone button is held.
+Press and hold the microphone button to start ChatGPT's browser dictation
+through Playwright. Releasing it clicks ChatGPT's **Done** control, waits for
+the dictated text to appear in ChatGPT's composer, and copies that text into
+the Live GPT input. The ChatGPT tab owns microphone capture and speech
+recognition, so the browser may ask for microphone permission the first time.
+Live GPT does not record audio locally or download a speech-recognition model.
 
 The recognized text remains editable. When the editor contains text, its
 paper-plane button sends the current text through Playwright to the selected
 ChatGPT tab, and its **X** button clears the editor. The app fills ChatGPT's
 composer and clicks its send button, then clears the local text after ChatGPT
-accepts it. While ChatGPT responds, the editor switches to a read-only response
-view, its action buttons and the microphone are hidden, and the status label
-shows activities such as web searching when ChatGPT exposes them in the turn.
+accepts it. The **X** button also clears the selected ChatGPT tab's composer.
+These browser interactions run without intentionally bringing its window to
+the foreground. While ChatGPT responds, the editor switches to a read-only
+response view, its action buttons and the microphone are hidden, and the status
+label shows activities such as web searching when ChatGPT exposes them in the turn.
 The reply streams into the former input area. After the completed reply becomes
 stable, Live GPT clicks ChatGPT's **Read aloud** button. During playback, the
-response area becomes a large, full-width two-line subtitle view that follows
-the browser media's playback progress. If ChatGPT
+response area becomes a large, full-width two-label subtitle view that follows
+the browser media's playback progress and rolls forward one line at a time. If ChatGPT
 does not expose its media element, subtitle timing falls back to an estimate.
 The full response and microphone return when playback finishes. Click the
 completed reply or press the microphone to start another prompt. Press
