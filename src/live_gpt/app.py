@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import sys
 import os
+import sys
 from pathlib import Path
 
 from PySide6.QtCore import QPoint, QSize, QTimer, Signal, Qt
@@ -15,6 +15,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -28,14 +29,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .logger import Logger, config_logger, shutdown_logger
-from .speech import SpeechTranscriber
 from .audio import (
     AudioDevice,
     AudioRecorder,
     list_playback_devices,
     list_recording_devices,
 )
+from .browser import BrowserMonitor, open_remote_debugging_settings
+from .logger import Logger, config_logger, shutdown_logger
+from .speech import SpeechTranscriber
 
 
 ASSET_DIRECTORY = Path(__file__).resolve().parent / "assets"
@@ -99,13 +101,15 @@ class OverlayWindow(QMainWindow):
     recording_requested = Signal()
     recording_stop_requested = Signal()
     send_requested = Signal(str)
+    open_remote_debugging_requested = Signal()
+    chatgpt_tab_selected = Signal(str)
 
     def __init__(self) -> None:
         super().__init__()
         logger.debug("Creating overlay window")
         self._drag_offset: QPoint | None = None
         self.setWindowTitle("Live GPT")
-        self.setFixedSize(520, 240)
+        self.setFixedSize(760, 240)
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
@@ -128,6 +132,31 @@ class OverlayWindow(QMainWindow):
         title = QLabel("Live GPT")
         title.setObjectName("overlayTitle")
         title_layout.addWidget(title)
+
+        self.chatgpt_tab_combo = QComboBox()
+        self.chatgpt_tab_combo.setObjectName("chatgptTabCombo")
+        self.chatgpt_tab_combo.setAccessibleName("ChatGPT window")
+        self.chatgpt_tab_combo.setMinimumWidth(220)
+        self.chatgpt_tab_combo.setMaximumWidth(300)
+        self.chatgpt_tab_combo.addItem("Looking for ChatGPT windows…")
+        self.chatgpt_tab_combo.setEnabled(False)
+        self.chatgpt_tab_combo.currentIndexChanged.connect(
+            self._chatgpt_tab_changed
+        )
+        title_layout.addWidget(self.chatgpt_tab_combo, 1)
+
+        self.remote_debugging_button = QPushButton("Enable Debugging")
+        self.remote_debugging_button.setObjectName("remoteDebuggingButton")
+        self.remote_debugging_button.setAccessibleName(
+            "Open remote debugging settings"
+        )
+        self.remote_debugging_button.setToolTip(
+            "Open the browser's remote debugging settings"
+        )
+        self.remote_debugging_button.clicked.connect(
+            self.open_remote_debugging_requested.emit
+        )
+        title_layout.addWidget(self.remote_debugging_button)
         title_layout.addStretch()
 
         self.settings_button = QPushButton()
@@ -227,6 +256,22 @@ class OverlayWindow(QMainWindow):
                 color: rgba(228, 235, 255, 210);
                 font-size: 13px;
             }
+            QComboBox#chatgptTabCombo {
+                min-height: 34px;
+                padding: 0 10px;
+                color: #f5f7ff;
+                background-color: rgba(5, 10, 28, 145);
+                border: 1px solid rgba(130, 165, 230, 75);
+                border-radius: 8px;
+            }
+            QComboBox#chatgptTabCombo:disabled {
+                color: rgba(228, 235, 255, 155);
+            }
+            QComboBox#chatgptTabCombo QAbstractItemView {
+                color: #f5f7ff;
+                background-color: rgb(18, 28, 58);
+                selection-background-color: rgb(38, 112, 145);
+            }
             QPlainTextEdit#transcriptArea {
                 color: #f5f7ff;
                 background-color: rgba(5, 10, 28, 145);
@@ -256,6 +301,10 @@ class OverlayWindow(QMainWindow):
                 max-height: 36px;
                 padding: 0;
                 border-radius: 9px;
+            }
+            QPushButton#remoteDebuggingButton {
+                min-height: 34px;
+                max-height: 34px;
             }
             QPushButton#sendButton,
             QPushButton#clearButton {
@@ -340,6 +389,43 @@ class OverlayWindow(QMainWindow):
         cursor.movePosition(QTextCursor.MoveOperation.End)
         self.transcript_area.setTextCursor(cursor)
 
+    def set_chatgpt_tabs(self, tabs: list[dict[str, str]]) -> None:
+        selected_id = self.chatgpt_tab_combo.currentData()
+        self.chatgpt_tab_combo.blockSignals(True)
+        self.chatgpt_tab_combo.clear()
+        if not tabs:
+            self.chatgpt_tab_combo.addItem("No ChatGPT windows")
+            self.chatgpt_tab_combo.setEnabled(False)
+            self.remote_debugging_button.setVisible(True)
+        else:
+            for tab in tabs:
+                self.chatgpt_tab_combo.addItem(tab["title"], tab["id"])
+                index = self.chatgpt_tab_combo.count() - 1
+                self.chatgpt_tab_combo.setItemData(
+                    index,
+                    tab["url"],
+                    Qt.ItemDataRole.ToolTipRole,
+                )
+            self.chatgpt_tab_combo.setEnabled(True)
+            self.remote_debugging_button.setVisible(False)
+            selected_index = self.chatgpt_tab_combo.findData(selected_id)
+            self.chatgpt_tab_combo.setCurrentIndex(
+                selected_index if selected_index >= 0 else 0
+            )
+        self.chatgpt_tab_combo.blockSignals(False)
+        if tabs:
+            self._chatgpt_tab_changed(self.chatgpt_tab_combo.currentIndex())
+
+    def set_browser_status(self, status: str) -> None:
+        self.chatgpt_tab_combo.setToolTip(status)
+        if not self.chatgpt_tab_combo.isEnabled():
+            self.chatgpt_tab_combo.setItemText(0, status)
+
+    def _chatgpt_tab_changed(self, index: int) -> None:
+        tab_id = self.chatgpt_tab_combo.itemData(index)
+        if tab_id:
+            self.chatgpt_tab_selected.emit(str(tab_id))
+
     def clear_transcript(self) -> None:
         self.transcript_area.clear()
         self.status_label.setText("Text cleared")
@@ -360,7 +446,7 @@ class OverlayWindow(QMainWindow):
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton:
             clicked_widget = self.childAt(event.position().toPoint())
-            if not isinstance(clicked_widget, QPushButton):
+            if not isinstance(clicked_widget, (QPushButton, QComboBox)):
                 self._drag_offset = (
                     event.globalPosition().toPoint()
                     - self.frameGeometry().topLeft()
@@ -407,6 +493,8 @@ class TrayController:
         self.playback_devices: list[AudioDevice] = []
         self.icon = QIcon(str(ICON_PATH))
         self.window = OverlayWindow()
+        self.browser_monitor = BrowserMonitor()
+        self.selected_chatgpt_tab_id: str | None = None
         self.settings_menu = QMenu(self.window)
 
         self.application.setWindowIcon(self.icon)
@@ -417,6 +505,16 @@ class TrayController:
         self.window.recording_requested.connect(self.start_recording)
         self.window.recording_stop_requested.connect(self.stop_recording)
         self.window.send_requested.connect(self._handle_send_requested)
+        self.window.open_remote_debugging_requested.connect(
+            self._open_remote_debugging_settings
+        )
+        self.window.chatgpt_tab_selected.connect(
+            self._select_chatgpt_tab
+        )
+        self.browser_monitor.tabs_changed.connect(self.window.set_chatgpt_tabs)
+        self.browser_monitor.status_changed.connect(
+            self.window.set_browser_status
+        )
         self.transcriber.transcript_changed.connect(self.window.set_transcript)
         self.transcriber.ready_changed.connect(self._on_transcriber_ready)
         self.transcriber.status_changed.connect(self._on_transcriber_status)
@@ -431,6 +529,7 @@ class TrayController:
 
         self._populate_settings_menu()
         self.transcriber.prepare()
+        self.browser_monitor.start()
 
         self.menu = QMenu()
         self.exit_action = QAction("Exit", self.menu)
@@ -674,6 +773,22 @@ class TrayController:
         logger.info(f"Send requested text={text!r}")
         self.window.status_label.setText("Send requested")
 
+    def _select_chatgpt_tab(self, tab_id: str) -> None:
+        self.selected_chatgpt_tab_id = tab_id
+        logger.info(f"Selected ChatGPT tab id={tab_id}")
+
+    def _open_remote_debugging_settings(self) -> None:
+        try:
+            settings_url = open_remote_debugging_settings()
+        except Exception as error:
+            logger.error("Unable to open remote debugging settings", error)
+            self.window.set_browser_status(str(error))
+            return
+        self.window.set_browser_status(
+            f"Remote debugging enabled at {settings_url}"
+        )
+        self.browser_monitor.request_retry_connection()
+
     def _position_overlay(self) -> None:
         screen = self.application.primaryScreen()
         if screen is None:
@@ -691,6 +806,9 @@ class TrayController:
         logger.info("Exit requested")
         if self.recorder.is_recording:
             self.stop_recording()
+        self.browser_monitor.request_stop()
+        if not self.browser_monitor.wait(17_000):
+            logger.warning("Browser monitor did not stop before application exit")
         self.transcriber.close()
         self.application.quit()
 
