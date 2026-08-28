@@ -130,6 +130,12 @@ celerybeat.pid
 # Environments
 .env
 .venv
+
+# Runtime microphone captures
+recordings/
+
+# Downloaded sherpa-onnx speech-recognition models
+models/
 env/
 venv/
 ENV/

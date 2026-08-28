@@ -1,0 +1,724 @@
+from __future__ import annotations
+
+import sys
+import os
+from pathlib import Path
+
+from PySide6.QtCore import QPoint, QSize, QTimer, Signal, Qt
+from PySide6.QtGui import (
+    QAction,
+    QActionGroup,
+    QCloseEvent,
+    QIcon,
+    QMouseEvent,
+    QTextCursor,
+)
+from PySide6.QtWidgets import (
+    QApplication,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QMainWindow,
+    QMenu,
+    QMessageBox,
+    QPlainTextEdit,
+    QPushButton,
+    QSystemTrayIcon,
+    QVBoxLayout,
+    QWidget,
+)
+
+from .logger import Logger, config_logger, shutdown_logger
+from .speech import SpeechTranscriber
+from .audio import (
+    AudioDevice,
+    AudioRecorder,
+    list_playback_devices,
+    list_recording_devices,
+)
+
+
+ASSET_DIRECTORY = Path(__file__).resolve().parent / "assets"
+ICON_PATH = ASSET_DIRECTORY / "app-icon.ico"
+MICROPHONE_ICON_PATH = ASSET_DIRECTORY / "microphone.svg"
+SETTINGS_ICON_PATH = ASSET_DIRECTORY / "settings.svg"
+HIDE_ICON_PATH = ASSET_DIRECTORY / "hide.svg"
+EXIT_ICON_PATH = ASSET_DIRECTORY / "exit.svg"
+SEND_ICON_PATH = ASSET_DIRECTORY / "send.svg"
+logger = Logger.get_logger(__name__)
+
+
+class TranscriptEditor(QPlainTextEdit):
+    """Editable transcript with contextual actions inside the input."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+
+        self.clear_button = QPushButton(self)
+        self.clear_button.setObjectName("clearButton")
+        self.clear_button.setIcon(QIcon(str(EXIT_ICON_PATH)))
+        self.clear_button.setIconSize(QSize(16, 16))
+        self.clear_button.setFixedSize(32, 32)
+        self.clear_button.setAccessibleName("Delete text")
+        self.clear_button.setToolTip("Delete text")
+
+        self.send_button = QPushButton(self)
+        self.send_button.setObjectName("sendButton")
+        self.send_button.setIcon(QIcon(str(SEND_ICON_PATH)))
+        self.send_button.setIconSize(QSize(16, 16))
+        self.send_button.setFixedSize(32, 32)
+        self.send_button.setAccessibleName("Send")
+        self.send_button.setToolTip("Send")
+
+        self.textChanged.connect(self._sync_action_visibility)
+        self._sync_action_visibility()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        margin = 8
+        spacing = 6
+        y = self.height() - self.send_button.height() - margin
+        send_x = self.width() - self.send_button.width() - margin
+        clear_x = send_x - self.clear_button.width() - spacing
+        self.clear_button.move(clear_x, y)
+        self.send_button.move(send_x, y)
+        self.clear_button.raise_()
+        self.send_button.raise_()
+
+    def _sync_action_visibility(self) -> None:
+        has_text = bool(self.toPlainText().strip())
+        self.clear_button.setVisible(has_text)
+        self.send_button.setVisible(has_text)
+        self.setViewportMargins(0, 0, 76 if has_text else 0, 0)
+
+
+class OverlayWindow(QMainWindow):
+    exit_requested = Signal()
+    hide_requested = Signal()
+    settings_requested = Signal()
+    recording_requested = Signal()
+    recording_stop_requested = Signal()
+    send_requested = Signal(str)
+
+    def __init__(self) -> None:
+        super().__init__()
+        logger.debug("Creating overlay window")
+        self._drag_offset: QPoint | None = None
+        self.setWindowTitle("Live GPT")
+        self.setFixedSize(520, 240)
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+
+        container = QWidget(self)
+        container.setObjectName("overlayContainer")
+        container_layout = QVBoxLayout(container)
+        container_layout.setContentsMargins(12, 12, 12, 12)
+
+        panel = QFrame(container)
+        panel.setObjectName("overlayPanel")
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(20, 16, 16, 18)
+        panel_layout.setSpacing(14)
+
+        title_layout = QHBoxLayout()
+        title = QLabel("Live GPT")
+        title.setObjectName("overlayTitle")
+        title_layout.addWidget(title)
+        title_layout.addStretch()
+
+        self.settings_button = QPushButton()
+        self.settings_button.setObjectName("settingsButton")
+        self._configure_icon_button(
+            self.settings_button,
+            SETTINGS_ICON_PATH,
+            "Settings",
+        )
+        self.settings_button.clicked.connect(self.settings_requested.emit)
+        title_layout.addWidget(self.settings_button)
+
+        self.hide_button = QPushButton()
+        self.hide_button.setObjectName("hideButton")
+        self._configure_icon_button(
+            self.hide_button,
+            HIDE_ICON_PATH,
+            "Hide",
+        )
+        self.hide_button.clicked.connect(self.hide_requested.emit)
+        title_layout.addWidget(self.hide_button)
+
+        self.exit_button = QPushButton()
+        self.exit_button.setObjectName("exitButton")
+        self._configure_icon_button(
+            self.exit_button,
+            EXIT_ICON_PATH,
+            "Exit",
+        )
+        self.exit_button.clicked.connect(self.exit_requested.emit)
+        title_layout.addWidget(self.exit_button)
+
+        self.status_label = QLabel("Preparing speech model...")
+        self.status_label.setObjectName("overlayStatus")
+        self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.transcript_area = TranscriptEditor()
+        self.transcript_area.setObjectName("transcriptArea")
+        self.transcript_area.setPlaceholderText(
+            "Recognized speech will appear here in real time"
+        )
+
+        self.microphone_button = QPushButton()
+        self.microphone_button.setObjectName("microphoneButton")
+        self.microphone_button.setProperty("recordingState", "idle")
+        self.microphone_button.setIcon(QIcon(str(MICROPHONE_ICON_PATH)))
+        self.microphone_button.setIconSize(QSize(26, 26))
+        self.microphone_button.setFixedSize(56, 56)
+        self.microphone_button.setAccessibleName("Hold to record")
+        self.microphone_button.setEnabled(False)
+        self.microphone_button.setToolTip(
+            "Press and hold to record from the default microphone"
+        )
+        self.microphone_button.pressed.connect(self.recording_requested.emit)
+        self.microphone_button.released.connect(
+            self.recording_stop_requested.emit
+        )
+
+        self.send_button = self.transcript_area.send_button
+        self.send_button.clicked.connect(self._request_send)
+
+        self.clear_button = self.transcript_area.clear_button
+        self.clear_button.clicked.connect(self.clear_transcript)
+
+        panel_layout.addLayout(title_layout)
+        recording_layout = QHBoxLayout()
+        recording_layout.setSpacing(16)
+        recording_layout.addWidget(self.transcript_area, 1)
+
+        recording_layout.addWidget(
+            self.microphone_button,
+            0,
+            Qt.AlignmentFlag.AlignVCenter,
+        )
+
+        panel_layout.addWidget(self.status_label)
+        panel_layout.addLayout(recording_layout, 1)
+        container_layout.addWidget(panel)
+        self.setCentralWidget(container)
+
+        self.setStyleSheet(
+            """
+            QWidget#overlayContainer {
+                background: transparent;
+            }
+            QFrame#overlayPanel {
+                background-color: rgba(12, 20, 48, 224);
+                border: 1px solid rgba(66, 220, 255, 150);
+                border-radius: 18px;
+            }
+            QLabel#overlayTitle {
+                color: #f5f7ff;
+                font-size: 20px;
+                font-weight: 700;
+            }
+            QLabel#overlayStatus {
+                color: rgba(228, 235, 255, 210);
+                font-size: 13px;
+            }
+            QPlainTextEdit#transcriptArea {
+                color: #f5f7ff;
+                background-color: rgba(5, 10, 28, 145);
+                border: 1px solid rgba(130, 165, 230, 75);
+                border-radius: 10px;
+                padding: 8px;
+                font-size: 15px;
+                selection-background-color: rgba(76, 201, 240, 130);
+            }
+            QPushButton {
+                min-height: 30px;
+                padding: 0 12px;
+                color: #f5f7ff;
+                background-color: rgba(70, 88, 140, 125);
+                border: 1px solid rgba(170, 195, 255, 90);
+                border-radius: 8px;
+            }
+            QPushButton:hover {
+                background-color: rgba(76, 201, 240, 150);
+            }
+            QPushButton#settingsButton,
+            QPushButton#hideButton,
+            QPushButton#exitButton {
+                min-width: 36px;
+                max-width: 36px;
+                min-height: 36px;
+                max-height: 36px;
+                padding: 0;
+                border-radius: 9px;
+            }
+            QPushButton#sendButton,
+            QPushButton#clearButton {
+                min-width: 32px;
+                max-width: 32px;
+                min-height: 32px;
+                max-height: 32px;
+                padding: 0;
+                border-radius: 8px;
+            }
+            QPushButton#exitButton:hover {
+                background-color: rgba(239, 68, 88, 190);
+            }
+            QPushButton#sendButton {
+                background-color: rgba(35, 155, 116, 190);
+            }
+            QPushButton#sendButton:hover {
+                background-color: rgba(40, 190, 140, 220);
+            }
+            QPushButton#clearButton:hover {
+                background-color: rgba(210, 116, 34, 190);
+            }
+            QPushButton#microphoneButton {
+                min-width: 56px;
+                max-width: 56px;
+                min-height: 56px;
+                max-height: 56px;
+                padding: 0;
+                background-color: rgba(48, 72, 128, 175);
+                border-radius: 28px;
+            }
+            QPushButton#microphoneButton[recordingState="recording"] {
+                color: white;
+                background-color: rgba(220, 48, 72, 220);
+                border-color: rgba(255, 150, 165, 220);
+            }
+            QPushButton#microphoneButton[recordingState="saved"] {
+                background-color: rgba(34, 160, 105, 210);
+                border-color: rgba(130, 255, 195, 190);
+            }
+            QPushButton#microphoneButton[recordingState="error"] {
+                background-color: rgba(210, 116, 34, 215);
+                border-color: rgba(255, 205, 130, 200);
+            }
+            """
+        )
+
+    @staticmethod
+    def _configure_icon_button(
+        button: QPushButton,
+        icon_path: Path,
+        accessible_name: str,
+    ) -> None:
+        button.setIcon(QIcon(str(icon_path)))
+        button.setIconSize(QSize(18, 18))
+        button.setAccessibleName(accessible_name)
+        button.setToolTip(accessible_name)
+
+    def set_microphone_state(
+        self,
+        state: str,
+        message: str | None = None,
+    ) -> None:
+        labels = {
+            "idle": "Press and hold the microphone to record",
+            "recording": "Recording... release to stop",
+            "saved": message or "Recording saved",
+            "error": "Microphone unavailable",
+        }
+        self.status_label.setText(labels[state])
+        self.microphone_button.setProperty("recordingState", state)
+        self.microphone_button.setAccessibleName(labels[state])
+        self.microphone_button.setToolTip(message or labels[state])
+        style = self.microphone_button.style()
+        style.unpolish(self.microphone_button)
+        style.polish(self.microphone_button)
+        self.microphone_button.update()
+
+    def set_transcript(self, text: str) -> None:
+        self.transcript_area.setPlainText(text)
+        cursor = self.transcript_area.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self.transcript_area.setTextCursor(cursor)
+
+    def clear_transcript(self) -> None:
+        self.transcript_area.clear()
+        self.status_label.setText("Text cleared")
+
+    def _request_send(self) -> None:
+        text = self.transcript_area.toPlainText().strip()
+        if not text:
+            self.status_label.setText("Enter text before sending")
+            return
+        self.send_requested.emit(text)
+
+    def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
+        """Keep the application running in the system tray."""
+        logger.info("Window closed; hiding it in the system tray")
+        self.hide()
+        event.ignore()
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton:
+            clicked_widget = self.childAt(event.position().toPoint())
+            if not isinstance(clicked_widget, QPushButton):
+                self._drag_offset = (
+                    event.globalPosition().toPoint()
+                    - self.frameGeometry().topLeft()
+                )
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if (
+            self._drag_offset is not None
+            and event.buttons() & Qt.MouseButton.LeftButton
+        ):
+            self.move(event.globalPosition().toPoint() - self._drag_offset)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and self._drag_offset is not None
+        ):
+            self._drag_offset = None
+            logger.debug(f"Overlay moved to {self.pos().x()},{self.pos().y()}")
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
+class TrayController:
+    def __init__(
+        self,
+        application: QApplication,
+        recorder: AudioRecorder | None = None,
+        transcriber: SpeechTranscriber | None = None,
+    ) -> None:
+        logger.debug("Creating tray controller")
+        self.application = application
+        self.recorder = recorder or AudioRecorder()
+        self.transcriber = transcriber or SpeechTranscriber()
+        self.playback_device: int | None = None
+        self.recording_devices: list[AudioDevice] = []
+        self.playback_devices: list[AudioDevice] = []
+        self.icon = QIcon(str(ICON_PATH))
+        self.window = OverlayWindow()
+        self.settings_menu = QMenu(self.window)
+
+        self.application.setWindowIcon(self.icon)
+        self.window.setWindowIcon(self.icon)
+        self.window.exit_requested.connect(self._exit_application)
+        self.window.hide_requested.connect(self.hide_window)
+        self.window.settings_requested.connect(self.show_settings)
+        self.window.recording_requested.connect(self.start_recording)
+        self.window.recording_stop_requested.connect(self.stop_recording)
+        self.window.send_requested.connect(self._handle_send_requested)
+        self.transcriber.transcript_changed.connect(self.window.set_transcript)
+        self.transcriber.ready_changed.connect(self._on_transcriber_ready)
+        self.transcriber.status_changed.connect(self._on_transcriber_status)
+        self.transcriber.failed.connect(self._on_transcriber_error)
+        self.recorder.audio_chunk_callback = self.transcriber.feed_audio
+        self.recorder.recording_started_callback = (
+            self.transcriber.start_session
+        )
+        self.recorder.recording_stopped_callback = (
+            self.transcriber.finish_session
+        )
+
+        self._populate_settings_menu()
+        self.transcriber.prepare()
+
+        self.menu = QMenu()
+        self.exit_action = QAction("Exit", self.menu)
+        self.exit_action.triggered.connect(self._exit_application)
+        self.menu.addAction(self.exit_action)
+
+        self.tray_icon = QSystemTrayIcon(self.icon, self.application)
+        self.tray_icon.setToolTip("Live GPT")
+        self.tray_icon.setContextMenu(self.menu)
+        self.tray_icon.activated.connect(self._handle_activation)
+        self.tray_icon.show()
+        logger.info("System tray icon is ready")
+        self._position_overlay()
+        self.show_window()
+
+    def _handle_activation(
+        self, reason: QSystemTrayIcon.ActivationReason
+    ) -> None:
+        logger.debug(f"Tray icon activated: {reason.name}")
+        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+            self.show_window()
+
+    def show_window(self) -> None:
+        logger.info("Showing the overlay window")
+        self.window.showNormal()
+        self.window.raise_()
+        self.window.activateWindow()
+
+    def hide_window(self) -> None:
+        logger.info("Hiding the overlay window")
+        self.window.hide()
+
+    def show_settings(self) -> None:
+        logger.info("Showing audio device settings")
+        self._populate_settings_menu()
+        button = self.window.settings_button
+        menu_size = self.settings_menu.sizeHint()
+        menu_position = button.mapToGlobal(
+            QPoint(
+                button.width() - menu_size.width(),
+                -menu_size.height() - 6,
+            )
+        )
+        self.settings_menu.popup(menu_position)
+
+    def _populate_settings_menu(self) -> None:
+        self.settings_menu.clear()
+
+        try:
+            recording_devices = list_recording_devices()
+            playback_devices = list_playback_devices()
+        except Exception as error:
+            logger.error("Unable to list audio devices", error)
+            unavailable = self.settings_menu.addAction(
+                "Audio devices unavailable"
+            )
+            unavailable.setEnabled(False)
+            return
+
+        self.recording_devices = recording_devices
+        self.playback_devices = playback_devices
+
+        if self.recorder.input_device is None:
+            default_recording_device = next(
+                (
+                    device
+                    for device in recording_devices
+                    if device.is_system_default
+                ),
+                None,
+            )
+            if default_recording_device is not None:
+                self.recorder.input_device = default_recording_device.index
+                logger.info(
+                    "Using system default recording device "
+                    f"index={default_recording_device.index} "
+                    f"name={default_recording_device.name!r}"
+                )
+
+        if self.playback_device is None:
+            default_playback_device = next(
+                (
+                    device
+                    for device in playback_devices
+                    if device.is_system_default
+                ),
+                None,
+            )
+            if default_playback_device is not None:
+                self.playback_device = default_playback_device.index
+                logger.info(
+                    "Using system default playback device "
+                    f"index={default_playback_device.index} "
+                    f"name={default_playback_device.name!r}"
+                )
+
+        recording_menu = self.settings_menu.addMenu("Recording device")
+        self._add_device_actions(
+            recording_menu,
+            recording_devices,
+            self.recorder.input_device,
+            self._select_recording_device,
+        )
+
+        playback_menu = self.settings_menu.addMenu("Playback device")
+        self._add_device_actions(
+            playback_menu,
+            playback_devices,
+            self.playback_device,
+            self._select_playback_device,
+        )
+
+    def _add_device_actions(
+        self,
+        menu: QMenu,
+        devices: list[AudioDevice],
+        selected_device: int | None,
+        selection_handler,
+    ) -> None:
+        action_group = QActionGroup(menu)
+        action_group.setExclusive(True)
+
+        for device in devices:
+            default_label = " (System Default)" if device.is_system_default else ""
+            label = f"{device.name}{default_label}".replace("&", "&&")
+            action = menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(device.index == selected_device)
+            action.triggered.connect(
+                lambda checked, index=device.index: (
+                    checked and selection_handler(index)
+                )
+            )
+            action_group.addAction(action)
+
+        if not devices:
+            unavailable = menu.addAction("No devices found")
+            unavailable.setEnabled(False)
+
+    def _select_recording_device(self, device_index: int | None) -> None:
+        if self.recorder.is_recording:
+            logger.warning("Cannot change recording device while recording")
+            return
+        self.recorder.input_device = device_index
+        logger.info(
+            "Selected recording device "
+            f"{self._describe_device(self.recording_devices, device_index)}"
+        )
+
+    def _select_playback_device(self, device_index: int | None) -> None:
+        self.playback_device = device_index
+        logger.info(
+            "Selected playback device "
+            f"{self._describe_device(self.playback_devices, device_index)}"
+        )
+
+    @staticmethod
+    def _describe_device(
+        devices: list[AudioDevice],
+        device_index: int | None,
+    ) -> str:
+        device = next(
+            (device for device in devices if device.index == device_index),
+            None,
+        )
+        if device is None:
+            return f"index={device_index} name=<unknown>"
+        return f"index={device.index} name={device.name!r}"
+
+    def start_recording(self) -> None:
+        selected_device = self._describe_device(
+            self.recording_devices,
+            self.recorder.input_device,
+        )
+        logger.info(f"Microphone button pressed selected_device={selected_device}")
+        if not self.transcriber.is_ready:
+            logger.warning("Recording ignored because speech model is not ready")
+            self.window.status_label.setText("Speech model is still preparing...")
+            return
+        try:
+            self.recorder.start()
+        except Exception as error:
+            self.transcriber.finish_session()
+            logger.error(
+                "Unable to start microphone recording "
+                f"selected_device={selected_device}",
+                error,
+            )
+            self.window.set_microphone_state("error", str(error))
+            QTimer.singleShot(2_000, self._reset_microphone_state)
+            return
+
+        self.window.set_microphone_state("recording")
+
+    def stop_recording(self) -> None:
+        if not self.recorder.is_recording:
+            return
+
+        logger.info("Microphone button released")
+        try:
+            result = self.recorder.stop()
+        except Exception as error:
+            self.transcriber.finish_session()
+            logger.error("Unable to stop microphone recording", error)
+            self.window.set_microphone_state("error", str(error))
+            QTimer.singleShot(2_000, self._reset_microphone_state)
+            return
+
+        if result is None:
+            self.window.set_microphone_state("error", "No audio was captured")
+            QTimer.singleShot(2_000, self._reset_microphone_state)
+            return
+
+        self.window.set_microphone_state(
+            "saved",
+            f"Saved {result.duration_seconds:.1f}s recording",
+        )
+        self.window.microphone_button.setToolTip(str(result.path))
+        QTimer.singleShot(1_500, self._reset_microphone_state)
+
+    def _reset_microphone_state(self) -> None:
+        if not self.recorder.is_recording:
+            self.window.set_microphone_state("idle")
+
+    def _on_transcriber_ready(self, ready: bool) -> None:
+        self.window.microphone_button.setEnabled(ready)
+        if ready:
+            self.window.set_microphone_state("idle")
+
+    def _on_transcriber_status(self, message: str) -> None:
+        if not self.recorder.is_recording:
+            self.window.status_label.setText(message)
+
+    def _on_transcriber_error(self, message: str) -> None:
+        logger.error(f"Speech recognition error: {message}")
+        self.window.microphone_button.setEnabled(False)
+        self.window.set_microphone_state("error", message)
+        self.window.status_label.setText("Speech recognition unavailable")
+
+    def _handle_send_requested(self, text: str) -> None:
+        logger.info(f"Send requested text={text!r}")
+        self.window.status_label.setText("Send requested")
+
+    def _position_overlay(self) -> None:
+        screen = self.application.primaryScreen()
+        if screen is None:
+            return
+
+        available = screen.availableGeometry()
+        bottom_margin = 32
+        self.window.move(
+            available.left() + (available.width() - self.window.width()) // 2,
+            available.bottom() - self.window.height() - bottom_margin + 1,
+        )
+
+    def _exit_application(self, checked: bool = False) -> None:
+        del checked
+        logger.info("Exit requested")
+        if self.recorder.is_recording:
+            self.stop_recording()
+        self.transcriber.close()
+        self.application.quit()
+
+
+def main() -> int:
+    config_logger({"debug": True}, name="live-gpt")
+    logger.info(f"Starting Live GPT with pid={os.getpid()} args={sys.argv}")
+
+    try:
+        application = QApplication(sys.argv)
+        application.setApplicationName("Live GPT")
+        application.setQuitOnLastWindowClosed(False)
+
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            logger.error("No system tray is available on this desktop")
+            QMessageBox.critical(
+                None,
+                "Live GPT",
+                "No system tray is available on this desktop.",
+            )
+            return 1
+
+        controller = TrayController(application)
+        exit_code = application.exec()
+        logger.info(f"Application event loop stopped with code={exit_code}")
+        return exit_code
+    except Exception as error:
+        logger.error("Application startup failed", error)
+        raise
+    finally:
+        shutdown_logger()
