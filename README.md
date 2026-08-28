@@ -25,9 +25,21 @@ first launch, then reused offline. Partial and final recognition results appear
 in the overlay while the microphone button is held.
 
 The recognized text remains editable. When the editor contains text, its
-paper-plane button submits the current text through the app's `send_requested`
-signal, and its **X** button clears the editor. Both buttons remain hidden while
-the editor is empty.
+paper-plane button sends the current text through Playwright to the selected
+ChatGPT tab, and its **X** button clears the editor. The app fills ChatGPT's
+composer and clicks its send button, then clears the local text after ChatGPT
+accepts it. While ChatGPT responds, the editor switches to a read-only response
+view, its action buttons and the microphone are hidden, and the status label
+shows activities such as web searching when ChatGPT exposes them in the turn.
+The reply streams into the former input area. After the completed reply becomes
+stable, Live GPT clicks ChatGPT's **Read aloud** button. During playback, the
+response area becomes a large, full-width two-line subtitle view that follows
+the browser media's playback progress. If ChatGPT
+does not expose its media element, subtitle timing falls back to an estimate.
+The full response and microphone return when playback finishes. Click the
+completed reply or press the microphone to start another prompt. Press
+**Enter** to send a prompt or **Shift+Enter** to insert a newline. Both editor
+buttons remain hidden while the editor is empty.
 
 At startup, Live GPT connects through Playwright to a local Chromium browser
 that was started with remote debugging enabled. It discovers ChatGPT tabs and
@@ -41,7 +53,9 @@ endpoint, and then connects. If the browser is already open, the settings page
 opens in a new tab without replacing the active page. The browser can still ask
 the user to approve the incoming connection; Live GPT makes one request and
 waits for **Enable Debugging** to be clicked before retrying a declined or timed
-out request. Attached ChatGPT pages retain the browser's native color-scheme
+out request. When a live debugging marker already exists, that button retries
+the connection directly and leaves the browser tabs unchanged. Attached
+ChatGPT pages retain the browser's native color-scheme
 preference. Live GPT does not launch the browser with debugging flags or create
 a separate profile. The optional `LIVE_GPT_CDP_ENDPOINT` environment variable
 can point the app at a specific CDP HTTP or WebSocket endpoint.

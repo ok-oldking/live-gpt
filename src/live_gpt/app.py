@@ -11,6 +11,7 @@ from PySide6.QtGui import (
     QCloseEvent,
     QIcon,
     QMouseEvent,
+    QTextBlockFormat,
     QTextCursor,
 )
 from PySide6.QtWidgets import (
@@ -35,7 +36,11 @@ from .audio import (
     list_playback_devices,
     list_recording_devices,
 )
-from .browser import BrowserMonitor, open_remote_debugging_settings
+from .browser import (
+    BrowserMonitor,
+    discover_cdp_endpoint,
+    open_remote_debugging_settings,
+)
 from .logger import Logger, config_logger, shutdown_logger
 from .speech import SpeechTranscriber
 
@@ -55,6 +60,9 @@ class TranscriptEditor(QPlainTextEdit):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self._response_mode = False
+        self._response_complete = False
+        self._full_response_text = ""
 
         self.clear_button = QPushButton(self)
         self.clear_button.setObjectName("clearButton")
@@ -87,8 +95,99 @@ class TranscriptEditor(QPlainTextEdit):
         self.clear_button.raise_()
         self.send_button.raise_()
 
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if self._response_mode:
+            if not self._response_complete:
+                event.accept()
+                return
+            self.begin_composing()
+        super().mousePressEvent(event)
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        is_enter = event.key() in (
+            Qt.Key.Key_Return,
+            Qt.Key.Key_Enter,
+        )
+        wants_newline = bool(
+            event.modifiers() & Qt.KeyboardModifier.ShiftModifier
+        )
+        if is_enter and not wants_newline and not self._response_mode:
+            if self.toPlainText().strip():
+                self.send_button.click()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    @property
+    def is_showing_response(self) -> bool:
+        return self._response_mode
+
+    def begin_response(self) -> None:
+        self._response_mode = True
+        self._response_complete = False
+        self._full_response_text = ""
+        self._set_reading_style(False)
+        self.setReadOnly(True)
+        self.clear()
+        self._sync_action_visibility()
+
+    def update_response(self, text: str) -> None:
+        if not self._response_mode:
+            self.begin_response()
+        if self.toPlainText() == text:
+            return
+        self._full_response_text = text
+        self.setPlainText(text)
+        cursor = self.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self.setTextCursor(cursor)
+
+    def finish_response(self) -> None:
+        self._response_complete = True
+
+    def begin_reading(self) -> None:
+        self._response_mode = True
+        self._response_complete = False
+        self.setReadOnly(True)
+        self._set_reading_style(True)
+        self.clear()
+
+    def update_reading_subtitle(self, subtitle: str) -> None:
+        if self.toPlainText() == subtitle:
+            return
+        self.setPlainText(subtitle)
+        cursor = self.textCursor()
+        cursor.select(QTextCursor.SelectionType.Document)
+        block_format = QTextBlockFormat()
+        block_format.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        cursor.mergeBlockFormat(block_format)
+        cursor.clearSelection()
+        cursor.movePosition(QTextCursor.MoveOperation.Start)
+        self.setTextCursor(cursor)
+
+    def finish_reading(self) -> None:
+        self._set_reading_style(False)
+        self.setPlainText(self._full_response_text)
+        self._response_complete = True
+
+    def _set_reading_style(self, reading: bool) -> None:
+        self.setProperty("readingMode", reading)
+        style = self.style()
+        style.unpolish(self)
+        style.polish(self)
+        self.update()
+
+    def begin_composing(self) -> None:
+        self._response_mode = False
+        self._response_complete = False
+        self._full_response_text = ""
+        self._set_reading_style(False)
+        self.setReadOnly(False)
+        self.clear()
+        self._sync_action_visibility()
+
     def _sync_action_visibility(self) -> None:
-        has_text = bool(self.toPlainText().strip())
+        has_text = bool(self.toPlainText().strip()) and not self._response_mode
         self.clear_button.setVisible(has_text)
         self.send_button.setVisible(has_text)
         self.setViewportMargins(0, 0, 76 if has_text else 0, 0)
@@ -281,6 +380,11 @@ class OverlayWindow(QMainWindow):
                 font-size: 15px;
                 selection-background-color: rgba(76, 201, 240, 130);
             }
+            QPlainTextEdit#transcriptArea[readingMode="true"] {
+                padding: 14px;
+                font-size: 22px;
+                font-weight: 600;
+            }
             QPushButton {
                 min-height: 30px;
                 padding: 0 12px;
@@ -421,6 +525,48 @@ class OverlayWindow(QMainWindow):
         if not self.chatgpt_tab_combo.isEnabled():
             self.chatgpt_tab_combo.setItemText(0, status)
 
+    def set_send_result(
+        self,
+        success: bool,
+        sent_text: str,
+        message: str,
+    ) -> None:
+        self.send_button.setEnabled(True)
+        if not success:
+            self.microphone_button.setVisible(True)
+            self.status_label.setText(message)
+            return
+
+        del sent_text, message
+        self.transcript_area.begin_response()
+        self.microphone_button.setVisible(False)
+        self.status_label.setText("Waiting for ChatGPT…")
+
+    def set_response_update(self, status: str, text: str) -> None:
+        self.status_label.setText(status)
+        self.transcript_area.update_response(text)
+
+    def set_response_finished(self, success: bool, message: str) -> None:
+        del success
+        self.transcript_area.finish_response()
+        self.microphone_button.setVisible(True)
+        self.status_label.setText(message)
+
+    def begin_reading(self, message: str) -> None:
+        self.transcript_area.begin_reading()
+        self.microphone_button.setVisible(False)
+        self.status_label.setText(message)
+
+    def set_reading_subtitle(self, subtitle: str) -> None:
+        self.transcript_area.update_reading_subtitle(subtitle)
+        self.status_label.setText("Reading aloud…")
+
+    def finish_reading(self, success: bool, message: str) -> None:
+        del success
+        self.transcript_area.finish_reading()
+        self.microphone_button.setVisible(True)
+        self.status_label.setText(message)
+
     def _chatgpt_tab_changed(self, index: int) -> None:
         tab_id = self.chatgpt_tab_combo.itemData(index)
         if tab_id:
@@ -514,6 +660,24 @@ class TrayController:
         self.browser_monitor.tabs_changed.connect(self.window.set_chatgpt_tabs)
         self.browser_monitor.status_changed.connect(
             self.window.set_browser_status
+        )
+        self.browser_monitor.send_finished.connect(
+            self.window.set_send_result
+        )
+        self.browser_monitor.response_changed.connect(
+            self.window.set_response_update
+        )
+        self.browser_monitor.response_finished.connect(
+            self.window.set_response_finished
+        )
+        self.browser_monitor.reading_started.connect(
+            self.window.begin_reading
+        )
+        self.browser_monitor.reading_changed.connect(
+            self.window.set_reading_subtitle
+        )
+        self.browser_monitor.reading_finished.connect(
+            self.window.finish_reading
         )
         self.transcriber.transcript_changed.connect(self.window.set_transcript)
         self.transcriber.ready_changed.connect(self._on_transcriber_ready)
@@ -709,6 +873,8 @@ class TrayController:
             logger.warning("Recording ignored because speech model is not ready")
             self.window.status_label.setText("Speech model is still preparing...")
             return
+        if self.window.transcript_area.is_showing_response:
+            self.window.transcript_area.begin_composing()
         try:
             self.recorder.start()
         except Exception as error:
@@ -770,14 +936,32 @@ class TrayController:
         self.window.status_label.setText("Speech recognition unavailable")
 
     def _handle_send_requested(self, text: str) -> None:
-        logger.info(f"Send requested text={text!r}")
-        self.window.status_label.setText("Send requested")
+        tab_id = self.selected_chatgpt_tab_id
+        if tab_id is None:
+            self.window.status_label.setText("Select a ChatGPT window first")
+            return
+
+        logger.info(
+            "Send requested "
+            f"tab_id={tab_id!r} characters={len(text)}"
+        )
+        self.window.send_button.setEnabled(False)
+        self.window.status_label.setText("Sending to ChatGPT…")
+        self.browser_monitor.request_send(tab_id, text)
 
     def _select_chatgpt_tab(self, tab_id: str) -> None:
         self.selected_chatgpt_tab_id = tab_id
         logger.info(f"Selected ChatGPT tab id={tab_id}")
 
     def _open_remote_debugging_settings(self) -> None:
+        endpoint = discover_cdp_endpoint()
+        if endpoint is not None:
+            self.window.set_browser_status(
+                "Retrying connection… approve it in the browser"
+            )
+            self.browser_monitor.request_retry_connection()
+            return
+
         try:
             settings_url = open_remote_debugging_settings()
         except Exception as error:

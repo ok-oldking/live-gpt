@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from live_gpt.browser import BrowserMonitor, _MonitorState
+from live_gpt.browser import (
+    _ActiveReading,
+    BrowserMonitor,
+    _ActiveResponse,
+    _MonitorState,
+    _ResponseSnapshot,
+)
 from live_gpt.browser_discovery import is_chatgpt_url
 from live_gpt import browser_windows
 
@@ -65,8 +72,280 @@ class BrowserMonitorTests(unittest.TestCase):
         self.assertEqual(first, second)
         page.emulate_media.assert_called_once_with(color_scheme="null")
 
+    def test_send_request_targets_selected_chatgpt_page(self) -> None:
+        composer = Mock()
+        composer_locator = Mock(first=composer)
+        send_button = Mock()
+        send_button_locator = Mock(first=send_button)
+        previous_turn = Mock()
+        previous_turn.get_attribute.side_effect = (
+            lambda attribute: "previous-turn"
+            if attribute == "data-turn-id"
+            else "conversation-turn-4"
+        )
+        assistant_turns = Mock(last=previous_turn)
+        assistant_turns.count.return_value = 2
+
+        page = Mock()
+        page.is_closed.return_value = False
+        page.url = "https://chatgpt.com/c/conversation"
+        def locate(selector: str) -> Mock:
+            if selector == "#prompt-textarea":
+                return composer_locator
+            if selector == (
+                '[data-testid^="conversation-turn-"]'
+                '[data-turn="assistant"]'
+            ):
+                return assistant_turns
+            return send_button_locator
+
+        page.locator.side_effect = locate
+        browser = Mock(contexts=[Mock(pages=[page])])
+        monitor = BrowserMonitor()
+        state = _MonitorState()
+        results: list[tuple[bool, str, str]] = []
+        monitor.send_finished.connect(
+            lambda success, text, message: results.append(
+                (success, text, message)
+            )
+        )
+
+        monitor.request_send(str(id(page)), "Hello from Live GPT")
+        monitor._process_send_requests(
+            browser,
+            FakePlaywrightError,
+            state,
+        )
+
+        page.bring_to_front.assert_called_once_with()
+        composer.wait_for.assert_called_once_with(
+            state="visible",
+            timeout=5_000,
+        )
+        composer.fill.assert_called_once_with("Hello from Live GPT")
+        send_button.click.assert_called_once_with(timeout=5_000)
+        self.assertEqual(
+            results,
+            [(True, "Hello from Live GPT", "Sent to ChatGPT")],
+        )
+        self.assertIsNotNone(state.active_response)
+
+    def test_completed_response_is_read_aloud(self) -> None:
+        page = Mock()
+        monitor = BrowserMonitor()
+        state = _MonitorState(
+            active_response=_ActiveResponse(
+                page=page,
+                turn_marker_before="previous-turn",
+                started_at=time.monotonic() - 2,
+            )
+        )
+        snapshot = _ResponseSnapshot(
+            has_new_turn=True,
+            is_generating=False,
+            has_completion_controls=True,
+            text="The completed reply",
+            status="Finishing reply…",
+        )
+        changes: list[tuple[str, str]] = []
+        finished: list[tuple[bool, str]] = []
+        reading_started: list[str] = []
+        monitor.response_changed.connect(
+            lambda status, text: changes.append((status, text))
+        )
+        monitor.response_finished.connect(
+            lambda success, message: finished.append((success, message))
+        )
+        monitor.reading_started.connect(reading_started.append)
+
+        with (
+            patch.object(monitor, "_response_snapshot", return_value=snapshot),
+            patch.object(monitor, "_click_read_aloud", return_value=True) as read,
+        ):
+            monitor._poll_active_response(state)
+            monitor._poll_active_response(state)
+            monitor._poll_active_response(state)
+
+        read.assert_called_once_with(page)
+        self.assertEqual(changes[0], ("Finishing reply…", "The completed reply"))
+        self.assertEqual(finished, [])
+        self.assertEqual(reading_started, ["Preparing Read aloud…"])
+        self.assertIsNone(state.active_response)
+        self.assertIsNotNone(state.active_reading)
+
+    def test_reading_progress_emits_subtitles_and_finishes(self) -> None:
+        page = Mock()
+        page.evaluate.side_effect = [
+            {
+                "playCount": 1,
+                "currentTime": 0,
+                "duration": 10,
+                "paused": False,
+                "ended": False,
+            },
+            {
+                "playCount": 1,
+                "currentTime": 6,
+                "duration": 10,
+                "paused": False,
+                "ended": False,
+            },
+            {
+                "playCount": 1,
+                "currentTime": 10,
+                "duration": 10,
+                "paused": True,
+                "ended": True,
+            },
+        ]
+        monitor = BrowserMonitor()
+        state = _MonitorState(
+            active_reading=_ActiveReading(
+                page=page,
+                full_text="First subtitle. Second subtitle.",
+                subtitles=("First subtitle.", "Second subtitle."),
+            )
+        )
+        subtitles: list[str] = []
+        finished: list[tuple[bool, str]] = []
+        monitor.reading_changed.connect(subtitles.append)
+        monitor.reading_finished.connect(
+            lambda success, message: finished.append((success, message))
+        )
+
+        monitor._poll_active_reading(state)
+        monitor._poll_active_reading(state)
+        assert state.active_reading is not None
+        state.active_reading.quiet_since = time.monotonic() - 5
+        monitor._poll_active_reading(state)
+
+        self.assertEqual(subtitles, ["First subtitle.", "Second subtitle."])
+        self.assertEqual(finished, [(True, "Read aloud complete")])
+        self.assertIsNone(state.active_reading)
+
+    def test_subtitles_wait_for_playback_to_begin(self) -> None:
+        page = Mock()
+        page.evaluate.return_value = None
+        monitor = BrowserMonitor()
+        state = _MonitorState(
+            active_reading=_ActiveReading(
+                page=page,
+                full_text="The reply has not started playing yet.",
+                subtitles=("The reply has not started playing yet.",),
+            )
+        )
+        subtitles: list[str] = []
+        monitor.reading_changed.connect(subtitles.append)
+
+        monitor._poll_active_reading(state)
+
+        self.assertEqual(subtitles, [])
+        self.assertIsNotNone(state.active_reading)
+
+    def test_subtitle_uses_two_near_full_width_lines(self) -> None:
+        text = " ".join(f"word{index}" for index in range(40)) + "."
+
+        subtitles = BrowserMonitor._subtitle_segments(text)
+
+        first_lines = subtitles[0].splitlines()
+        self.assertEqual(len(first_lines), 2)
+        self.assertGreater(len(first_lines[0]), 60)
+        self.assertGreater(len(first_lines[1]), 60)
+
+    def test_read_aloud_uses_more_actions_menu(self) -> None:
+        turn = Mock()
+        turns = Mock(last=turn)
+        turns.count.return_value = 1
+        direct_button = Mock()
+        more_actions = Mock()
+        read_aloud = Mock()
+
+        page = Mock()
+
+        def locate(selector: str) -> Mock:
+            if selector == (
+                '[data-testid^="conversation-turn-"]'
+                '[data-turn="assistant"]'
+            ):
+                return turns
+            if "voice-play-turn-action-button" in selector:
+                return Mock(last=direct_button)
+            if selector == 'button[aria-label="More actions"]':
+                return Mock(last=more_actions)
+            return Mock(last=read_aloud)
+
+        page.locator.side_effect = locate
+        direct_button.is_visible.return_value = False
+
+        clicked = BrowserMonitor._click_read_aloud(page)
+
+        self.assertTrue(clicked)
+        turn.hover.assert_called_once_with(timeout=2_000)
+        more_actions.click.assert_called_once_with(timeout=5_000)
+        read_aloud.click.assert_called_once_with(timeout=5_000)
+
+    def test_response_snapshot_reads_current_assistant_section(self) -> None:
+        markdown = Mock()
+        markdown.count.return_value = 1
+        markdown.evaluate.return_value = "Visible assistant reply"
+        markdown.inner_text.return_value = "Visible assistant reply"
+        completion_controls = Mock()
+        completion_controls.count.return_value = 0
+
+        turn = Mock()
+        turn.inner_text.return_value = "Visible assistant reply"
+        turn.get_attribute.side_effect = (
+            lambda attribute: "new-turn"
+            if attribute == "data-turn-id"
+            else "conversation-turn-6"
+        )
+
+        def locate_in_turn(selector: str) -> Mock:
+            if selector.startswith(".markdown"):
+                return Mock(last=markdown)
+            return completion_controls
+
+        turn.locator.side_effect = locate_in_turn
+        turns = Mock(last=turn)
+        turns.count.return_value = 4
+        stop_button = Mock()
+        stop_button.is_visible.return_value = True
+
+        page = Mock()
+
+        def locate_in_page(selector: str) -> Mock:
+            if selector.startswith('[data-testid^="conversation-turn-"]'):
+                return turns
+            return Mock(first=stop_button)
+
+        page.locator.side_effect = locate_in_page
+
+        snapshot = BrowserMonitor._response_snapshot(page, "previous-turn")
+
+        self.assertTrue(snapshot.has_new_turn)
+        self.assertTrue(snapshot.is_generating)
+        self.assertEqual(snapshot.text, "Visible assistant reply")
+        self.assertEqual(snapshot.status, "ChatGPT is responding…")
+
 
 class BrowserWindowsTests(unittest.TestCase):
+    @patch("live_gpt.browser_windows._run_powershell")
+    def test_navigation_has_keyboard_new_tab_fallback(
+        self,
+        run_powershell: Mock,
+    ) -> None:
+        run_powershell.return_value = "Navigated"
+
+        browser_windows._navigate_browser_window(
+            1234,
+            "edge://inspect/#remote-debugging",
+            create_new_tab=True,
+        )
+
+        script = run_powershell.call_args.args[0]
+        self.assertIn("0x54", script)
+        self.assertNotIn("New Tab button not found", script)
+
     @patch("live_gpt.browser_windows._wait_for_remote_debugging_marker")
     @patch("live_gpt.browser_windows._enable_remote_debugging")
     @patch("live_gpt.browser_windows._navigate_browser_window")

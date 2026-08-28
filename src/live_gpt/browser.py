@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import math
+import re
 import time
 from dataclasses import dataclass, field
+from queue import Empty, Queue
 from typing import Any
 
 from PySide6.QtCore import QThread, Signal
@@ -23,6 +26,45 @@ from .logger import Logger
 
 
 logger = Logger.get_logger(__name__)
+ASSISTANT_TURN_SELECTOR = (
+    '[data-testid^="conversation-turn-"][data-turn="assistant"]'
+)
+_MEDIA_TRACKER_SCRIPT = """
+() => {
+    if (window.__liveGptMediaTrackerInstalled) return;
+    window.__liveGptMediaTrackerInstalled = true;
+    window.__liveGptReadAloudTracker = {
+        media: null,
+        playCount: 0
+    };
+    const originalPlay = HTMLMediaElement.prototype.play;
+    HTMLMediaElement.prototype.play = function(...args) {
+        const tracker = window.__liveGptReadAloudTracker;
+        tracker.media = this;
+        tracker.playCount += 1;
+        return originalPlay.apply(this, args);
+    };
+}
+"""
+_MEDIA_PROGRESS_SCRIPT = """
+() => {
+    const tracker = window.__liveGptReadAloudTracker;
+    const media = tracker?.media ||
+        [...document.querySelectorAll('audio, video')].find(item =>
+            !item.paused || item.currentTime > 0
+        );
+    if (!media) return null;
+    return {
+        playCount: tracker?.playCount || 0,
+        currentTime: Number.isFinite(media.currentTime)
+            ? media.currentTime : 0,
+        duration: Number.isFinite(media.duration)
+            ? media.duration : null,
+        paused: media.paused,
+        ended: media.ended
+    };
+}
+"""
 
 
 @dataclass
@@ -33,6 +75,46 @@ class _MonitorState:
     rejected_endpoint: str | None = None
     last_tabs: list[dict[str, str]] | None = None
     media_reset_pages: set[str] = field(default_factory=set)
+    active_response: _ActiveResponse | None = None
+    active_reading: _ActiveReading | None = None
+
+
+@dataclass(frozen=True)
+class _SendRequest:
+    tab_id: str
+    text: str
+
+
+@dataclass
+class _ActiveResponse:
+    page: Any
+    turn_marker_before: str | None
+    started_at: float = field(default_factory=time.monotonic)
+    last_text: str = ""
+    last_status: str = ""
+    unchanged_polls: int = 0
+
+
+@dataclass(frozen=True)
+class _ResponseSnapshot:
+    has_new_turn: bool
+    is_generating: bool
+    has_completion_controls: bool
+    text: str
+    status: str
+
+
+@dataclass
+class _ActiveReading:
+    page: Any
+    full_text: str
+    subtitles: tuple[str, ...]
+    started_at: float = field(default_factory=time.monotonic)
+    last_subtitle: str = ""
+    audio_seen: bool = False
+    playback_started_at: float | None = None
+    last_play_count: int = 0
+    quiet_since: float | None = None
 
 
 class BrowserMonitor(QThread):
@@ -40,11 +122,18 @@ class BrowserMonitor(QThread):
 
     tabs_changed = Signal(object)
     status_changed = Signal(str)
+    send_finished = Signal(bool, str, str)
+    response_changed = Signal(str, str)
+    response_finished = Signal(bool, str)
+    reading_started = Signal(str)
+    reading_changed = Signal(str)
+    reading_finished = Signal(bool, str)
 
     def __init__(self) -> None:
         super().__init__()
         self._stop_requested = False
         self._retry_connection_requested = False
+        self._send_requests: Queue[_SendRequest] = Queue()
         self._last_status = ""
 
     def request_stop(self) -> None:
@@ -52,6 +141,10 @@ class BrowserMonitor(QThread):
 
     def request_retry_connection(self) -> None:
         self._retry_connection_requested = True
+
+    def request_send(self, tab_id: str, text: str) -> None:
+        """Queue text for the selected ChatGPT page on the worker thread."""
+        self._send_requests.put(_SendRequest(tab_id=tab_id, text=text))
 
     def run(self) -> None:
         try:
@@ -83,7 +176,23 @@ class BrowserMonitor(QThread):
                     state.last_tabs = []
                     self.tabs_changed.emit([])
 
-                self.msleep(1_500)
+                connected_browser = (
+                    state.browser
+                    if self._is_connected(state.browser)
+                    else None
+                )
+                self._process_send_requests(
+                    connected_browser,
+                    PlaywrightError,
+                    state,
+                )
+                self._poll_active_response(state)
+                self._poll_active_reading(state)
+                is_busy = (
+                    state.active_response is not None
+                    or state.active_reading is not None
+                )
+                self.msleep(250 if is_busy else 1_500)
 
         logger.info("Browser monitor stopped")
 
@@ -112,7 +221,7 @@ class BrowserMonitor(QThread):
             )
             return
 
-        self._set_status("Connecting to browser…")
+        self._set_status("Approve remote debugging in the browser…")
         try:
             state.browser = playwright.chromium.connect_over_cdp(
                 endpoint,
@@ -189,12 +298,544 @@ class BrowserMonitor(QThread):
         return tabs
 
     def _handle_disconnect(self, state: _MonitorState) -> None:
+        if state.active_response is not None:
+            self.response_finished.emit(False, "Browser disconnected")
+            state.active_response = None
+        if state.active_reading is not None:
+            self.reading_finished.emit(False, "Browser disconnected")
+            state.active_reading = None
         state.browser = None
         state.media_reset_pages.clear()
         self._set_status("Browser disconnected")
         if state.last_tabs != []:
             state.last_tabs = []
             self.tabs_changed.emit([])
+
+    def _process_send_requests(
+        self,
+        browser: Any | None,
+        playwright_error: type[Exception],
+        state: _MonitorState,
+    ) -> None:
+        while True:
+            try:
+                request = self._send_requests.get_nowait()
+            except Empty:
+                return
+
+            if browser is None:
+                self.send_finished.emit(
+                    False,
+                    request.text,
+                    "Browser is not connected",
+                )
+                continue
+
+            if (
+                state.active_response is not None
+                or state.active_reading is not None
+            ):
+                self.send_finished.emit(
+                    False,
+                    request.text,
+                    "Wait for the current reply or reading to finish",
+                )
+                continue
+
+            page = self._find_chatgpt_page(
+                browser,
+                request.tab_id,
+                playwright_error,
+            )
+            if page is None:
+                self.send_finished.emit(
+                    False,
+                    request.text,
+                    "Selected ChatGPT window is no longer available",
+                )
+                continue
+
+            try:
+                turn_marker_before = self._assistant_turn_marker(page)
+                self._send_to_chatgpt_page(page, request.text)
+            except Exception as error:
+                logger.error("Unable to send text to ChatGPT", error)
+                self.send_finished.emit(
+                    False,
+                    request.text,
+                    f"Could not send to ChatGPT: {error}",
+                )
+                continue
+
+            logger.info(
+                "Sent text to ChatGPT "
+                f"tab_id={request.tab_id!r} characters={len(request.text)}"
+            )
+            state.active_response = _ActiveResponse(
+                page=page,
+                turn_marker_before=turn_marker_before,
+            )
+            self.send_finished.emit(True, request.text, "Sent to ChatGPT")
+
+    def _poll_active_response(self, state: _MonitorState) -> None:
+        response = state.active_response
+        if response is None:
+            return
+
+        try:
+            snapshot = self._response_snapshot(
+                response.page,
+                response.turn_marker_before,
+            )
+        except Exception as error:
+            logger.error("Unable to read the ChatGPT response", error)
+            self.response_finished.emit(
+                False,
+                f"Could not read ChatGPT's reply: {error}",
+            )
+            state.active_response = None
+            return
+
+        text_changed = snapshot.text != response.last_text
+        if not text_changed:
+            if snapshot.has_new_turn:
+                response.unchanged_polls += 1
+        else:
+            response.last_text = snapshot.text
+            response.unchanged_polls = 0
+
+        if (
+            text_changed
+            or snapshot.status != response.last_status
+        ):
+            response.last_status = snapshot.status
+            self.response_changed.emit(snapshot.status, snapshot.text)
+        elif snapshot.text and response.unchanged_polls == 0:
+            self.response_changed.emit(snapshot.status, snapshot.text)
+
+        response_age = time.monotonic() - response.started_at
+        is_complete = (
+            snapshot.has_new_turn
+            and bool(snapshot.text)
+            and not snapshot.is_generating
+            and snapshot.has_completion_controls
+            and response.unchanged_polls >= 2
+            and response_age >= 1.0
+        )
+        if not is_complete:
+            if response_age >= 600:
+                self.response_finished.emit(
+                    False,
+                    "Timed out while waiting for ChatGPT's reply",
+                )
+                state.active_response = None
+            return
+
+        read_aloud_clicked = self._click_read_aloud(response.page)
+        if read_aloud_clicked:
+            state.active_reading = _ActiveReading(
+                page=response.page,
+                full_text=snapshot.text,
+                subtitles=self._subtitle_segments(snapshot.text),
+            )
+            self.reading_started.emit("Preparing Read aloud…")
+        else:
+            self.response_finished.emit(
+                True,
+                "Reply complete · Read aloud was unavailable",
+            )
+        state.active_response = None
+
+    def _poll_active_reading(self, state: _MonitorState) -> None:
+        reading = state.active_reading
+        if reading is None:
+            return
+
+        now = time.monotonic()
+        elapsed_since_click = now - reading.started_at
+        estimated_duration = self._estimated_reading_duration(
+            reading.full_text
+        )
+        try:
+            media = reading.page.evaluate(_MEDIA_PROGRESS_SCRIPT)
+        except Exception as error:
+            logger.warning(f"Unable to read playback progress: {error}")
+            media = None
+
+        fraction: float | None = None
+        finished = False
+        if isinstance(media, dict):
+            play_count = int(media.get("playCount") or 0)
+            current_time = self._finite_float(media.get("currentTime")) or 0.0
+            duration = self._finite_float(media.get("duration"))
+            playback_has_started = play_count > 0 and (
+                current_time > 0.02 or not bool(media.get("paused"))
+            )
+            if playback_has_started:
+                reading.audio_seen = True
+                if reading.playback_started_at is None:
+                    reading.playback_started_at = now
+
+            if play_count != reading.last_play_count:
+                reading.last_play_count = play_count
+                reading.quiet_since = None
+
+            if reading.playback_started_at is not None:
+                playback_elapsed = now - reading.playback_started_at
+                is_full_response_audio = (
+                    duration is not None
+                    and duration >= estimated_duration * 0.35
+                )
+                if is_full_response_audio:
+                    fraction = min(
+                        max(current_time / duration, 0.0),
+                        1.0,
+                    )
+                else:
+                    fraction = min(
+                        playback_elapsed / estimated_duration,
+                        0.99,
+                    )
+
+            is_playing = (
+                reading.audio_seen
+                and not bool(media.get("paused"))
+                and not bool(media.get("ended"))
+            )
+            if is_playing:
+                reading.quiet_since = None
+            elif reading.audio_seen:
+                if reading.quiet_since is None:
+                    reading.quiet_since = now
+                finished = now - reading.quiet_since >= 4.0
+        elif reading.audio_seen:
+            if reading.quiet_since is None:
+                reading.quiet_since = now
+            finished = now - reading.quiet_since >= 4.0
+        elif elapsed_since_click >= 8.0:
+            if reading.playback_started_at is None:
+                reading.playback_started_at = now
+            playback_elapsed = now - reading.playback_started_at
+            fraction = min(playback_elapsed / estimated_duration, 1.0)
+            finished = playback_elapsed >= estimated_duration
+
+        if fraction is None:
+            return
+
+        subtitle = self._subtitle_at_progress(reading.subtitles, fraction)
+        if subtitle and subtitle != reading.last_subtitle:
+            reading.last_subtitle = subtitle
+            self.reading_changed.emit(subtitle)
+
+        if not finished:
+            return
+
+        logger.info(
+            "ChatGPT Read aloud finished "
+            f"media_detected={reading.audio_seen}"
+        )
+        self.reading_finished.emit(True, "Read aloud complete")
+        state.active_reading = None
+
+    @staticmethod
+    def _find_chatgpt_page(
+        browser: Any,
+        tab_id: str,
+        playwright_error: type[Exception],
+    ) -> Any | None:
+        try:
+            contexts = list(browser.contexts)
+        except playwright_error:
+            return None
+
+        for context in contexts:
+            try:
+                pages = list(context.pages)
+            except playwright_error:
+                continue
+            for page in pages:
+                try:
+                    if (
+                        str(id(page)) == tab_id
+                        and not page.is_closed()
+                        and is_chatgpt_url(page.url)
+                    ):
+                        return page
+                except playwright_error:
+                    continue
+        return None
+
+    @staticmethod
+    def _send_to_chatgpt_page(page: Any, text: str) -> None:
+        page.bring_to_front()
+        composer = page.locator("#prompt-textarea").first
+        composer.wait_for(state="visible", timeout=5_000)
+        composer.fill(text)
+
+        send_button = page.locator(
+            'button[data-testid="send-button"]'
+        ).first
+        send_button.wait_for(state="visible", timeout=5_000)
+        send_button.click(timeout=5_000)
+
+    @staticmethod
+    def _assistant_turn_marker(page: Any) -> str | None:
+        turns = page.locator(ASSISTANT_TURN_SELECTOR)
+        if int(turns.count()) == 0:
+            return None
+        turn = turns.last
+        return (
+            turn.get_attribute("data-turn-id")
+            or turn.get_attribute("data-testid")
+        )
+
+    @classmethod
+    def _response_snapshot(
+        cls,
+        page: Any,
+        turn_marker_before: str | None,
+    ) -> _ResponseSnapshot:
+        turns = page.locator(ASSISTANT_TURN_SELECTOR)
+        turn_count = int(turns.count())
+        stop_button = page.locator(
+            'button[data-testid="stop-button"], '
+            'button[aria-label="Stop generating"]'
+        ).first
+        is_generating = cls._locator_is_visible(stop_button)
+
+        if turn_count == 0:
+            return _ResponseSnapshot(
+                has_new_turn=False,
+                is_generating=is_generating,
+                has_completion_controls=False,
+                text="",
+                status="Waiting for ChatGPT…",
+            )
+
+        turn = turns.last
+        turn_marker = (
+            turn.get_attribute("data-turn-id")
+            or turn.get_attribute("data-testid")
+        )
+        if turn_marker == turn_marker_before:
+            return _ResponseSnapshot(
+                has_new_turn=False,
+                is_generating=is_generating,
+                has_completion_controls=False,
+                text="",
+                status="Waiting for ChatGPT…",
+            )
+
+        turn_text = turn.inner_text(timeout=1_000).strip()
+        markdown = turn.locator(
+            '.markdown, [data-message-author-role="assistant"] .prose'
+        ).last
+        text = (
+            cls._clean_markdown_text(markdown)
+            if int(markdown.count()) > 0
+            else cls._response_text_from_turn(turn_text)
+        )
+        completion_controls = turn.locator(
+            'button[aria-label="Copy response"], '
+            'button[aria-label="More actions"]'
+        )
+        return _ResponseSnapshot(
+            has_new_turn=True,
+            is_generating=is_generating,
+            has_completion_controls=int(completion_controls.count()) > 0,
+            text=text,
+            status=cls._response_activity_status(turn_text, is_generating),
+        )
+
+    @staticmethod
+    def _response_text_from_turn(turn_text: str) -> str:
+        action_labels = {
+            "copy response",
+            "rate response",
+            "share",
+            "switch model",
+            "more actions",
+        }
+        lines = [
+            line
+            for line in turn_text.splitlines()
+            if line.strip().casefold() not in action_labels
+        ]
+        return "\n".join(lines).strip()
+
+    @staticmethod
+    def _clean_markdown_text(markdown: Any) -> str:
+        clean_text = markdown.evaluate(
+            """
+            element => {
+                const clone = element.cloneNode(true);
+                clone.querySelectorAll([
+                    '[data-testid="webpage-citation-pill"]',
+                    '[data-testid="webpage-citation-card"]',
+                    '[data-content-reference-start]',
+                    'button[aria-label="Copy table"]',
+                    'svg',
+                    '.sr-only'
+                ].join(',')).forEach(item => item.remove());
+                return clone.innerText || clone.textContent || '';
+            }
+            """
+        )
+        if isinstance(clean_text, str):
+            return clean_text.strip()
+        return markdown.inner_text(timeout=1_000).strip()
+
+    @staticmethod
+    def _response_activity_status(turn_text: str, is_generating: bool) -> str:
+        if not is_generating:
+            return "Finishing reply…"
+
+        activity_words = (
+            "searching",
+            "browsing",
+            "looking up",
+            "reading",
+            "analyzing",
+            "thinking",
+        )
+        for line in turn_text.splitlines():
+            label = line.strip()
+            if (
+                0 < len(label) <= 100
+                and any(word in label.casefold() for word in activity_words)
+            ):
+                return label
+        return "ChatGPT is responding…"
+
+    @staticmethod
+    def _subtitle_segments(
+        text: str,
+        target_length: int = 164,
+    ) -> tuple[str, ...]:
+        normalized = re.sub(r"\s+", " ", text).strip()
+        if not normalized:
+            return ()
+
+        sentences = re.split(r"(?<=[.!?。！？])\s+", normalized)
+        segments: list[str] = []
+        current = ""
+        for sentence in sentences:
+            words = sentence.split()
+            if not words:
+                continue
+            pieces: list[str] = []
+            piece = ""
+            for word in words:
+                candidate = f"{piece} {word}".strip()
+                if piece and len(candidate) > target_length:
+                    pieces.append(piece)
+                    piece = word
+                else:
+                    piece = candidate
+            if piece:
+                pieces.append(piece)
+
+            for piece in pieces:
+                candidate = f"{current} {piece}".strip()
+                if current and len(candidate) > target_length:
+                    segments.append(current)
+                    current = piece
+                else:
+                    current = candidate
+        if current:
+            segments.append(current)
+        return tuple(
+            BrowserMonitor._balance_subtitle_lines(segment)
+            for segment in segments
+        )
+
+    @staticmethod
+    def _balance_subtitle_lines(subtitle: str) -> str:
+        if len(subtitle) <= 52:
+            return subtitle
+        words = subtitle.split()
+        if len(words) < 2:
+            midpoint = len(subtitle) // 2
+            return f"{subtitle[:midpoint]}\n{subtitle[midpoint:]}"
+
+        best_index = min(
+            range(1, len(words)),
+            key=lambda index: abs(
+                len(" ".join(words[:index]))
+                - len(" ".join(words[index:]))
+            ),
+        )
+        return (
+            f"{' '.join(words[:best_index])}\n"
+            f"{' '.join(words[best_index:])}"
+        )
+
+    @staticmethod
+    def _subtitle_at_progress(
+        subtitles: tuple[str, ...],
+        fraction: float,
+    ) -> str:
+        if not subtitles:
+            return ""
+        weights = [max(len(subtitle), 12) for subtitle in subtitles]
+        target = min(max(fraction, 0.0), 1.0) * sum(weights)
+        cumulative = 0
+        for subtitle, weight in zip(subtitles, weights, strict=True):
+            cumulative += weight
+            if target < cumulative:
+                return subtitle
+        return subtitles[-1]
+
+    @staticmethod
+    def _estimated_reading_duration(text: str) -> float:
+        word_count = max(len(text.split()), 1)
+        return max(word_count / 1.9, 2.0)
+
+    @staticmethod
+    def _finite_float(value: object) -> float | None:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if math.isfinite(number) else None
+
+    @staticmethod
+    def _locator_is_visible(locator: Any) -> bool:
+        try:
+            return bool(locator.is_visible())
+        except Exception:
+            return False
+
+    @classmethod
+    def _click_read_aloud(cls, page: Any) -> bool:
+        try:
+            page.evaluate(_MEDIA_TRACKER_SCRIPT)
+            turns = page.locator(ASSISTANT_TURN_SELECTOR)
+            if int(turns.count()) > 0:
+                turns.last.hover(timeout=2_000)
+            direct_button = page.locator(
+                'button[data-testid="voice-play-turn-action-button"], '
+                'button[aria-label="Read aloud"]'
+            ).last
+            if cls._locator_is_visible(direct_button):
+                direct_button.click(timeout=5_000)
+            else:
+                more_actions = page.locator(
+                    'button[aria-label="More actions"]'
+                ).last
+                more_actions.wait_for(state="visible", timeout=5_000)
+                more_actions.click(timeout=5_000)
+                read_aloud = page.locator(
+                    '[role="menuitem"]:has-text("Read aloud"), '
+                    '[role="menuitemradio"]:has-text("Read aloud")'
+                ).last
+                read_aloud.wait_for(state="visible", timeout=5_000)
+                read_aloud.click(timeout=5_000)
+            logger.info("Clicked ChatGPT Read aloud")
+            return True
+        except Exception as error:
+            logger.warning(f"Unable to click ChatGPT Read aloud: {error}")
+            return False
 
     def _set_status(self, status: str) -> None:
         if status == self._last_status:

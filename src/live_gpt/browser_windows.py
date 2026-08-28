@@ -263,11 +263,37 @@ if ({create_new_tab_value}) {{
             $nameCondition
         )
     }}
-    if (-not $newTab) {{ throw 'New Tab button not found' }}
-    $invoke = $newTab.GetCurrentPattern(
-        [System.Windows.Automation.InvokePattern]::Pattern
-    )
-    $invoke.Invoke()
+    if ($newTab) {{
+        $invoke = $newTab.GetCurrentPattern(
+            [System.Windows.Automation.InvokePattern]::Pattern
+        )
+        $invoke.Invoke()
+    }} else {{
+        [void][LiveGptWindowMessages]::PostMessage(
+            [System.IntPtr]::new({window_handle}),
+            0x0100,
+            [System.IntPtr]::new(0x11),
+            [System.IntPtr]::Zero
+        )
+        [void][LiveGptWindowMessages]::PostMessage(
+            [System.IntPtr]::new({window_handle}),
+            0x0100,
+            [System.IntPtr]::new(0x54),
+            [System.IntPtr]::Zero
+        )
+        [void][LiveGptWindowMessages]::PostMessage(
+            [System.IntPtr]::new({window_handle}),
+            0x0101,
+            [System.IntPtr]::new(0x54),
+            [System.IntPtr]::Zero
+        )
+        [void][LiveGptWindowMessages]::PostMessage(
+            [System.IntPtr]::new({window_handle}),
+            0x0101,
+            [System.IntPtr]::new(0x11),
+            [System.IntPtr]::Zero
+        )
+    }}
     Start-Sleep -Milliseconds 250
 }}
 $addressCondition = New-Object System.Windows.Automation.PropertyCondition(
