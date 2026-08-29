@@ -10,8 +10,13 @@ live-gpt
 
 The app starts as a translucent, always-on-top overlay centered above the
 bottom of the screen and also places an icon in the Windows system tray. Drag
-any non-button area to reposition it. Use the overlay's **Hide** and **Exit**
-buttons, or double-click the tray icon to restore a hidden overlay.
+any non-button area to reposition it, or drag any border or corner to resize
+it. The lock button beside **Configure** freezes both its position and size;
+click it again to unlock. When the pointer is outside the overlay, its frame,
+title controls, and microphone become fully transparent while the input area
+stays visible. They return when the pointer enters or while a border is being
+resized. Use the overlay's **Hide** and **Exit** buttons, or double-click the
+tray icon to restore a hidden overlay.
 
 Press and hold the microphone button to start ChatGPT's browser dictation
 through Playwright. Releasing it clicks ChatGPT's **Done** control, waits for
@@ -21,7 +26,10 @@ recognition, so the browser may ask for microphone permission the first time.
 Live GPT does not record audio locally or download a speech-recognition model.
 While the button is held, the input area is replaced by a waiting state until
 ChatGPT's dictation-end control appears, followed by a listening state. Closing
-the app cancels these browser waits promptly.
+the app cancels these browser waits promptly. Before a new session, Live GPT
+cancels any stale browser dictation. A mouse dictation must remain held for at
+least 0.5 seconds after ChatGPT starts listening or it is cancelled. The global
+hold hotkey waits 0.3 seconds before starting, so a quick tap has no effect.
 
 The recognized text remains editable. When the editor contains text, its
 paper-plane button sends the current text through Playwright to the selected
@@ -41,6 +49,20 @@ image attachments and, unless **No screenshot** is selected, captures the
 chosen source, scales its longest edge down to 1920 pixels when necessary, and
 uploads it as lossless WebP before clicking Send. Window capture uses the
 BitBlt/PrintWindow approach with full-content rendering enabled.
+When a screenshot source is selected, a **No screenshot** action also appears
+inside the editor so the current prompt can be sent as text without changing
+the selector.
+
+The **Configure** button opens the global-hotkey settings. Defaults are
+**Caps Lock** (hold to dictate), **Ctrl+S** (send with the selected screenshot),
+and **Ctrl+D** (send without a screenshot). The shortcuts work while the
+overlay is hidden or unfocused. Live GPT observes their key state without
+registering or swallowing the keys, so the foreground program continues to
+receive the same keystrokes. Changes are saved for the current Windows user.
+The editor and microphone remain disabled until a ChatGPT window is connected.
+Status tips appear as the editor hint rather than in a separate row; errors use
+a red hint.
+
 The reply streams into the former input area. After the completed reply becomes
 stable, Live GPT clicks ChatGPT's **Read aloud** button. During playback, the
 response area becomes a large, full-width two-label subtitle view that follows

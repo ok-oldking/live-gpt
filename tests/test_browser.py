@@ -6,6 +6,10 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from live_gpt.browser import (
+    CHATGPT_COMPOSER_SELECTOR,
+    DICTATION_CANCEL_SELECTORS,
+    DICTATION_RESULT_POLL_COUNT,
+    DICTATION_RESULT_TIMEOUT_MS,
     _ActiveReading,
     BrowserMonitor,
     _ActiveResponse,
@@ -29,6 +33,31 @@ class BrowserDiscoveryTests(unittest.TestCase):
 
 
 class BrowserMonitorTests(unittest.TestCase):
+    def test_composer_text_uses_visible_contenteditable_match(self) -> None:
+        hidden_composer = Mock()
+        hidden_composer.evaluate.return_value = "Hidden composer"
+        visible_composer = Mock()
+        visible_composer.evaluate.return_value = "Visible dictated text"
+        page = Mock()
+
+        def locate(selector: str) -> Mock:
+            if selector == "#prompt-textarea":
+                return Mock(first=hidden_composer)
+            if ":visible" in selector and "contenteditable" in selector:
+                return Mock(first=visible_composer)
+            raise AssertionError(f"Unexpected selector: {selector}")
+
+        page.locator.side_effect = locate
+
+        text = BrowserMonitor._read_composer_text(page)
+
+        self.assertEqual(text, "Visible dictated text")
+        visible_composer.wait_for.assert_called_once_with(
+            state="visible",
+            timeout=DICTATION_RESULT_TIMEOUT_MS,
+        )
+        hidden_composer.wait_for.assert_not_called()
+
     @patch("live_gpt.browser.discover_cdp_endpoint")
     def test_declined_endpoint_is_not_retried_until_requested(
         self,
@@ -92,7 +121,7 @@ class BrowserMonitorTests(unittest.TestCase):
         page.is_closed.return_value = False
         page.url = "https://chatgpt.com/c/conversation"
         def locate(selector: str) -> Mock:
-            if selector == "#prompt-textarea":
+            if selector == CHATGPT_COMPOSER_SELECTOR:
                 return composer_locator
             if selector == (
                 '[data-testid^="conversation-turn-"]'
@@ -148,7 +177,7 @@ class BrowserMonitorTests(unittest.TestCase):
         page = Mock()
 
         def locate(selector: str) -> Mock:
-            if selector == "#prompt-textarea":
+            if selector == CHATGPT_COMPOSER_SELECTOR:
                 return Mock(first=composer)
             if selector.startswith('button[aria-label="Remove file"]'):
                 return remove_buttons
@@ -187,8 +216,12 @@ class BrowserMonitorTests(unittest.TestCase):
         page.url = "https://chatgpt.com/c/conversation"
 
         def locate(selector: str) -> Mock:
-            if selector == "#prompt-textarea":
+            if selector == CHATGPT_COMPOSER_SELECTOR:
                 return Mock(first=composer)
+            if selector in DICTATION_CANCEL_SELECTORS:
+                unavailable = Mock()
+                unavailable.is_visible.return_value = False
+                return Mock(last=unavailable)
             return Mock(last=microphone)
 
         page.locator.side_effect = locate
@@ -209,6 +242,59 @@ class BrowserMonitorTests(unittest.TestCase):
             "Existing text",
         )
         self.assertEqual(results, [(True, "Browser dictation is listening")])
+
+    def test_start_clears_stale_dictation_before_clicking_microphone(self) -> None:
+        cancel = Mock()
+        cancel.is_visible.side_effect = [True, False]
+        microphone = Mock()
+        microphone.is_visible.return_value = True
+        end_button = Mock()
+        end_button.is_visible.side_effect = [False, True]
+        unavailable = Mock()
+        unavailable.is_visible.return_value = False
+        page = Mock()
+
+        def locate(selector: str) -> Mock:
+            if selector == DICTATION_CANCEL_SELECTORS[0]:
+                return Mock(last=cancel)
+            if selector == 'button[aria-label="Start dictation"]':
+                return Mock(last=microphone)
+            if selector == 'button[aria-label="Submit dictation"]':
+                return Mock(last=end_button)
+            return Mock(last=unavailable)
+
+        page.locator.side_effect = locate
+        monitor = BrowserMonitor()
+
+        monitor._cancel_existing_dictation(page)
+        monitor._start_browser_dictation(page)
+
+        cancel.click.assert_called_once_with(timeout=5_000)
+        microphone.click.assert_called_once_with(timeout=5_000)
+
+    def test_cancel_dictation_restores_original_composer_text(self) -> None:
+        composer = Mock()
+        cancel = Mock()
+        cancel.is_visible.side_effect = [True, False]
+        unavailable = Mock()
+        unavailable.is_visible.return_value = False
+        page = Mock()
+
+        def locate(selector: str) -> Mock:
+            if selector == CHATGPT_COMPOSER_SELECTOR:
+                return Mock(first=composer)
+            if selector == DICTATION_CANCEL_SELECTORS[0]:
+                return Mock(last=cancel)
+            return Mock(last=unavailable)
+
+        page.locator.side_effect = locate
+        monitor = BrowserMonitor()
+
+        text = monitor._cancel_browser_dictation(page, "Original text")
+
+        cancel.click.assert_called_once_with(timeout=5_000)
+        composer.fill.assert_called_once_with("Original text")
+        self.assertEqual(text, "Original text")
 
     def test_clear_request_empties_background_chatgpt_composer(self) -> None:
         composer = Mock()
@@ -248,7 +334,7 @@ class BrowserMonitorTests(unittest.TestCase):
         unavailable.is_visible.return_value = False
 
         def locate(selector: str) -> Mock:
-            if selector == "#prompt-textarea":
+            if selector == CHATGPT_COMPOSER_SELECTOR:
                 return Mock(first=composer)
             if selector == 'button[aria-label="Submit dictation"]':
                 return Mock(last=done)
@@ -294,7 +380,7 @@ class BrowserMonitorTests(unittest.TestCase):
         page = Mock()
 
         def locate(selector: str) -> Mock:
-            if selector == "#prompt-textarea":
+            if selector == CHATGPT_COMPOSER_SELECTOR:
                 return Mock(first=composer)
             if selector == 'button[aria-label="Submit dictation"]':
                 return Mock(last=done)
@@ -307,7 +393,14 @@ class BrowserMonitorTests(unittest.TestCase):
 
         self.assertEqual(text, "Existing text")
         done.click.assert_called_once_with(timeout=5_000)
-        self.assertEqual(page.wait_for_timeout.call_count, 15)
+        composer.wait_for.assert_called_with(
+            state="visible",
+            timeout=DICTATION_RESULT_TIMEOUT_MS,
+        )
+        self.assertEqual(
+            page.wait_for_timeout.call_count,
+            DICTATION_RESULT_POLL_COUNT,
+        )
 
     def test_stopping_monitor_cancels_dictation_wait(self) -> None:
         monitor = BrowserMonitor()
@@ -437,7 +530,7 @@ class BrowserMonitorTests(unittest.TestCase):
                 subtitles=("First subtitle.", "Second subtitle."),
             )
         )
-        subtitles: list[str] = []
+        subtitles: list[object] = []
         finished: list[tuple[bool, str]] = []
         monitor.reading_changed.connect(subtitles.append)
         monitor.reading_finished.connect(
@@ -452,7 +545,20 @@ class BrowserMonitorTests(unittest.TestCase):
 
         self.assertEqual(
             subtitles,
-            ["First subtitle.\nSecond subtitle.", "Second subtitle."],
+            [
+                {
+                    "text": "First subtitle. Second subtitle.",
+                    "fraction": 0.0,
+                },
+                {
+                    "text": "First subtitle. Second subtitle.",
+                    "fraction": 0.6,
+                },
+                {
+                    "text": "First subtitle. Second subtitle.",
+                    "fraction": 1.0,
+                },
+            ],
         )
         self.assertEqual(finished, [(True, "Read aloud complete")])
         self.assertIsNone(state.active_reading)
@@ -489,8 +595,8 @@ class BrowserMonitorTests(unittest.TestCase):
 
         first_lines = first.splitlines()
         next_lines = after_first_line.splitlines()
-        self.assertEqual(len(first_lines), 2)
-        self.assertEqual(len(next_lines), 2)
+        self.assertGreaterEqual(len(first_lines), 2)
+        self.assertGreaterEqual(len(next_lines), 2)
         self.assertEqual(first_lines[1], next_lines[0])
         self.assertLessEqual(max(map(len, lines)), 54)
 

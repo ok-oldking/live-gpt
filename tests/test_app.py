@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import os
+import time
 import unittest
 from unittest.mock import Mock, patch
 
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import Qt  # noqa: E402
+from PySide6.QtCore import QPoint, QRect, Qt  # noqa: E402
+from PySide6.QtGui import QPalette  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
@@ -79,6 +81,141 @@ class TrayControllerBrowserTests(unittest.TestCase):
         try:
             self.assertEqual(window.width(), 1140)
             self.assertEqual(window.height(), 240)
+            self.assertFalse(window.configure_button.icon().isNull())
+            window.show()
+            QApplication.processEvents()
+            self.assertLess(
+                window.configure_button.geometry().left(),
+                window.lock_button.geometry().left(),
+            )
+            self.assertLess(
+                window.lock_button.geometry().left(),
+                window.hide_button.geometry().left(),
+            )
+        finally:
+            window.close()
+
+    def test_overlay_can_resize_and_lock_its_geometry(self) -> None:
+        window = OverlayWindow()
+        try:
+            window.show()
+            QApplication.processEvents()
+
+            window.resize(1280, 320)
+            QApplication.processEvents()
+            self.assertEqual(window.size().width(), 1280)
+            self.assertEqual(window.size().height(), 320)
+
+            window.lock_button.click()
+            locked_size = window.size()
+            window.resize(900, 200)
+            QApplication.processEvents()
+
+            self.assertTrue(window.lock_button.isChecked())
+            self.assertEqual(window.size(), locked_size)
+
+            window.lock_button.click()
+            window.resize(900, 200)
+            QApplication.processEvents()
+
+            self.assertFalse(window.lock_button.isChecked())
+            self.assertEqual(window.size().width(), 900)
+            self.assertEqual(window.size().height(), 200)
+        finally:
+            window.close()
+
+    def test_every_overlay_border_and_corner_is_resizable(self) -> None:
+        window = OverlayWindow()
+        try:
+            window.show()
+            window.setGeometry(100, 100, 1000, 300)
+            QApplication.processEvents()
+            width = window._resize_surface.width()
+            height = window._resize_surface.height()
+            self.assertEqual(
+                window._resize_edges_at(QPoint(1, height // 2)),
+                Qt.Edge.LeftEdge,
+            )
+            self.assertEqual(
+                window._resize_edges_at(QPoint(15, height // 2)),
+                Qt.Edge.LeftEdge,
+            )
+            self.assertEqual(
+                window._resize_edges_at(QPoint(width - 2, height // 2)),
+                Qt.Edge.RightEdge,
+            )
+            self.assertEqual(
+                window._resize_edges_at(QPoint(width // 2, 1)),
+                Qt.Edge.TopEdge,
+            )
+            self.assertEqual(
+                window._resize_edges_at(QPoint(width // 2, height - 2)),
+                Qt.Edge.BottomEdge,
+            )
+            self.assertEqual(
+                window._resize_edges_at(QPoint(1, 1)),
+                Qt.Edge.TopEdge | Qt.Edge.LeftEdge,
+            )
+
+            window._begin_border_resize(
+                Qt.Edge.TopEdge | Qt.Edge.LeftEdge,
+                QPoint(100, 100),
+            )
+            window._update_border_resize(QPoint(80, 70))
+
+            self.assertEqual(window.geometry(), QRect(80, 70, 1020, 330))
+            window._end_border_resize()
+        finally:
+            window.close()
+
+    def test_chrome_is_transparent_outside_and_visible_while_resizing(self) -> None:
+        window = OverlayWindow()
+        try:
+            self.assertEqual(window._title_opacity.opacity(), 0.0)
+            self.assertEqual(window._microphone_opacity.opacity(), 0.0)
+            self.assertFalse(window.panel.property("chromeVisible"))
+            self.assertFalse(
+                window._resize_surface.property("chromeVisible")
+            )
+
+            window._set_chrome_visible(True)
+
+            self.assertEqual(window._title_opacity.opacity(), 1.0)
+            self.assertEqual(window._microphone_opacity.opacity(), 1.0)
+            self.assertTrue(window.panel.property("chromeVisible"))
+            self.assertTrue(
+                window._resize_surface.property("chromeVisible")
+            )
+            window.show()
+            QApplication.processEvents()
+            corner = window.grab().toImage().pixelColor(1, 1)
+            self.assertEqual(corner.alpha(), 0)
+
+            window._begin_border_resize(Qt.Edge.LeftEdge, QPoint(0, 0))
+            window._set_chrome_visible(False)
+
+            self.assertEqual(window._title_opacity.opacity(), 1.0)
+            self.assertTrue(window.panel.property("chromeVisible"))
+        finally:
+            window.close()
+
+    def test_status_uses_input_hint_and_errors_are_red(self) -> None:
+        window = OverlayWindow()
+        try:
+            self.assertFalse(hasattr(window, "status_label"))
+
+            window.set_status("Connection failed", error=True)
+
+            self.assertEqual(
+                window.transcript_area.placeholderText(),
+                "Connection failed",
+            )
+            self.assertEqual(
+                window.transcript_area.palette()
+                .color(QPalette.ColorRole.PlaceholderText)
+                .name(),
+                "#ff667a",
+            )
         finally:
             window.close()
 
@@ -119,7 +256,7 @@ class TrayControllerBrowserTests(unittest.TestCase):
         controller.browser_monitor.request_clear.assert_called_once_with(
             "selected-tab"
         )
-        controller.window.status_label.setText.assert_called_once_with(
+        controller.window.set_status.assert_called_once_with(
             "Clearing ChatGPT input…"
         )
 
@@ -135,12 +272,16 @@ class TrayControllerBrowserTests(unittest.TestCase):
             self.assertTrue(window.transcript_area.isHidden())
             self.assertFalse(window.subtitle_panel.isHidden())
             self.assertEqual(
-                window.subtitle_line_one.text(),
-                "Current subtitle",
-            )
-            self.assertEqual(
-                window.subtitle_line_two.text(),
-                "Next subtitle",
+                " ".join(
+                    filter(
+                        None,
+                        (
+                            window.subtitle_line_one.text(),
+                            window.subtitle_line_two.text(),
+                        ),
+                    )
+                ),
+                "Current subtitle Next subtitle",
             )
 
             window.finish_reading(True, "Read aloud complete")
@@ -151,6 +292,60 @@ class TrayControllerBrowserTests(unittest.TestCase):
                 window.transcript_area.toPlainText(),
                 "The complete response",
             )
+        finally:
+            window.close()
+
+    def test_subtitle_lines_use_the_available_panel_width(self) -> None:
+        window = OverlayWindow()
+        try:
+            window.show()
+            window.begin_reading("Reading aloud…")
+            QApplication.processEvents()
+            subtitle = " ".join(
+                f"subtitle-word-{index}" for index in range(60)
+            )
+
+            window.set_reading_subtitle(subtitle)
+
+            available = window.subtitle_panel.width() - 32
+            metrics = window.subtitle_line_one.fontMetrics()
+            first_width = metrics.horizontalAdvance(
+                window.subtitle_line_one.text()
+            )
+            second_width = metrics.horizontalAdvance(
+                window.subtitle_line_two.text()
+            )
+            self.assertGreater(first_width, available * 0.7)
+            self.assertGreater(second_width, available * 0.7)
+            self.assertLessEqual(first_width, available)
+            self.assertLessEqual(second_width, available)
+        finally:
+            window.close()
+
+    def test_subtitle_progress_rolls_exactly_one_rendered_line(self) -> None:
+        window = OverlayWindow()
+        try:
+            window.show()
+            window.begin_reading("Reading aloud…")
+            QApplication.processEvents()
+            text = " ".join(f"spoken-word-{index}" for index in range(80))
+
+            window.set_reading_subtitle({"text": text, "fraction": 0.0})
+            previous_second_line = window.subtitle_line_two.text()
+            lines = window._subtitle_lines()
+            weights = [max(len(line), 12) for line in lines]
+            after_first_line = (weights[0] + 0.1) / sum(weights)
+
+            window.set_reading_subtitle(
+                {"text": text, "fraction": after_first_line}
+            )
+
+            self.assertTrue(previous_second_line)
+            self.assertEqual(
+                window.subtitle_line_one.text(),
+                previous_second_line,
+            )
+            self.assertEqual(window._subtitle_line_index, 1)
         finally:
             window.close()
 
@@ -171,6 +366,67 @@ class TrayControllerBrowserTests(unittest.TestCase):
             self.assertEqual(window.capture_source_combo.itemText(0), "No screenshot")
             self.assertIsNone(window.capture_source_combo.itemData(0))
             self.assertEqual(window.capture_source_combo.itemData(1), source)
+        finally:
+            window.close()
+
+    def test_selected_screenshot_adds_text_only_send_action(self) -> None:
+        window = OverlayWindow()
+        source = CaptureSource(
+            "display:1",
+            "Screenshot desktop",
+            "display",
+            0,
+            0,
+            1920,
+            1080,
+        )
+        requests: list[tuple[str, object]] = []
+        window.send_requested.connect(
+            lambda text, selected: requests.append((text, selected))
+        )
+        try:
+            window.set_chatgpt_tabs(
+                [{"id": "tab", "title": "ChatGPT", "url": "https://chatgpt.com"}]
+            )
+            window.set_capture_sources([source])
+            window.capture_source_combo.setCurrentIndex(1)
+            window.set_transcript("Explain this")
+
+            self.assertFalse(
+                window.send_without_screenshot_button.isHidden()
+            )
+            window.send_without_screenshot_button.click()
+
+            self.assertEqual(requests, [("Explain this", None)])
+        finally:
+            window.close()
+
+    def test_normal_send_keeps_selected_screenshot(self) -> None:
+        window = OverlayWindow()
+        source = CaptureSource(
+            "display:1",
+            "Screenshot desktop",
+            "display",
+            0,
+            0,
+            1920,
+            1080,
+        )
+        requests: list[tuple[str, object]] = []
+        window.send_requested.connect(
+            lambda text, selected: requests.append((text, selected))
+        )
+        try:
+            window.set_chatgpt_tabs(
+                [{"id": "tab", "title": "ChatGPT", "url": "https://chatgpt.com"}]
+            )
+            window.set_capture_sources([source])
+            window.capture_source_combo.setCurrentIndex(1)
+            window.set_transcript("Explain this")
+
+            window.send_button.click()
+
+            self.assertEqual(requests, [("Explain this", source)])
         finally:
             window.close()
 
@@ -208,6 +464,7 @@ class TrayControllerBrowserTests(unittest.TestCase):
             True,
             "Browser dictation is listening",
         )
+        controller._dictation_listening_since = time.monotonic() - 0.6
         controller.finish_dictation()
 
         controller.browser_monitor.request_start_dictation.assert_called_once_with(
@@ -219,7 +476,94 @@ class TrayControllerBrowserTests(unittest.TestCase):
         controller.window.begin_dictation_waiting.assert_called_once_with()
         controller.window.set_dictation_listening.assert_called_once_with()
         controller.window.set_dictation_finishing.assert_called_once_with()
-        self.assertIsNone(controller.dictation_tab_id)
+        self.assertEqual(controller._dictation_state, "finishing")
+
+    def test_short_mouse_dictation_is_cancelled(self) -> None:
+        controller = TrayController.__new__(TrayController)
+        controller.window = Mock()
+        controller.window.transcript_area.is_showing_response = False
+        controller.browser_monitor = Mock()
+        controller.selected_chatgpt_tab_id = "selected-tab"
+        controller.dictation_tab_id = None
+        controller._dictation_state = "idle"
+        controller._dictation_input_held = False
+        controller._dictation_listening_since = None
+
+        controller.start_dictation()
+        controller._on_dictation_started(True, "Listening")
+        controller.finish_dictation()
+
+        controller.browser_monitor.request_cancel_dictation.assert_called_once_with(
+            "selected-tab"
+        )
+        controller.browser_monitor.request_finish_dictation.assert_not_called()
+        self.assertEqual(controller._dictation_state, "cancelling")
+
+    def test_release_before_browser_listens_cancels_when_ready(self) -> None:
+        controller = TrayController.__new__(TrayController)
+        controller.window = Mock()
+        controller.window.transcript_area.is_showing_response = False
+        controller.browser_monitor = Mock()
+        controller.selected_chatgpt_tab_id = "selected-tab"
+        controller.dictation_tab_id = None
+        controller._dictation_state = "idle"
+        controller._dictation_input_held = False
+        controller._dictation_listening_since = None
+
+        controller.start_dictation()
+        controller.finish_dictation()
+        controller._on_dictation_started(True, "Listening")
+
+        controller.browser_monitor.request_cancel_dictation.assert_called_once_with(
+            "selected-tab"
+        )
+
+    def test_press_during_cancel_restarts_only_if_still_held(self) -> None:
+        controller = TrayController.__new__(TrayController)
+        controller.window = Mock()
+        controller.window.transcript_area.is_showing_response = False
+        controller.browser_monitor = Mock()
+        controller.selected_chatgpt_tab_id = "selected-tab"
+        controller.dictation_tab_id = None
+        controller._dictation_state = "idle"
+        controller._dictation_input_held = False
+        controller._dictation_listening_since = None
+
+        controller.start_dictation()
+        controller._on_dictation_started(True, "Listening")
+        controller.finish_dictation()
+        controller.start_dictation()
+        controller._on_dictation_finished(
+            True,
+            "Original text",
+            "Dictation cancelled",
+        )
+
+        self.assertEqual(
+            controller.browser_monitor.request_start_dictation.call_count,
+            2,
+        )
+        self.assertEqual(controller._dictation_state, "starting")
+
+    def test_input_and_microphone_require_a_chatgpt_window(self) -> None:
+        window = OverlayWindow()
+        try:
+            self.assertFalse(window.transcript_area.isEnabled())
+            self.assertFalse(window.microphone_button.isEnabled())
+
+            window.set_chatgpt_tabs(
+                [{"id": "tab", "title": "ChatGPT", "url": "https://chatgpt.com"}]
+            )
+
+            self.assertTrue(window.transcript_area.isEnabled())
+            self.assertTrue(window.microphone_button.isEnabled())
+
+            window.set_chatgpt_tabs([])
+
+            self.assertFalse(window.transcript_area.isEnabled())
+            self.assertFalse(window.microphone_button.isEnabled())
+        finally:
+            window.close()
 
     def test_finished_dictation_populates_app_input(self) -> None:
         controller = TrayController.__new__(TrayController)

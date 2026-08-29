@@ -30,6 +30,19 @@ logger = Logger.get_logger(__name__)
 ASSISTANT_TURN_SELECTOR = (
     '[data-testid^="conversation-turn-"][data-turn="assistant"]'
 )
+CHATGPT_COMPOSER_SELECTOR = (
+    '[data-composer-surface="true"]:visible '
+    '#prompt-textarea[contenteditable="true"]:visible, '
+    '[data-composer-surface="true"]:visible '
+    '[contenteditable="true"][role="textbox"]:visible, '
+    '#prompt-textarea[contenteditable="true"]:visible, '
+    'textarea[name="prompt-textarea"]:visible'
+)
+DICTATION_RESULT_TIMEOUT_MS = 20_000
+DICTATION_RESULT_POLL_INTERVAL_MS = 200
+DICTATION_RESULT_POLL_COUNT = (
+    DICTATION_RESULT_TIMEOUT_MS // DICTATION_RESULT_POLL_INTERVAL_MS
+)
 DICTATION_END_SELECTORS = (
     'button[aria-label="Submit dictation"]',
     'button[aria-label="Done"]',
@@ -39,6 +52,16 @@ DICTATION_END_SELECTORS = (
     'button[data-testid="composer-dictation-done-button"]',
     'button[data-testid="dictation-done-button"]',
     'button:text-is("Done")',
+)
+DICTATION_CANCEL_SELECTORS = (
+    'button[aria-label="Cancel dictation"]',
+    'button[aria-label="Cancel recording"]',
+    'button[aria-label*="cancel" i][aria-label*="dictation" i]',
+    'button[aria-label*="cancel" i][aria-label*="record" i]',
+    'button[data-testid="composer-dictation-cancel-button"]',
+    'button[data-testid="dictation-cancel-button"]',
+    'button[data-testid*="dictation"][data-testid*="cancel"]',
+    'form button:text-is("Cancel")',
 )
 _MEDIA_TRACKER_SCRIPT = """
 () => {
@@ -135,6 +158,7 @@ class _ActiveReading:
     subtitles: tuple[str, ...]
     started_at: float = field(default_factory=time.monotonic)
     last_subtitle: str = ""
+    last_progress_fraction: float | None = None
     audio_seen: bool = False
     playback_started_at: float | None = None
     last_play_count: int = 0
@@ -150,7 +174,7 @@ class BrowserMonitor(QThread):
     response_changed = Signal(str, str)
     response_finished = Signal(bool, str)
     reading_started = Signal(str)
-    reading_changed = Signal(str)
+    reading_changed = Signal(object)
     reading_finished = Signal(bool, str)
     dictation_started = Signal(bool, str)
     dictation_finished = Signal(bool, str, str)
@@ -200,6 +224,12 @@ class BrowserMonitor(QThread):
     def request_finish_dictation(self, tab_id: str) -> None:
         self._dictation_requests.put(
             _DictationRequest(action="finish", tab_id=tab_id)
+        )
+        self._wake_event.set()
+
+    def request_cancel_dictation(self, tab_id: str) -> None:
+        self._dictation_requests.put(
+            _DictationRequest(action="cancel", tab_id=tab_id)
         )
         self._wake_event.set()
 
@@ -413,6 +443,7 @@ class BrowserMonitor(QThread):
 
             try:
                 if request.action == "start":
+                    self._cancel_existing_dictation(page)
                     initial_text = self._read_composer_text(page)
                     self._start_browser_dictation(page)
                     self._dictation_initial_text[request.tab_id] = initial_text
@@ -420,7 +451,7 @@ class BrowserMonitor(QThread):
                         True,
                         "Browser dictation is listening",
                     )
-                else:
+                elif request.action == "finish":
                     initial_text = self._dictation_initial_text.pop(
                         request.tab_id,
                         "",
@@ -433,6 +464,20 @@ class BrowserMonitor(QThread):
                         True,
                         text,
                         "Dictation copied from ChatGPT",
+                    )
+                else:
+                    initial_text = self._dictation_initial_text.pop(
+                        request.tab_id,
+                        "",
+                    )
+                    text = self._cancel_browser_dictation(
+                        page,
+                        initial_text,
+                    )
+                    self.dictation_finished.emit(
+                        True,
+                        text,
+                        "Dictation cancelled",
                     )
             except Exception as error:
                 logger.error(
@@ -731,10 +776,17 @@ class BrowserMonitor(QThread):
         if fraction is None:
             return
 
-        subtitle = self._subtitle_at_progress(reading.subtitles, fraction)
-        if subtitle and subtitle != reading.last_subtitle:
-            reading.last_subtitle = subtitle
-            self.reading_changed.emit(subtitle)
+        if (
+            reading.last_progress_fraction is None
+            or abs(fraction - reading.last_progress_fraction) >= 0.0001
+        ):
+            reading.last_progress_fraction = fraction
+            self.reading_changed.emit(
+                {
+                    "text": reading.full_text,
+                    "fraction": fraction,
+                }
+            )
 
         if not finished:
             return
@@ -781,7 +833,7 @@ class BrowserMonitor(QThread):
         text: str,
         screenshot_webp: bytes | None = None,
     ) -> None:
-        composer = page.locator("#prompt-textarea").first
+        composer = page.locator(CHATGPT_COMPOSER_SELECTOR).first
         composer.wait_for(state="visible", timeout=5_000)
         cls._clear_chatgpt_attachments(page)
         composer.fill(text)
@@ -829,13 +881,16 @@ class BrowserMonitor(QThread):
 
     @staticmethod
     def _clear_chatgpt_composer(page: Any) -> None:
-        composer = page.locator("#prompt-textarea").first
+        composer = page.locator(CHATGPT_COMPOSER_SELECTOR).first
         composer.wait_for(state="visible", timeout=5_000)
         composer.fill("")
 
     @staticmethod
-    def _read_composer_text(page: Any, timeout: int = 5_000) -> str:
-        composer = page.locator("#prompt-textarea").first
+    def _read_composer_text(
+        page: Any,
+        timeout: int = DICTATION_RESULT_TIMEOUT_MS,
+    ) -> str:
+        composer = page.locator(CHATGPT_COMPOSER_SELECTOR).first
         composer.wait_for(state="visible", timeout=timeout)
         text = composer.evaluate(
             """
@@ -873,6 +928,63 @@ class BrowserMonitor(QThread):
                 raise RuntimeError("Dictation cancelled")
             raise RuntimeError("ChatGPT did not start listening")
 
+    def _cancel_existing_dictation(self, page: Any) -> bool:
+        """Return ChatGPT to an idle composer before starting a new session."""
+        cancel_button = None
+        for selector in DICTATION_CANCEL_SELECTORS:
+            candidate = page.locator(selector).last
+            if self._locator_is_visible(candidate):
+                cancel_button = candidate
+                break
+        if cancel_button is None:
+            return False
+
+        logger.info("Cancelling stale ChatGPT dictation before starting")
+        cancel_button.click(timeout=5_000)
+        if not self._wait_for_dictation_controls_hidden(page):
+            raise RuntimeError("ChatGPT's stale dictation did not cancel")
+        return True
+
+    def _cancel_browser_dictation(
+        self,
+        page: Any,
+        initial_text: str,
+    ) -> str:
+        button = self._first_visible_locator(
+            page,
+            DICTATION_CANCEL_SELECTORS,
+            timeout=2_000,
+        )
+        if button is None:
+            button = self._first_visible_locator(
+                page,
+                DICTATION_END_SELECTORS,
+                timeout=2_000,
+            )
+        if button is not None:
+            button.click(timeout=5_000)
+            if not self._wait_for_dictation_controls_hidden(page):
+                raise RuntimeError("ChatGPT's dictation did not cancel")
+        elif not self._stop_requested:
+            raise RuntimeError("ChatGPT's dictation Cancel button was not found")
+
+        composer = page.locator(CHATGPT_COMPOSER_SELECTOR).first
+        composer.wait_for(state="visible", timeout=5_000)
+        composer.fill(initial_text)
+        return initial_text.strip()
+
+    def _wait_for_dictation_controls_hidden(self, page: Any) -> bool:
+        for _ in range(50):
+            if self._stop_requested:
+                return False
+            if not self._any_visible_locator(
+                page,
+                DICTATION_CANCEL_SELECTORS + DICTATION_END_SELECTORS,
+            ):
+                return True
+            page.wait_for_timeout(100)
+        return False
+
     def _finish_browser_dictation(
         self,
         page: Any,
@@ -893,11 +1005,14 @@ class BrowserMonitor(QThread):
         changed = False
         stable_polls = 0
         end_hidden_polls = 0
-        for _ in range(40):
+        for _ in range(DICTATION_RESULT_POLL_COUNT):
             if self._stop_requested:
                 break
-            page.wait_for_timeout(200)
-            current_text = self._read_composer_text(page, timeout=1_000)
+            page.wait_for_timeout(DICTATION_RESULT_POLL_INTERVAL_MS)
+            current_text = self._read_composer_text(
+                page,
+                timeout=DICTATION_RESULT_TIMEOUT_MS,
+            )
             if current_text == text:
                 stable_polls += 1
             else:
@@ -913,7 +1028,7 @@ class BrowserMonitor(QThread):
                 return text
             if (
                 not changed
-                and end_hidden_polls >= 15
+                and end_hidden_polls >= DICTATION_RESULT_POLL_COUNT
             ):
                 return text
         return text

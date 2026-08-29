@@ -2,21 +2,39 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from pathlib import Path
 
-from PySide6.QtCore import QPoint, QSize, QTimer, Signal, Qt
+from PySide6.QtCore import (
+    QEvent,
+    QPoint,
+    QRect,
+    QSettings,
+    QSize,
+    QTimer,
+    Signal,
+    Qt,
+)
 from PySide6.QtGui import (
     QAction,
     QCloseEvent,
+    QColor,
     QIcon,
+    QKeySequence,
     QMouseEvent,
+    QPalette,
     QTextCursor,
 )
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
     QFrame,
+    QGraphicsOpacityEffect,
     QHBoxLayout,
+    QKeySequenceEdit,
     QLabel,
     QMainWindow,
     QMenu,
@@ -34,6 +52,7 @@ from .browser import (
     open_remote_debugging_settings,
 )
 from .logger import Logger, config_logger, shutdown_logger
+from .hotkeys import GlobalHotkeyMonitor, HotkeyBinding
 from .screen_capture import CaptureSource, capture_webp, list_capture_sources
 
 
@@ -43,7 +62,99 @@ MICROPHONE_ICON_PATH = ASSET_DIRECTORY / "microphone.svg"
 HIDE_ICON_PATH = ASSET_DIRECTORY / "hide.svg"
 EXIT_ICON_PATH = ASSET_DIRECTORY / "exit.svg"
 SEND_ICON_PATH = ASSET_DIRECTORY / "send.svg"
+SETTINGS_ICON_PATH = ASSET_DIRECTORY / "settings.svg"
+LOCK_ICON_PATH = ASSET_DIRECTORY / "lock.svg"
+UNLOCK_ICON_PATH = ASSET_DIRECTORY / "unlock.svg"
 logger = Logger.get_logger(__name__)
+
+DEFAULT_HOLD_MIC_HOTKEY = "CapsLock"
+DEFAULT_SEND_HOTKEY = "Ctrl+S"
+DEFAULT_SEND_WITHOUT_SCREENSHOT_HOTKEY = "Ctrl+D"
+HOTKEY_SETTING_KEYS = {
+    "hold": "hotkeys/hold_microphone",
+    "send": "hotkeys/send",
+    "send_without_screenshot": "hotkeys/send_without_screenshot",
+}
+
+
+class HotkeyConfigDialog(QDialog):
+    """Edit the pass-through global shortcuts used by the overlay."""
+
+    def __init__(
+        self,
+        hold_microphone: QKeySequence,
+        send: QKeySequence,
+        send_without_screenshot: QKeySequence,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Live GPT configuration")
+        self.setMinimumWidth(430)
+
+        self.hold_microphone_edit = self._sequence_edit(hold_microphone)
+        self.send_edit = self._sequence_edit(send)
+        self.send_without_screenshot_edit = self._sequence_edit(
+            send_without_screenshot
+        )
+
+        form = QFormLayout()
+        form.addRow("Hold microphone:", self.hold_microphone_edit)
+        form.addRow("Send:", self.send_edit)
+        form.addRow(
+            "Send without screenshot:",
+            self.send_without_screenshot_edit,
+        )
+
+        note = QLabel(
+            "These shortcuts work globally and are still passed to the "
+            "foreground program."
+        )
+        note.setWordWrap(True)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(note)
+        layout.addWidget(buttons)
+
+    @staticmethod
+    def _sequence_edit(sequence: QKeySequence) -> QKeySequenceEdit:
+        edit = QKeySequenceEdit(sequence)
+        edit.setMaximumSequenceLength(1)
+        return edit
+
+    def sequences(self) -> dict[str, QKeySequence]:
+        return {
+            "hold": self.hold_microphone_edit.keySequence(),
+            "send": self.send_edit.keySequence(),
+            "send_without_screenshot": (
+                self.send_without_screenshot_edit.keySequence()
+            ),
+        }
+
+    def bindings(self) -> dict[str, HotkeyBinding]:
+        bindings = {
+            name: HotkeyBinding.from_sequence(sequence)
+            for name, sequence in self.sequences().items()
+        }
+        texts = [binding.text.casefold() for binding in bindings.values()]
+        if len(set(texts)) != len(texts):
+            raise ValueError("Each action must use a different hotkey")
+        return bindings
+
+    def accept(self) -> None:
+        try:
+            self.bindings()
+        except ValueError as error:
+            QMessageBox.warning(self, "Invalid hotkey", str(error))
+            return
+        super().accept()
 
 
 class TranscriptEditor(QPlainTextEdit):
@@ -54,6 +165,7 @@ class TranscriptEditor(QPlainTextEdit):
         self._response_mode = False
         self._response_complete = False
         self._full_response_text = ""
+        self._screenshot_selected = False
 
         self.clear_button = QPushButton(self)
         self.clear_button.setObjectName("clearButton")
@@ -71,19 +183,47 @@ class TranscriptEditor(QPlainTextEdit):
         self.send_button.setAccessibleName("Send")
         self.send_button.setToolTip("Send")
 
+        self.send_without_screenshot_button = QPushButton(
+            "No screenshot",
+            self,
+        )
+        self.send_without_screenshot_button.setObjectName(
+            "sendWithoutScreenshotButton"
+        )
+        self.send_without_screenshot_button.setFixedSize(108, 32)
+        self.send_without_screenshot_button.setAccessibleName(
+            "Send without screenshot"
+        )
+        self.send_without_screenshot_button.setToolTip(
+            "Send the text without the selected screenshot"
+        )
+
         self.textChanged.connect(self._sync_action_visibility)
         self._sync_action_visibility()
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
+        self._position_action_buttons()
+
+    def _position_action_buttons(self) -> None:
         margin = 8
         spacing = 6
         y = self.height() - self.send_button.height() - margin
         send_x = self.width() - self.send_button.width() - margin
-        clear_x = send_x - self.clear_button.width() - spacing
+        if self._screenshot_selected:
+            no_screenshot_x = (
+                send_x
+                - self.send_without_screenshot_button.width()
+                - spacing
+            )
+            clear_x = no_screenshot_x - self.clear_button.width() - spacing
+            self.send_without_screenshot_button.move(no_screenshot_x, y)
+        else:
+            clear_x = send_x - self.clear_button.width() - spacing
         self.clear_button.move(clear_x, y)
         self.send_button.move(send_x, y)
         self.clear_button.raise_()
+        self.send_without_screenshot_button.raise_()
         self.send_button.raise_()
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
@@ -153,11 +293,32 @@ class TranscriptEditor(QPlainTextEdit):
         self.clear()
         self._sync_action_visibility()
 
+    def set_screenshot_selected(self, selected: bool) -> None:
+        self._screenshot_selected = selected
+        self._sync_action_visibility()
+        self._position_action_buttons()
+
+    def set_hint(self, message: str, *, error: bool = False) -> None:
+        self.setPlaceholderText(message)
+        color = QColor("#ff667a" if error else "#aeb9d5")
+        palette = self.palette()
+        for group in (
+            QPalette.ColorGroup.Active,
+            QPalette.ColorGroup.Inactive,
+            QPalette.ColorGroup.Disabled,
+        ):
+            palette.setColor(group, QPalette.ColorRole.PlaceholderText, color)
+        self.setPalette(palette)
+
     def _sync_action_visibility(self) -> None:
         has_text = bool(self.toPlainText().strip()) and not self._response_mode
         self.clear_button.setVisible(has_text)
         self.send_button.setVisible(has_text)
-        self.setViewportMargins(0, 0, 76 if has_text else 0, 0)
+        self.send_without_screenshot_button.setVisible(
+            has_text and self._screenshot_selected
+        )
+        right_margin = 190 if has_text and self._screenshot_selected else 76
+        self.setViewportMargins(0, 0, right_margin if has_text else 0, 0)
 
 
 class OverlayWindow(QMainWindow):
@@ -167,15 +328,22 @@ class OverlayWindow(QMainWindow):
     dictation_finish_requested = Signal()
     clear_requested = Signal()
     send_requested = Signal(str, object)
+    configure_requested = Signal()
     open_remote_debugging_requested = Signal()
     chatgpt_tab_selected = Signal(str)
+    chatgpt_connection_changed = Signal(bool)
 
     def __init__(self) -> None:
         super().__init__()
         logger.debug("Creating overlay window")
         self._drag_offset: QPoint | None = None
+        self._position_locked = False
+        self._resize_edges = Qt.Edges()
+        self._resize_start_global: QPoint | None = None
+        self._resize_start_geometry: QRect | None = None
+        self._chrome_visible = False
         self.setWindowTitle("Live GPT")
-        self.setFixedSize(1140, 240)
+        self.setMinimumSize(760, 180)
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
@@ -185,16 +353,26 @@ class OverlayWindow(QMainWindow):
 
         container = QWidget(self)
         container.setObjectName("overlayContainer")
+        container.setProperty("chromeVisible", False)
+        container.setMouseTracking(True)
+        container.installEventFilter(self)
+        self._resize_surface = container
         container_layout = QVBoxLayout(container)
         container_layout.setContentsMargins(12, 12, 12, 12)
 
-        panel = QFrame(container)
-        panel.setObjectName("overlayPanel")
-        panel_layout = QVBoxLayout(panel)
+        self.panel = QFrame(container)
+        self.panel.setObjectName("overlayPanel")
+        self.panel.setProperty("chromeVisible", False)
+        self.panel.setMouseTracking(True)
+        self.panel.installEventFilter(self)
+        panel_layout = QVBoxLayout(self.panel)
         panel_layout.setContentsMargins(20, 16, 16, 18)
         panel_layout.setSpacing(14)
 
-        title_layout = QHBoxLayout()
+        self.title_bar = QWidget(self.panel)
+        self.title_bar.setObjectName("overlayTitleBar")
+        title_layout = QHBoxLayout(self.title_bar)
+        title_layout.setContentsMargins(0, 0, 0, 0)
         title = QLabel("Live GPT")
         title.setObjectName("overlayTitle")
         title_layout.addWidget(title)
@@ -220,6 +398,9 @@ class OverlayWindow(QMainWindow):
         self.capture_source_combo.setToolTip(
             "Choose a desktop or visible window to attach when sending"
         )
+        self.capture_source_combo.currentIndexChanged.connect(
+            self._capture_source_changed
+        )
         title_layout.addWidget(self.capture_source_combo, 1)
 
         self.remote_debugging_button = QPushButton("Enable Debugging")
@@ -234,7 +415,29 @@ class OverlayWindow(QMainWindow):
             self.open_remote_debugging_requested.emit
         )
         title_layout.addWidget(self.remote_debugging_button)
+
         title_layout.addStretch()
+
+        self.configure_button = QPushButton()
+        self.configure_button.setObjectName("configureButton")
+        self._configure_icon_button(
+            self.configure_button,
+            SETTINGS_ICON_PATH,
+            "Configure hotkeys",
+        )
+        self.configure_button.clicked.connect(self.configure_requested.emit)
+        title_layout.addWidget(self.configure_button)
+
+        self.lock_button = QPushButton()
+        self.lock_button.setObjectName("lockButton")
+        self.lock_button.setCheckable(True)
+        self._configure_icon_button(
+            self.lock_button,
+            UNLOCK_ICON_PATH,
+            "Lock overlay position",
+        )
+        self.lock_button.toggled.connect(self._set_position_locked)
+        title_layout.addWidget(self.lock_button)
 
         self.hide_button = QPushButton()
         self.hide_button.setObjectName("hideButton")
@@ -256,15 +459,10 @@ class OverlayWindow(QMainWindow):
         self.exit_button.clicked.connect(self.exit_requested.emit)
         title_layout.addWidget(self.exit_button)
 
-        self.status_label = QLabel("Looking for ChatGPT windows…")
-        self.status_label.setObjectName("overlayStatus")
-        self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
         self.transcript_area = TranscriptEditor()
         self.transcript_area.setObjectName("transcriptArea")
-        self.transcript_area.setPlaceholderText(
-            "Hold the microphone to dictate through ChatGPT"
-        )
+        self.transcript_area.setEnabled(False)
+        self.transcript_area.set_hint("Looking for ChatGPT windows…")
 
         self.subtitle_panel = QFrame()
         self.subtitle_panel.setObjectName("subtitlePanel")
@@ -283,6 +481,9 @@ class OverlayWindow(QMainWindow):
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
         )
         self.subtitle_line_two.setWordWrap(False)
+        self._reading_full_text = ""
+        self._reading_fraction = 0.0
+        self._subtitle_line_index = -1
         subtitle_layout.addWidget(self.subtitle_line_one, 1)
         subtitle_layout.addWidget(self.subtitle_line_two, 1)
         self.subtitle_panel.hide()
@@ -315,12 +516,19 @@ class OverlayWindow(QMainWindow):
         )
 
         self.send_button = self.transcript_area.send_button
-        self.send_button.clicked.connect(self._request_send)
+        self.send_button.clicked.connect(lambda: self._request_send(True))
+
+        self.send_without_screenshot_button = (
+            self.transcript_area.send_without_screenshot_button
+        )
+        self.send_without_screenshot_button.clicked.connect(
+            self._request_send_without_screenshot
+        )
 
         self.clear_button = self.transcript_area.clear_button
         self.clear_button.clicked.connect(self._request_clear)
 
-        panel_layout.addLayout(title_layout)
+        panel_layout.addWidget(self.title_bar)
         recording_layout = QHBoxLayout()
         recording_layout.setSpacing(16)
         recording_layout.addWidget(self.transcript_area, 1)
@@ -333,10 +541,17 @@ class OverlayWindow(QMainWindow):
             Qt.AlignmentFlag.AlignVCenter,
         )
 
-        panel_layout.addWidget(self.status_label)
         panel_layout.addLayout(recording_layout, 1)
-        container_layout.addWidget(panel)
+        container_layout.addWidget(self.panel)
         self.setCentralWidget(container)
+        self.resize(1140, 240)
+
+        self._title_opacity = QGraphicsOpacityEffect(self.title_bar)
+        self.title_bar.setGraphicsEffect(self._title_opacity)
+        self._microphone_opacity = QGraphicsOpacityEffect(
+            self.microphone_button
+        )
+        self.microphone_button.setGraphicsEffect(self._microphone_opacity)
 
         self.setStyleSheet(
             """
@@ -348,14 +563,14 @@ class OverlayWindow(QMainWindow):
                 border: 1px solid rgba(66, 220, 255, 150);
                 border-radius: 18px;
             }
+            QFrame#overlayPanel[chromeVisible="false"] {
+                background-color: transparent;
+                border-color: transparent;
+            }
             QLabel#overlayTitle {
                 color: #f5f7ff;
                 font-size: 20px;
                 font-weight: 700;
-            }
-            QLabel#overlayStatus {
-                color: rgba(228, 235, 255, 210);
-                font-size: 13px;
             }
             QComboBox#chatgptTabCombo,
             QComboBox#captureSourceCombo {
@@ -417,6 +632,8 @@ class OverlayWindow(QMainWindow):
                 background-color: rgba(76, 201, 240, 150);
             }
             QPushButton#hideButton,
+            QPushButton#configureButton,
+            QPushButton#lockButton,
             QPushButton#exitButton {
                 min-width: 36px;
                 max-width: 36px;
@@ -430,22 +647,38 @@ class OverlayWindow(QMainWindow):
                 max-height: 34px;
             }
             QPushButton#sendButton,
-            QPushButton#clearButton {
+            QPushButton#clearButton,
+            QPushButton#sendWithoutScreenshotButton {
                 min-width: 32px;
-                max-width: 32px;
                 min-height: 32px;
                 max-height: 32px;
                 padding: 0;
                 border-radius: 8px;
             }
+            QPushButton#sendButton,
+            QPushButton#clearButton {
+                max-width: 32px;
+            }
             QPushButton#exitButton:hover {
                 background-color: rgba(239, 68, 88, 190);
+            }
+            QPushButton#lockButton:checked {
+                background-color: rgba(35, 155, 116, 190);
+                border-color: rgba(130, 255, 195, 190);
             }
             QPushButton#sendButton {
                 background-color: rgba(35, 155, 116, 190);
             }
             QPushButton#sendButton:hover {
                 background-color: rgba(40, 190, 140, 220);
+            }
+            QPushButton#sendWithoutScreenshotButton {
+                min-width: 108px;
+                max-width: 108px;
+                background-color: rgba(38, 112, 145, 190);
+            }
+            QPushButton#sendWithoutScreenshotButton:hover {
+                background-color: rgba(48, 145, 185, 220);
             }
             QPushButton#clearButton:hover {
                 background-color: rgba(210, 116, 34, 190);
@@ -474,6 +707,7 @@ class OverlayWindow(QMainWindow):
             }
             """
         )
+        self._set_chrome_visible(False)
 
     @staticmethod
     def _configure_icon_button(
@@ -498,7 +732,7 @@ class OverlayWindow(QMainWindow):
             "error": "Browser dictation unavailable",
         }
         label = message or labels[state]
-        self.status_label.setText(label)
+        self.set_status(label, error=state == "error")
         self.microphone_button.setProperty("recordingState", state)
         self.microphone_button.setAccessibleName(label)
         self.microphone_button.setToolTip(label)
@@ -506,6 +740,9 @@ class OverlayWindow(QMainWindow):
         style.unpolish(self.microphone_button)
         style.polish(self.microphone_button)
         self.microphone_button.update()
+
+    def set_status(self, message: str, *, error: bool = False) -> None:
+        self.transcript_area.set_hint(message, error=error)
 
     def set_transcript(self, text: str) -> None:
         self.transcript_area.setPlainText(text)
@@ -522,6 +759,8 @@ class OverlayWindow(QMainWindow):
             self.chatgpt_tab_combo.setEnabled(False)
             self.remote_debugging_button.setVisible(True)
             self.microphone_button.setEnabled(False)
+            self.transcript_area.setEnabled(False)
+            self.set_status("Connect to a ChatGPT window to begin")
         else:
             for tab in tabs:
                 self.chatgpt_tab_combo.addItem(tab["title"], tab["id"])
@@ -534,16 +773,27 @@ class OverlayWindow(QMainWindow):
             self.chatgpt_tab_combo.setEnabled(True)
             self.remote_debugging_button.setVisible(False)
             self.microphone_button.setEnabled(True)
+            self.transcript_area.setEnabled(True)
+            self.set_status("Hold the microphone or enter a message")
             selected_index = self.chatgpt_tab_combo.findData(selected_id)
             self.chatgpt_tab_combo.setCurrentIndex(
                 selected_index if selected_index >= 0 else 0
             )
         self.chatgpt_tab_combo.blockSignals(False)
+        self.chatgpt_connection_changed.emit(bool(tabs))
         if tabs:
             self._chatgpt_tab_changed(self.chatgpt_tab_combo.currentIndex())
 
     def set_browser_status(self, status: str) -> None:
         self.chatgpt_tab_combo.setToolTip(status)
+        status_lower = status.casefold()
+        self.set_status(
+            status,
+            error=any(
+                word in status_lower
+                for word in ("not installed", "disconnected", "unable", "could not")
+            ),
+        )
         if not self.chatgpt_tab_combo.isEnabled():
             self.chatgpt_tab_combo.setItemText(0, status)
 
@@ -562,6 +812,7 @@ class OverlayWindow(QMainWindow):
                     self.capture_source_combo.setCurrentIndex(index)
                     break
         self.capture_source_combo.blockSignals(False)
+        self._capture_source_changed(self.capture_source_combo.currentIndex())
 
     def set_send_result(
         self,
@@ -570,48 +821,117 @@ class OverlayWindow(QMainWindow):
         message: str,
     ) -> None:
         self.send_button.setEnabled(True)
+        self.send_without_screenshot_button.setEnabled(True)
         if not success:
             self.microphone_button.setVisible(True)
-            self.status_label.setText(message)
+            self.set_status(message, error=True)
             return
 
         del sent_text, message
         self.transcript_area.begin_response()
         self.microphone_button.setVisible(False)
-        self.status_label.setText("Waiting for ChatGPT…")
+        self.set_status("Waiting for ChatGPT…")
 
     def set_response_update(self, status: str, text: str) -> None:
-        self.status_label.setText(status)
+        self.set_status(status)
         self.transcript_area.update_response(text)
 
     def set_response_finished(self, success: bool, message: str) -> None:
-        del success
         self.transcript_area.finish_response()
         self.microphone_button.setVisible(True)
-        self.status_label.setText(message)
+        self.set_status(message, error=not success)
 
     def begin_reading(self, message: str) -> None:
         self.transcript_area.begin_reading()
+        self._reading_full_text = ""
+        self._reading_fraction = 0.0
+        self._subtitle_line_index = -1
         self.subtitle_line_one.clear()
         self.subtitle_line_two.clear()
         self.transcript_area.hide()
         self.subtitle_panel.show()
         self.microphone_button.setVisible(False)
-        self.status_label.setText(message)
+        self.set_status(message)
 
-    def set_reading_subtitle(self, subtitle: str) -> None:
-        lines = subtitle.splitlines()
-        self.subtitle_line_one.setText(lines[0] if lines else "")
-        self.subtitle_line_two.setText(lines[1] if len(lines) > 1 else "")
-        self.status_label.setText("Reading aloud…")
+    def set_reading_subtitle(self, update: object) -> None:
+        if isinstance(update, dict):
+            self._reading_full_text = str(update.get("text") or "")
+            try:
+                self._reading_fraction = min(
+                    max(float(update.get("fraction") or 0.0), 0.0),
+                    1.0,
+                )
+            except (TypeError, ValueError):
+                self._reading_fraction = 0.0
+        else:
+            self._reading_full_text = str(update or "")
+            self._reading_fraction = 0.0
+        self._render_reading_subtitle()
+        self.set_status("Reading aloud…")
+
+    def _subtitle_lines(self) -> list[str]:
+        words = self._reading_full_text.split()
+        if not words:
+            return []
+
+        available_width = max(self.subtitle_panel.width() - 32, 1)
+        metrics = self.subtitle_line_one.fontMetrics()
+        lines: list[str] = []
+        current = ""
+        for word in words:
+            candidate = f"{current} {word}".strip()
+            if current and metrics.horizontalAdvance(candidate) > available_width:
+                lines.append(current)
+                current = word
+            else:
+                current = candidate
+        if current:
+            lines.append(current)
+        return lines
+
+    def _subtitle_index_at_progress(self, lines: list[str]) -> int:
+        if not lines:
+            return 0
+        weights = [max(len(line), 12) for line in lines]
+        target = self._reading_fraction * sum(weights)
+        cumulative = 0
+        for index, weight in enumerate(weights):
+            cumulative += weight
+            if target < cumulative:
+                return index
+        return len(lines) - 1
+
+    def _render_reading_subtitle(self, *, resized: bool = False) -> None:
+        lines = self._subtitle_lines()
+        if not lines:
+            self.subtitle_line_one.clear()
+            self.subtitle_line_two.clear()
+            self._subtitle_line_index = -1
+            return
+
+        target_index = self._subtitle_index_at_progress(lines)
+        if (
+            not resized
+            and self._subtitle_line_index >= 0
+            and target_index > self._subtitle_line_index + 1
+        ):
+            target_index = self._subtitle_line_index + 1
+        if not resized and target_index == self._subtitle_line_index:
+            return
+
+        self._subtitle_line_index = target_index
+        visible_lines = lines[target_index:target_index + 2]
+        self.subtitle_line_one.setText(visible_lines[0])
+        self.subtitle_line_two.setText(
+            visible_lines[1] if len(visible_lines) > 1 else ""
+        )
 
     def finish_reading(self, success: bool, message: str) -> None:
-        del success
         self.transcript_area.finish_reading()
         self.subtitle_panel.hide()
         self.transcript_area.show()
         self.microphone_button.setVisible(True)
-        self.status_label.setText(message)
+        self.set_status(message, error=not success)
 
     def begin_dictation_waiting(self) -> None:
         self.subtitle_panel.hide()
@@ -627,6 +947,9 @@ class OverlayWindow(QMainWindow):
     def set_dictation_finishing(self) -> None:
         self.dictation_state_label.setText("Finishing dictation…")
 
+    def set_dictation_cancelling(self) -> None:
+        self.dictation_state_label.setText("Cancelling short dictation…")
+
     def end_dictation_display(self) -> None:
         self.dictation_panel.hide()
         self.transcript_area.show()
@@ -636,20 +959,214 @@ class OverlayWindow(QMainWindow):
         if tab_id:
             self.chatgpt_tab_selected.emit(str(tab_id))
 
+    def _capture_source_changed(self, index: int) -> None:
+        self.transcript_area.set_screenshot_selected(
+            self.capture_source_combo.itemData(index) is not None
+        )
+
     def clear_transcript(self) -> None:
         self.transcript_area.clear()
-        self.status_label.setText("Text cleared")
+        self.set_status("Text cleared")
 
     def _request_clear(self) -> None:
         self.clear_transcript()
         self.clear_requested.emit()
 
-    def _request_send(self) -> None:
+    def _request_send(self, include_screenshot: bool = True) -> None:
+        if self.transcript_area.is_showing_response:
+            self.set_status("Wait for the current response to finish")
+            return
         text = self.transcript_area.toPlainText().strip()
         if not text:
-            self.status_label.setText("Enter text before sending")
+            self.set_status("Enter text before sending", error=True)
             return
-        self.send_requested.emit(text, self.capture_source_combo.currentData())
+        capture_source = (
+            self.capture_source_combo.currentData()
+            if include_screenshot
+            else None
+        )
+        self.send_requested.emit(text, capture_source)
+
+    def _request_send_without_screenshot(self) -> None:
+        self._request_send(include_screenshot=False)
+
+    def request_send_from_hotkey(self, include_screenshot: bool) -> None:
+        self._request_send(include_screenshot=include_screenshot)
+
+    def _set_position_locked(self, locked: bool) -> None:
+        self._position_locked = locked
+        self._drag_offset = None
+        self._end_border_resize()
+        if locked:
+            self.setFixedSize(self.size())
+            icon_path = LOCK_ICON_PATH
+            label = "Unlock overlay position"
+        else:
+            self.setMinimumSize(760, 180)
+            self.setMaximumSize(16_777_215, 16_777_215)
+            icon_path = UNLOCK_ICON_PATH
+            label = "Lock overlay position"
+        self.lock_button.setIcon(QIcon(str(icon_path)))
+        self.lock_button.setAccessibleName(label)
+        self.lock_button.setToolTip(label)
+
+    def _set_chrome_visible(self, visible: bool) -> None:
+        visible = visible or bool(self._resize_edges)
+        self._chrome_visible = visible
+        opacity = 1.0 if visible else 0.0
+        self._title_opacity.setOpacity(opacity)
+        self._microphone_opacity.setOpacity(opacity)
+        self.panel.setProperty("chromeVisible", visible)
+        self._resize_surface.setProperty("chromeVisible", visible)
+        for widget in (self.panel, self._resize_surface):
+            style = widget.style()
+            style.unpolish(widget)
+            style.polish(widget)
+            widget.update()
+
+    def enterEvent(self, event) -> None:  # noqa: N802
+        self._set_chrome_visible(True)
+        super().enterEvent(event)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        if hasattr(self, "_reading_full_text"):
+            self._render_reading_subtitle(resized=True)
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        QTimer.singleShot(0, self._hide_chrome_if_outside)
+        super().leaveEvent(event)
+
+    def _hide_chrome_if_outside(self) -> None:
+        if not self._resize_edges and not self.underMouse():
+            self._set_chrome_visible(False)
+
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802
+        resize_surface = getattr(self, "_resize_surface", None)
+        panel = getattr(self, "panel", None)
+        if watched is not resize_surface and watched is not panel:
+            return super().eventFilter(watched, event)
+
+        position = watched.mapTo(
+            resize_surface,
+            event.position().toPoint(),
+        ) if hasattr(event, "position") else QPoint()
+
+        event_type = event.type()
+        if event_type == QEvent.Type.MouseButtonPress:
+            if (
+                event.button() == Qt.MouseButton.LeftButton
+                and not self._position_locked
+            ):
+                edges = self._resize_edges_at(position)
+                if edges:
+                    self._begin_border_resize(
+                        edges,
+                        event.globalPosition().toPoint(),
+                    )
+                    event.accept()
+                    return True
+        elif event_type == QEvent.Type.MouseMove:
+            if (
+                self._resize_edges
+                and event.buttons() & Qt.MouseButton.LeftButton
+            ):
+                self._update_border_resize(event.globalPosition().toPoint())
+                event.accept()
+                return True
+            if self._resize_edges_at(position):
+                self._set_chrome_visible(True)
+            self._update_border_cursor(position)
+        elif event_type == QEvent.Type.MouseButtonRelease:
+            if self._resize_edges:
+                self._end_border_resize()
+                self._update_border_cursor(position)
+                event.accept()
+                return True
+        return super().eventFilter(watched, event)
+
+    def _resize_edges_at(self, position: QPoint) -> Qt.Edges:
+        if self._position_locked:
+            return Qt.Edges()
+        margin = 20
+        edges = Qt.Edges()
+        if position.x() <= margin:
+            edges |= Qt.Edge.LeftEdge
+        elif position.x() >= self._resize_surface.width() - margin - 1:
+            edges |= Qt.Edge.RightEdge
+        if position.y() <= margin:
+            edges |= Qt.Edge.TopEdge
+        elif position.y() >= self._resize_surface.height() - margin - 1:
+            edges |= Qt.Edge.BottomEdge
+        return edges
+
+    def _begin_border_resize(
+        self,
+        edges: Qt.Edges,
+        global_position: QPoint,
+    ) -> None:
+        self._resize_edges = edges
+        self._resize_start_global = global_position
+        self._resize_start_geometry = self.geometry()
+        self._drag_offset = None
+        self._set_chrome_visible(True)
+
+    def _update_border_resize(self, global_position: QPoint) -> None:
+        if (
+            not self._resize_edges
+            or self._resize_start_global is None
+            or self._resize_start_geometry is None
+        ):
+            return
+        delta = global_position - self._resize_start_global
+        start = self._resize_start_geometry
+        resized = QRect(start)
+        if self._resize_edges & Qt.Edge.LeftEdge:
+            resized.setLeft(
+                min(start.left() + delta.x(), start.right() - self.minimumWidth() + 1)
+            )
+        if self._resize_edges & Qt.Edge.RightEdge:
+            resized.setRight(
+                max(start.right() + delta.x(), start.left() + self.minimumWidth() - 1)
+            )
+        if self._resize_edges & Qt.Edge.TopEdge:
+            resized.setTop(
+                min(start.top() + delta.y(), start.bottom() - self.minimumHeight() + 1)
+            )
+        if self._resize_edges & Qt.Edge.BottomEdge:
+            resized.setBottom(
+                max(start.bottom() + delta.y(), start.top() + self.minimumHeight() - 1)
+            )
+        self.setGeometry(resized)
+        self._set_chrome_visible(True)
+
+    def _end_border_resize(self) -> None:
+        was_resizing = bool(self._resize_edges)
+        self._resize_edges = Qt.Edges()
+        self._resize_start_global = None
+        self._resize_start_geometry = None
+        if was_resizing and not self.underMouse():
+            self._set_chrome_visible(False)
+
+    def _update_border_cursor(self, position: QPoint) -> None:
+        edges = self._resize_edges or self._resize_edges_at(position)
+        if edges in (
+            Qt.Edge.TopEdge | Qt.Edge.LeftEdge,
+            Qt.Edge.BottomEdge | Qt.Edge.RightEdge,
+        ):
+            cursor = Qt.CursorShape.SizeFDiagCursor
+        elif edges in (
+            Qt.Edge.TopEdge | Qt.Edge.RightEdge,
+            Qt.Edge.BottomEdge | Qt.Edge.LeftEdge,
+        ):
+            cursor = Qt.CursorShape.SizeBDiagCursor
+        elif edges & (Qt.Edge.LeftEdge | Qt.Edge.RightEdge):
+            cursor = Qt.CursorShape.SizeHorCursor
+        elif edges & (Qt.Edge.TopEdge | Qt.Edge.BottomEdge):
+            cursor = Qt.CursorShape.SizeVerCursor
+        else:
+            cursor = Qt.CursorShape.ArrowCursor
+        self._resize_surface.setCursor(cursor)
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
         """Keep the application running in the system tray."""
@@ -658,7 +1175,10 @@ class OverlayWindow(QMainWindow):
         event.ignore()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
-        if event.button() == Qt.MouseButton.LeftButton:
+        if (
+            not self._position_locked
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
             clicked_widget = self.childAt(event.position().toPoint())
             if not isinstance(clicked_widget, (QPushButton, QComboBox)):
                 self._drag_offset = (
@@ -671,7 +1191,8 @@ class OverlayWindow(QMainWindow):
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if (
-            self._drag_offset is not None
+            not self._position_locked
+            and self._drag_offset is not None
             and event.buttons() & Qt.MouseButton.LeftButton
         ):
             self.move(event.globalPosition().toPoint() - self._drag_offset)
@@ -700,6 +1221,18 @@ class TrayController:
         self.browser_monitor = BrowserMonitor()
         self.selected_chatgpt_tab_id: str | None = None
         self.dictation_tab_id: str | None = None
+        self._dictation_state = "idle"
+        self._dictation_input_held = False
+        self._dictation_listening_since: float | None = None
+        self.settings = QSettings("Live GPT", "Live GPT")
+        self._hotkey_sequences = self._load_hotkey_sequences()
+        bindings = self._bindings_for_sequences(self._hotkey_sequences)
+        self.hotkey_monitor = GlobalHotkeyMonitor(
+            bindings["hold"],
+            bindings["send"],
+            bindings["send_without_screenshot"],
+            self.window,
+        )
 
         self.application.setWindowIcon(self.icon)
         self.window.setWindowIcon(self.icon)
@@ -709,11 +1242,15 @@ class TrayController:
         self.window.dictation_finish_requested.connect(self.finish_dictation)
         self.window.clear_requested.connect(self._handle_clear_requested)
         self.window.send_requested.connect(self._handle_send_requested)
+        self.window.configure_requested.connect(self._open_configuration)
         self.window.open_remote_debugging_requested.connect(
             self._open_remote_debugging_settings
         )
         self.window.chatgpt_tab_selected.connect(
             self._select_chatgpt_tab
+        )
+        self.window.chatgpt_connection_changed.connect(
+            self._set_chatgpt_connection
         )
         self.browser_monitor.tabs_changed.connect(self.window.set_chatgpt_tabs)
         self.browser_monitor.status_changed.connect(
@@ -746,8 +1283,17 @@ class TrayController:
         self.browser_monitor.clear_finished.connect(
             self._on_clear_finished
         )
+        self.hotkey_monitor.hold_pressed.connect(self.start_dictation)
+        self.hotkey_monitor.hold_released.connect(self.finish_dictation)
+        self.hotkey_monitor.send_pressed.connect(
+            lambda: self.window.request_send_from_hotkey(True)
+        )
+        self.hotkey_monitor.send_without_screenshot_pressed.connect(
+            lambda: self.window.request_send_from_hotkey(False)
+        )
 
         self.browser_monitor.start()
+        self.hotkey_monitor.start()
 
         self.capture_refresh_timer = QTimer(self.window)
         self.capture_refresh_timer.timeout.connect(
@@ -770,6 +1316,81 @@ class TrayController:
         self._position_overlay()
         self.show_window()
 
+    @staticmethod
+    def _bindings_for_sequences(
+        sequences: dict[str, QKeySequence],
+    ) -> dict[str, HotkeyBinding]:
+        bindings = {
+            name: HotkeyBinding.from_sequence(sequence)
+            for name, sequence in sequences.items()
+        }
+        if len({binding.text.casefold() for binding in bindings.values()}) != 3:
+            raise ValueError("Each action must use a different hotkey")
+        return bindings
+
+    def _load_hotkey_sequences(self) -> dict[str, QKeySequence]:
+        defaults = {
+            "hold": DEFAULT_HOLD_MIC_HOTKEY,
+            "send": DEFAULT_SEND_HOTKEY,
+            "send_without_screenshot": (
+                DEFAULT_SEND_WITHOUT_SCREENSHOT_HOTKEY
+            ),
+        }
+        sequences = {
+            name: QKeySequence(
+                str(self.settings.value(HOTKEY_SETTING_KEYS[name], default))
+            )
+            for name, default in defaults.items()
+        }
+        try:
+            self._bindings_for_sequences(sequences)
+        except ValueError as error:
+            logger.warning(f"Invalid saved hotkey configuration: {error}")
+            return {
+                name: QKeySequence(default)
+                for name, default in defaults.items()
+            }
+        return sequences
+
+    def _open_configuration(self) -> None:
+        self.hotkey_monitor.stop()
+        try:
+            dialog = HotkeyConfigDialog(
+                self._hotkey_sequences["hold"],
+                self._hotkey_sequences["send"],
+                self._hotkey_sequences["send_without_screenshot"],
+                self.window,
+            )
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+
+            sequences = dialog.sequences()
+            bindings = dialog.bindings()
+            self._hotkey_sequences = sequences
+            for name, sequence in sequences.items():
+                self.settings.setValue(
+                    HOTKEY_SETTING_KEYS[name],
+                    sequence.toString(
+                        QKeySequence.SequenceFormat.PortableText
+                    ),
+                )
+            self.settings.sync()
+            self.hotkey_monitor.update_bindings(
+                bindings["hold"],
+                bindings["send"],
+                bindings["send_without_screenshot"],
+            )
+            self.window.set_status("Global hotkeys updated")
+            logger.info(
+                "Updated global hotkeys "
+                + ", ".join(
+                    f"{name}={binding.text!r}"
+                    for name, binding in bindings.items()
+                )
+            )
+        finally:
+            self.hotkey_monitor.start()
+
     def _handle_activation(
         self, reason: QSystemTrayIcon.ActivationReason
     ) -> None:
@@ -788,8 +1409,14 @@ class TrayController:
         self.window.hide()
 
     def start_dictation(self) -> None:
+        self._dictation_input_held = True
+        state = getattr(self, "_dictation_state", "idle")
+        if state != "idle":
+            return
+
         tab_id = self.selected_chatgpt_tab_id
         if tab_id is None:
+            self._dictation_input_held = False
             self.window.set_microphone_state(
                 "error",
                 "Select a ChatGPT window first",
@@ -800,6 +1427,8 @@ class TrayController:
         if self.window.transcript_area.is_showing_response:
             self.window.transcript_area.begin_composing()
         self.dictation_tab_id = tab_id
+        self._dictation_state = "starting"
+        self._dictation_listening_since = None
         self.window.begin_dictation_waiting()
         self.window.set_microphone_state(
             "recording",
@@ -808,11 +1437,24 @@ class TrayController:
         self.browser_monitor.request_start_dictation(tab_id)
 
     def finish_dictation(self) -> None:
+        self._dictation_input_held = False
+        state = getattr(self, "_dictation_state", "idle")
         tab_id = self.dictation_tab_id
-        if tab_id is None:
+        if tab_id is None or state == "idle":
             return
 
-        self.dictation_tab_id = None
+        if state == "starting":
+            self.window.set_dictation_cancelling()
+            return
+        if state != "listening":
+            return
+
+        listening_since = self._dictation_listening_since or time.monotonic()
+        if time.monotonic() - listening_since < 0.5:
+            self._cancel_dictation(tab_id)
+            return
+
+        self._dictation_state = "finishing"
         logger.info(f"Finishing ChatGPT dictation tab_id={tab_id!r}")
         self.window.set_dictation_finishing()
         self.window.set_microphone_state(
@@ -821,14 +1463,35 @@ class TrayController:
         )
         self.browser_monitor.request_finish_dictation(tab_id)
 
+    def _cancel_dictation(self, tab_id: str) -> None:
+        self._dictation_state = "cancelling"
+        logger.info(f"Cancelling short ChatGPT dictation tab_id={tab_id!r}")
+        self.window.set_dictation_cancelling()
+        self.window.set_microphone_state(
+            "recording",
+            "Dictation was too short; cancelling…",
+        )
+        self.browser_monitor.request_cancel_dictation(tab_id)
+
     def _on_dictation_started(self, success: bool, message: str) -> None:
         if success:
-            if self.dictation_tab_id is None:
+            if (
+                self.dictation_tab_id is None
+                or getattr(self, "_dictation_state", "idle") != "starting"
+            ):
+                return
+            self._dictation_state = "listening"
+            self._dictation_listening_since = time.monotonic()
+            if not getattr(self, "_dictation_input_held", False):
+                self._cancel_dictation(self.dictation_tab_id)
                 return
             self.window.set_dictation_listening()
             self.window.set_microphone_state("recording", message)
             return
 
+        self._dictation_state = "idle"
+        self._dictation_input_held = False
+        self._dictation_listening_since = None
         self.dictation_tab_id = None
         self.window.end_dictation_display()
         self.window.set_microphone_state("error", message)
@@ -839,13 +1502,24 @@ class TrayController:
         text: str,
         message: str,
     ) -> None:
+        was_cancelled = getattr(self, "_dictation_state", "idle") == "cancelling"
+        restart = getattr(self, "_dictation_input_held", False)
+        self._dictation_state = "idle"
+        self._dictation_listening_since = None
+        self.dictation_tab_id = None
         self.window.end_dictation_display()
         if not success:
+            self._dictation_input_held = False
             self.window.set_microphone_state("error", message)
             return
 
-        self.window.set_transcript(text)
-        self.window.set_microphone_state("saved", message)
+        if was_cancelled:
+            self.window.set_microphone_state("idle", message)
+        else:
+            self.window.set_transcript(text)
+            self.window.set_microphone_state("saved", message)
+        if restart:
+            self.start_dictation()
 
     def _handle_send_requested(
         self,
@@ -854,20 +1528,26 @@ class TrayController:
     ) -> None:
         tab_id = self.selected_chatgpt_tab_id
         if tab_id is None:
-            self.window.status_label.setText("Select a ChatGPT window first")
+            self.window.set_status(
+                "Select a ChatGPT window first",
+                error=True,
+            )
             return
 
         self.window.send_button.setEnabled(False)
+        self.window.send_without_screenshot_button.setEnabled(False)
         screenshot = None
         if capture_source is not None:
-            self.window.status_label.setText("Capturing screenshot…")
+            self.window.set_status("Capturing screenshot…")
             try:
                 screenshot = capture_webp(capture_source)
             except Exception as error:
                 logger.error("Unable to capture screenshot", error)
                 self.window.send_button.setEnabled(True)
-                self.window.status_label.setText(
-                    f"Could not capture screenshot: {error}"
+                self.window.send_without_screenshot_button.setEnabled(True)
+                self.window.set_status(
+                    f"Could not capture screenshot: {error}",
+                    error=True,
                 )
                 return
 
@@ -876,7 +1556,7 @@ class TrayController:
             f"tab_id={tab_id!r} characters={len(text)} "
             f"screenshot={capture_source.key if capture_source else None!r}"
         )
-        self.window.status_label.setText("Sending to ChatGPT…")
+        self.window.set_status("Sending to ChatGPT…")
         self.browser_monitor.request_send(tab_id, text, screenshot)
 
     def _refresh_capture_sources(self) -> None:
@@ -892,22 +1572,27 @@ class TrayController:
     def _handle_clear_requested(self) -> None:
         tab_id = self.selected_chatgpt_tab_id
         if tab_id is None:
-            self.window.status_label.setText(
-                "Text cleared locally; no ChatGPT window selected"
+            self.window.set_status(
+                "Text cleared locally; no ChatGPT window selected",
+                error=True,
             )
             return
 
         logger.info(f"Clearing ChatGPT input tab_id={tab_id!r}")
-        self.window.status_label.setText("Clearing ChatGPT input…")
+        self.window.set_status("Clearing ChatGPT input…")
         self.browser_monitor.request_clear(tab_id)
 
     def _on_clear_finished(self, success: bool, message: str) -> None:
-        del success
-        self.window.status_label.setText(message)
+        self.window.set_status(message, error=not success)
 
     def _select_chatgpt_tab(self, tab_id: str) -> None:
         self.selected_chatgpt_tab_id = tab_id
         logger.info(f"Selected ChatGPT tab id={tab_id}")
+
+    def _set_chatgpt_connection(self, connected: bool) -> None:
+        if connected:
+            return
+        self.selected_chatgpt_tab_id = None
 
     def _open_remote_debugging_settings(self) -> None:
         endpoint = discover_cdp_endpoint()
@@ -945,6 +1630,7 @@ class TrayController:
         del checked
         logger.info("Exit requested")
         self.capture_refresh_timer.stop()
+        self.hotkey_monitor.stop()
         self.browser_monitor.request_stop()
         if not self.browser_monitor.wait(17_000):
             logger.warning("Browser monitor did not stop before application exit")
