@@ -19,6 +19,7 @@ from PySide6.QtGui import (
     QAction,
     QCloseEvent,
     QColor,
+    QCursor,
     QIcon,
     QKeySequence,
     QMouseEvent,
@@ -54,6 +55,7 @@ from .browser import (
 from .logger import Logger, config_logger, shutdown_logger
 from .hotkeys import GlobalHotkeyMonitor, HotkeyBinding
 from .screen_capture import CaptureSource, capture_webp, list_capture_sources
+from .window_focus import ForegroundWindowRestorer
 
 
 ASSET_DIRECTORY = Path(__file__).resolve().parent / "assets"
@@ -342,6 +344,7 @@ class OverlayWindow(QMainWindow):
         self._resize_start_global: QPoint | None = None
         self._resize_start_geometry: QRect | None = None
         self._chrome_visible = False
+        self._focus_restorer = ForegroundWindowRestorer()
         self.setWindowTitle("Live GPT")
         self.setMinimumSize(760, 180)
         self.setWindowFlags(
@@ -350,6 +353,12 @@ class OverlayWindow(QMainWindow):
             | Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+
+        self._focus_history_timer = QTimer(self)
+        self._focus_history_timer.timeout.connect(
+            self._focus_restorer.remember_foreground
+        )
+        self._focus_history_timer.start(75)
 
         container = QWidget(self)
         container.setObjectName("overlayContainer")
@@ -481,12 +490,34 @@ class OverlayWindow(QMainWindow):
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
         )
         self.subtitle_line_two.setWordWrap(False)
+        self.subtitle_full_text = QPlainTextEdit()
+        self.subtitle_full_text.setObjectName("subtitleFullText")
+        self.subtitle_full_text.setReadOnly(True)
+        self.subtitle_full_text.setMouseTracking(True)
+        self.subtitle_full_text.hide()
         self._reading_full_text = ""
         self._reading_fraction = 0.0
         self._subtitle_line_index = -1
+        self._subtitle_mode_active = False
+        self._subtitle_dismissed = False
+        self._subtitle_expanded = False
+        self._subtitle_reading_active = False
+        self._subtitle_status_text = ""
+        self._subtitle_collapsed_geometry: QRect | None = None
         subtitle_layout.addWidget(self.subtitle_line_one, 1)
         subtitle_layout.addWidget(self.subtitle_line_two, 1)
+        subtitle_layout.addWidget(self.subtitle_full_text, 1)
         self.subtitle_panel.hide()
+        self._subtitle_hover_widgets = (
+            self.subtitle_panel,
+            self.subtitle_line_one,
+            self.subtitle_line_two,
+            self.subtitle_full_text,
+            self.subtitle_full_text.viewport(),
+        )
+        for widget in self._subtitle_hover_widgets:
+            widget.setMouseTracking(True)
+            widget.installEventFilter(self)
 
         self.dictation_panel = QFrame()
         self.dictation_panel.setObjectName("dictationPanel")
@@ -612,6 +643,14 @@ class OverlayWindow(QMainWindow):
                 border: none;
                 font-size: 22px;
                 font-weight: 600;
+            }
+            QPlainTextEdit#subtitleFullText {
+                color: #f5f7ff;
+                background: transparent;
+                border: none;
+                padding: 4px;
+                font-size: 16px;
+                selection-background-color: rgba(76, 201, 240, 130);
             }
             QLabel#dictationState {
                 color: #f5f7ff;
@@ -823,34 +862,78 @@ class OverlayWindow(QMainWindow):
         self.send_button.setEnabled(True)
         self.send_without_screenshot_button.setEnabled(True)
         if not success:
+            self.dismiss_subtitle_mode()
+            self.set_transcript(sent_text)
             self.microphone_button.setVisible(True)
             self.set_status(message, error=True)
             return
 
         del sent_text, message
-        self.transcript_area.begin_response()
-        self.microphone_button.setVisible(False)
+        if not self._subtitle_mode_active:
+            self.begin_response_display()
+        self._set_subtitle_status("Waiting for ChatGPT…")
         self.set_status("Waiting for ChatGPT…")
 
-    def set_response_update(self, status: str, text: str) -> None:
-        self.set_status(status)
-        self.transcript_area.update_response(text)
-
-    def set_response_finished(self, success: bool, message: str) -> None:
-        self.transcript_area.finish_response()
-        self.microphone_button.setVisible(True)
-        self.set_status(message, error=not success)
-
-    def begin_reading(self, message: str) -> None:
-        self.transcript_area.begin_reading()
+    def begin_response_display(
+        self,
+        sent_text: str = "",
+        message: str = "Sending to ChatGPT…",
+    ) -> None:
+        del sent_text
+        self._collapse_subtitle()
+        self._subtitle_mode_active = True
+        self._subtitle_dismissed = False
+        self._subtitle_reading_active = False
         self._reading_full_text = ""
         self._reading_fraction = 0.0
         self._subtitle_line_index = -1
-        self.subtitle_line_one.clear()
-        self.subtitle_line_two.clear()
+        self.transcript_area.begin_response()
+        self.transcript_area.hide()
+        self.dictation_panel.hide()
+        self.subtitle_panel.show()
+        self.microphone_button.setVisible(True)
+        self._set_subtitle_status(message)
+        self.set_status(message)
+
+    def set_response_update(self, status: str, text: str) -> None:
+        self.set_status(status)
+        if self._subtitle_dismissed:
+            return
+        self.transcript_area.update_response(text)
+        if not self._subtitle_mode_active:
+            self.begin_response_display(message=status)
+        self._reading_full_text = text
+        self._reading_fraction = 1.0
+        if text:
+            self._render_reading_subtitle(resized=True, latest=True)
+            self._update_expanded_subtitle()
+        else:
+            self._set_subtitle_status(status)
+
+    def set_response_finished(self, success: bool, message: str) -> None:
+        if self._subtitle_dismissed:
+            return
+        self.transcript_area.finish_response()
+        self.microphone_button.setVisible(True)
+        self.set_status(message, error=not success)
+        if self._subtitle_mode_active and not self._reading_full_text:
+            self._set_subtitle_status(message)
+
+    def begin_reading(self, message: str) -> None:
+        if self._subtitle_dismissed:
+            return
+        self.transcript_area.begin_reading()
+        self._subtitle_reading_active = True
+        self._reading_fraction = 0.0
+        self._subtitle_line_index = -1
+        self._subtitle_mode_active = True
         self.transcript_area.hide()
         self.subtitle_panel.show()
-        self.microphone_button.setVisible(False)
+        self.microphone_button.setVisible(True)
+        if not self._reading_full_text:
+            self._set_subtitle_status(message)
+        else:
+            self._render_reading_subtitle(resized=True)
         self.set_status(message)
 
     def set_reading_subtitle(self, update: object) -> None:
@@ -866,7 +949,10 @@ class OverlayWindow(QMainWindow):
         else:
             self._reading_full_text = str(update or "")
             self._reading_fraction = 0.0
+        if self._subtitle_dismissed:
+            return
         self._render_reading_subtitle()
+        self._update_expanded_subtitle()
         self.set_status("Reading aloud…")
 
     def _subtitle_lines(self) -> list[str]:
@@ -901,7 +987,12 @@ class OverlayWindow(QMainWindow):
                 return index
         return len(lines) - 1
 
-    def _render_reading_subtitle(self, *, resized: bool = False) -> None:
+    def _render_reading_subtitle(
+        self,
+        *,
+        resized: bool = False,
+        latest: bool = False,
+    ) -> None:
         lines = self._subtitle_lines()
         if not lines:
             self.subtitle_line_one.clear()
@@ -909,7 +1000,11 @@ class OverlayWindow(QMainWindow):
             self._subtitle_line_index = -1
             return
 
-        target_index = self._subtitle_index_at_progress(lines)
+        target_index = (
+            max(len(lines) - 2, 0)
+            if latest
+            else self._subtitle_index_at_progress(lines)
+        )
         if (
             not resized
             and self._subtitle_line_index >= 0
@@ -927,13 +1022,93 @@ class OverlayWindow(QMainWindow):
         )
 
     def finish_reading(self, success: bool, message: str) -> None:
+        if self._subtitle_dismissed:
+            return
         self.transcript_area.finish_reading()
-        self.subtitle_panel.hide()
-        self.transcript_area.show()
         self.microphone_button.setVisible(True)
         self.set_status(message, error=not success)
 
+    def _set_subtitle_status(self, message: str) -> None:
+        self._subtitle_status_text = message
+        self.subtitle_line_one.setText(message)
+        self.subtitle_line_two.clear()
+        self.subtitle_full_text.setPlainText(
+            self._reading_full_text or message
+        )
+
+    def _update_expanded_subtitle(self) -> None:
+        if not self._subtitle_expanded:
+            return
+        self.subtitle_full_text.setPlainText(
+            self._reading_full_text or self._subtitle_status_text
+        )
+        cursor = self.subtitle_full_text.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self.subtitle_full_text.setTextCursor(cursor)
+
+    def _expand_subtitle(self) -> None:
+        if not self._subtitle_mode_active or self._subtitle_expanded:
+            return
+        self._subtitle_expanded = True
+        self._subtitle_collapsed_geometry = QRect(self.geometry())
+        self.subtitle_full_text.setPlainText(
+            self._reading_full_text or self._subtitle_status_text
+        )
+        self.subtitle_line_one.hide()
+        self.subtitle_line_two.hide()
+        self.subtitle_full_text.show()
+
+        available = self.screen().availableGeometry()
+        target_height = min(
+            max(self.height() * 2, 420),
+            max(available.height() - 40, self.height()),
+        )
+        if target_height > self.height() and not self._position_locked:
+            geometry = QRect(self.geometry())
+            geometry.setTop(
+                max(available.top(), geometry.bottom() - target_height + 1)
+            )
+            geometry.setHeight(target_height)
+            self.setGeometry(geometry)
+
+    def _collapse_subtitle(self) -> None:
+        if not self._subtitle_expanded:
+            return
+        self._subtitle_expanded = False
+        self.subtitle_full_text.hide()
+        self.subtitle_line_one.show()
+        self.subtitle_line_two.show()
+        if (
+            self._subtitle_collapsed_geometry is not None
+            and not self._position_locked
+        ):
+            self.setGeometry(self._subtitle_collapsed_geometry)
+        self._subtitle_collapsed_geometry = None
+
+    def _collapse_subtitle_if_outside(self) -> None:
+        if not self._subtitle_expanded:
+            return
+        position = self.subtitle_panel.mapFromGlobal(QCursor.pos())
+        if not self.subtitle_panel.rect().contains(position):
+            self._collapse_subtitle()
+
+    def dismiss_subtitle_mode(self) -> bool:
+        if not self._subtitle_mode_active:
+            return False
+        self._collapse_subtitle()
+        self._subtitle_mode_active = False
+        self._subtitle_dismissed = True
+        self._subtitle_reading_active = False
+        self.subtitle_panel.hide()
+        self.dictation_panel.hide()
+        self.transcript_area.begin_composing()
+        self.transcript_area.show()
+        self.microphone_button.setVisible(True)
+        self.set_status("Hold the microphone or enter a message")
+        return True
+
     def begin_dictation_waiting(self) -> None:
+        self.dismiss_subtitle_mode()
         self.subtitle_panel.hide()
         self.transcript_area.hide()
         self.dictation_state_label.setText(
@@ -972,7 +1147,12 @@ class OverlayWindow(QMainWindow):
         self.clear_transcript()
         self.clear_requested.emit()
 
-    def _request_send(self, include_screenshot: bool = True) -> None:
+    def _request_send(
+        self,
+        include_screenshot: bool = True,
+        *,
+        restore_focus: bool = True,
+    ) -> None:
         if self.transcript_area.is_showing_response:
             self.set_status("Wait for the current response to finish")
             return
@@ -986,12 +1166,26 @@ class OverlayWindow(QMainWindow):
             else None
         )
         self.send_requested.emit(text, capture_source)
+        if restore_focus:
+            QTimer.singleShot(0, self._restore_previous_focus)
 
     def _request_send_without_screenshot(self) -> None:
         self._request_send(include_screenshot=False)
 
     def request_send_from_hotkey(self, include_screenshot: bool) -> None:
-        self._request_send(include_screenshot=include_screenshot)
+        self._request_send(
+            include_screenshot=include_screenshot,
+            restore_focus=False,
+        )
+
+    def remember_foreground_app(self) -> None:
+        self._focus_restorer.remember_foreground()
+
+    def _restore_previous_focus(self) -> None:
+        if self._focus_restorer.restore_previous():
+            logger.debug("Restored focus to the previous application")
+        else:
+            logger.debug("No external application was available to restore")
 
     def _set_position_locked(self, locked: bool) -> None:
         self._position_locked = locked
@@ -1031,7 +1225,10 @@ class OverlayWindow(QMainWindow):
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
         if hasattr(self, "_reading_full_text"):
-            self._render_reading_subtitle(resized=True)
+            self._render_reading_subtitle(
+                resized=True,
+                latest=not self._subtitle_reading_active,
+            )
 
     def leaveEvent(self, event) -> None:  # noqa: N802
         QTimer.singleShot(0, self._hide_chrome_if_outside)
@@ -1042,6 +1239,21 @@ class OverlayWindow(QMainWindow):
             self._set_chrome_visible(False)
 
     def eventFilter(self, watched, event) -> bool:  # noqa: N802
+        subtitle_widgets = getattr(self, "_subtitle_hover_widgets", ())
+        if watched in subtitle_widgets:
+            event_type = event.type()
+            if event_type == QEvent.Type.Enter:
+                self._expand_subtitle()
+            elif event_type == QEvent.Type.Leave:
+                QTimer.singleShot(0, self._collapse_subtitle_if_outside)
+            elif (
+                event_type == QEvent.Type.MouseButtonPress
+                and event.button() == Qt.MouseButton.LeftButton
+            ):
+                if self.dismiss_subtitle_mode():
+                    event.accept()
+                    return True
+
         resize_surface = getattr(self, "_resize_surface", None)
         panel = getattr(self, "panel", None)
         if watched is not resize_surface and watched is not panel:
@@ -1400,6 +1612,7 @@ class TrayController:
 
     def show_window(self) -> None:
         logger.info("Showing the overlay window")
+        self.window.remember_foreground_app()
         self.window.showNormal()
         self.window.raise_()
         self.window.activateWindow()
@@ -1414,6 +1627,13 @@ class TrayController:
         if state != "idle":
             return
 
+        dismissed = self.window.dismiss_subtitle_mode()
+        if (
+            not dismissed
+            and self.window.transcript_area.is_showing_response
+        ):
+            self.window.transcript_area.begin_composing()
+
         tab_id = self.selected_chatgpt_tab_id
         if tab_id is None:
             self._dictation_input_held = False
@@ -1424,8 +1644,6 @@ class TrayController:
             return
 
         logger.info(f"Starting ChatGPT dictation tab_id={tab_id!r}")
-        if self.window.transcript_area.is_showing_response:
-            self.window.transcript_area.begin_composing()
         self.dictation_tab_id = tab_id
         self._dictation_state = "starting"
         self._dictation_listening_since = None
@@ -1556,6 +1774,7 @@ class TrayController:
             f"tab_id={tab_id!r} characters={len(text)} "
             f"screenshot={capture_source.key if capture_source else None!r}"
         )
+        self.window.begin_response_display(text)
         self.window.set_status("Sending to ChatGPT…")
         self.browser_monitor.request_send(tab_id, text, screenshot)
 

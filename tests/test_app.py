@@ -244,6 +244,9 @@ class TrayControllerBrowserTests(unittest.TestCase):
             "Explain this",
             b"screenshot",
         )
+        controller.window.begin_response_display.assert_called_once_with(
+            "Explain this"
+        )
 
     def test_clear_queues_selected_browser_composer(self) -> None:
         controller = TrayController.__new__(TrayController)
@@ -286,12 +289,49 @@ class TrayControllerBrowserTests(unittest.TestCase):
 
             window.finish_reading(True, "Read aloud complete")
 
+            self.assertTrue(window.transcript_area.isHidden())
+            self.assertFalse(window.subtitle_panel.isHidden())
+
+            window.dismiss_subtitle_mode()
+
             self.assertFalse(window.transcript_area.isHidden())
             self.assertTrue(window.subtitle_panel.isHidden())
-            self.assertEqual(
-                window.transcript_area.toPlainText(),
-                "The complete response",
+            self.assertEqual(window.transcript_area.toPlainText(), "")
+        finally:
+            window.close()
+
+    def test_subtitle_hover_expands_full_text_and_click_dismisses(self) -> None:
+        window = OverlayWindow()
+        try:
+            window.show()
+            window.begin_response_display("Question")
+            response = " ".join(
+                f"complete-response-word-{index}" for index in range(80)
             )
+            window.set_response_update("Writing…", response)
+            QApplication.processEvents()
+            collapsed_height = window.height()
+
+            window._expand_subtitle()
+            QApplication.processEvents()
+
+            self.assertTrue(window.subtitle_line_one.isHidden())
+            self.assertFalse(window.subtitle_full_text.isHidden())
+            self.assertEqual(
+                window.subtitle_full_text.toPlainText(),
+                response,
+            )
+            self.assertGreater(window.height(), collapsed_height)
+
+            QTest.mouseClick(
+                window.subtitle_full_text.viewport(),
+                Qt.MouseButton.LeftButton,
+            )
+            QApplication.processEvents()
+
+            self.assertTrue(window.subtitle_panel.isHidden())
+            self.assertFalse(window.transcript_area.isHidden())
+            self.assertFalse(window.transcript_area.is_showing_response)
         finally:
             window.close()
 
@@ -430,6 +470,31 @@ class TrayControllerBrowserTests(unittest.TestCase):
         finally:
             window.close()
 
+    def test_overlay_send_restores_focus_but_hotkey_send_does_not(self) -> None:
+        window = OverlayWindow()
+        focus_restorer = Mock()
+        focus_restorer.restore_previous.return_value = True
+        window._focus_restorer = focus_restorer
+        try:
+            window.set_chatgpt_tabs(
+                [{"id": "tab", "title": "ChatGPT", "url": "https://chatgpt.com"}]
+            )
+            window.set_transcript("Send from overlay")
+
+            window.send_button.click()
+            QApplication.processEvents()
+
+            focus_restorer.restore_previous.assert_called_once_with()
+
+            focus_restorer.reset_mock()
+            window.set_transcript("Send from global hotkey")
+            window.request_send_from_hotkey(True)
+            QApplication.processEvents()
+
+            focus_restorer.restore_previous.assert_not_called()
+        finally:
+            window.close()
+
     def test_dictation_states_replace_input_area(self) -> None:
         window = OverlayWindow()
         try:
@@ -470,6 +535,7 @@ class TrayControllerBrowserTests(unittest.TestCase):
         controller.browser_monitor.request_start_dictation.assert_called_once_with(
             "selected-tab"
         )
+        controller.window.dismiss_subtitle_mode.assert_called_once_with()
         controller.browser_monitor.request_finish_dictation.assert_called_once_with(
             "selected-tab"
         )
