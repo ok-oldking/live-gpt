@@ -4,7 +4,7 @@ import os
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QPoint, QSize, Signal, Qt
+from PySide6.QtCore import QPoint, QSize, QTimer, Signal, Qt
 from PySide6.QtGui import (
     QAction,
     QCloseEvent,
@@ -34,6 +34,7 @@ from .browser import (
     open_remote_debugging_settings,
 )
 from .logger import Logger, config_logger, shutdown_logger
+from .screen_capture import CaptureSource, capture_webp, list_capture_sources
 
 
 ASSET_DIRECTORY = Path(__file__).resolve().parent / "assets"
@@ -165,7 +166,7 @@ class OverlayWindow(QMainWindow):
     dictation_requested = Signal()
     dictation_finish_requested = Signal()
     clear_requested = Signal()
-    send_requested = Signal(str)
+    send_requested = Signal(str, object)
     open_remote_debugging_requested = Signal()
     chatgpt_tab_selected = Signal(str)
 
@@ -174,7 +175,7 @@ class OverlayWindow(QMainWindow):
         logger.debug("Creating overlay window")
         self._drag_offset: QPoint | None = None
         self.setWindowTitle("Live GPT")
-        self.setFixedSize(760, 240)
+        self.setFixedSize(1140, 240)
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
@@ -209,6 +210,17 @@ class OverlayWindow(QMainWindow):
             self._chatgpt_tab_changed
         )
         title_layout.addWidget(self.chatgpt_tab_combo, 1)
+
+        self.capture_source_combo = QComboBox()
+        self.capture_source_combo.setObjectName("captureSourceCombo")
+        self.capture_source_combo.setAccessibleName("Screenshot source")
+        self.capture_source_combo.setMinimumWidth(150)
+        self.capture_source_combo.setMaximumWidth(220)
+        self.capture_source_combo.addItem("No screenshot", None)
+        self.capture_source_combo.setToolTip(
+            "Choose a desktop or visible window to attach when sending"
+        )
+        title_layout.addWidget(self.capture_source_combo, 1)
 
         self.remote_debugging_button = QPushButton("Enable Debugging")
         self.remote_debugging_button.setObjectName("remoteDebuggingButton")
@@ -275,6 +287,17 @@ class OverlayWindow(QMainWindow):
         subtitle_layout.addWidget(self.subtitle_line_two, 1)
         self.subtitle_panel.hide()
 
+        self.dictation_panel = QFrame()
+        self.dictation_panel.setObjectName("dictationPanel")
+        dictation_layout = QVBoxLayout(self.dictation_panel)
+        dictation_layout.setContentsMargins(16, 8, 16, 8)
+        self.dictation_state_label = QLabel()
+        self.dictation_state_label.setObjectName("dictationState")
+        self.dictation_state_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.dictation_state_label.setWordWrap(True)
+        dictation_layout.addWidget(self.dictation_state_label, 1)
+        self.dictation_panel.hide()
+
         self.microphone_button = QPushButton()
         self.microphone_button.setObjectName("microphoneButton")
         self.microphone_button.setProperty("recordingState", "idle")
@@ -302,6 +325,7 @@ class OverlayWindow(QMainWindow):
         recording_layout.setSpacing(16)
         recording_layout.addWidget(self.transcript_area, 1)
         recording_layout.addWidget(self.subtitle_panel, 1)
+        recording_layout.addWidget(self.dictation_panel, 1)
 
         recording_layout.addWidget(
             self.microphone_button,
@@ -333,7 +357,8 @@ class OverlayWindow(QMainWindow):
                 color: rgba(228, 235, 255, 210);
                 font-size: 13px;
             }
-            QComboBox#chatgptTabCombo {
+            QComboBox#chatgptTabCombo,
+            QComboBox#captureSourceCombo {
                 min-height: 34px;
                 padding: 0 10px;
                 color: #f5f7ff;
@@ -341,10 +366,12 @@ class OverlayWindow(QMainWindow):
                 border: 1px solid rgba(130, 165, 230, 75);
                 border-radius: 8px;
             }
-            QComboBox#chatgptTabCombo:disabled {
+            QComboBox#chatgptTabCombo:disabled,
+            QComboBox#captureSourceCombo:disabled {
                 color: rgba(228, 235, 255, 155);
             }
-            QComboBox#chatgptTabCombo QAbstractItemView {
+            QComboBox#chatgptTabCombo QAbstractItemView,
+            QComboBox#captureSourceCombo QAbstractItemView {
                 color: #f5f7ff;
                 background-color: rgb(18, 28, 58);
                 selection-background-color: rgb(38, 112, 145);
@@ -358,7 +385,8 @@ class OverlayWindow(QMainWindow):
                 font-size: 15px;
                 selection-background-color: rgba(76, 201, 240, 130);
             }
-            QFrame#subtitlePanel {
+            QFrame#subtitlePanel,
+            QFrame#dictationPanel {
                 background-color: rgba(5, 10, 28, 145);
                 border: 1px solid rgba(130, 165, 230, 75);
                 border-radius: 10px;
@@ -368,6 +396,13 @@ class OverlayWindow(QMainWindow):
                 background: transparent;
                 border: none;
                 font-size: 22px;
+                font-weight: 600;
+            }
+            QLabel#dictationState {
+                color: #f5f7ff;
+                background: transparent;
+                border: none;
+                font-size: 20px;
                 font-weight: 600;
             }
             QPushButton {
@@ -512,6 +547,22 @@ class OverlayWindow(QMainWindow):
         if not self.chatgpt_tab_combo.isEnabled():
             self.chatgpt_tab_combo.setItemText(0, status)
 
+    def set_capture_sources(self, sources: list[CaptureSource]) -> None:
+        selected = self.capture_source_combo.currentData()
+        selected_key = selected.key if isinstance(selected, CaptureSource) else None
+        self.capture_source_combo.blockSignals(True)
+        self.capture_source_combo.clear()
+        self.capture_source_combo.addItem("No screenshot", None)
+        for source in sources:
+            self.capture_source_combo.addItem(source.label, source)
+        if selected_key is not None:
+            for index in range(1, self.capture_source_combo.count()):
+                source = self.capture_source_combo.itemData(index)
+                if isinstance(source, CaptureSource) and source.key == selected_key:
+                    self.capture_source_combo.setCurrentIndex(index)
+                    break
+        self.capture_source_combo.blockSignals(False)
+
     def set_send_result(
         self,
         success: bool,
@@ -562,6 +613,24 @@ class OverlayWindow(QMainWindow):
         self.microphone_button.setVisible(True)
         self.status_label.setText(message)
 
+    def begin_dictation_waiting(self) -> None:
+        self.subtitle_panel.hide()
+        self.transcript_area.hide()
+        self.dictation_state_label.setText(
+            "Waiting for the browser to start listening…"
+        )
+        self.dictation_panel.show()
+
+    def set_dictation_listening(self) -> None:
+        self.dictation_state_label.setText("Listening…")
+
+    def set_dictation_finishing(self) -> None:
+        self.dictation_state_label.setText("Finishing dictation…")
+
+    def end_dictation_display(self) -> None:
+        self.dictation_panel.hide()
+        self.transcript_area.show()
+
     def _chatgpt_tab_changed(self, index: int) -> None:
         tab_id = self.chatgpt_tab_combo.itemData(index)
         if tab_id:
@@ -580,7 +649,7 @@ class OverlayWindow(QMainWindow):
         if not text:
             self.status_label.setText("Enter text before sending")
             return
-        self.send_requested.emit(text)
+        self.send_requested.emit(text, self.capture_source_combo.currentData())
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
         """Keep the application running in the system tray."""
@@ -680,6 +749,13 @@ class TrayController:
 
         self.browser_monitor.start()
 
+        self.capture_refresh_timer = QTimer(self.window)
+        self.capture_refresh_timer.timeout.connect(
+            self._refresh_capture_sources
+        )
+        self.capture_refresh_timer.start(2_000)
+        self._refresh_capture_sources()
+
         self.menu = QMenu()
         self.exit_action = QAction("Exit", self.menu)
         self.exit_action.triggered.connect(self._exit_application)
@@ -724,9 +800,10 @@ class TrayController:
         if self.window.transcript_area.is_showing_response:
             self.window.transcript_area.begin_composing()
         self.dictation_tab_id = tab_id
+        self.window.begin_dictation_waiting()
         self.window.set_microphone_state(
             "recording",
-            "Starting ChatGPT dictation…",
+            "Waiting for the browser to start listening…",
         )
         self.browser_monitor.request_start_dictation(tab_id)
 
@@ -737,6 +814,7 @@ class TrayController:
 
         self.dictation_tab_id = None
         logger.info(f"Finishing ChatGPT dictation tab_id={tab_id!r}")
+        self.window.set_dictation_finishing()
         self.window.set_microphone_state(
             "recording",
             "Finishing ChatGPT dictation…",
@@ -745,10 +823,14 @@ class TrayController:
 
     def _on_dictation_started(self, success: bool, message: str) -> None:
         if success:
+            if self.dictation_tab_id is None:
+                return
+            self.window.set_dictation_listening()
             self.window.set_microphone_state("recording", message)
             return
 
         self.dictation_tab_id = None
+        self.window.end_dictation_display()
         self.window.set_microphone_state("error", message)
 
     def _on_dictation_finished(
@@ -757,6 +839,7 @@ class TrayController:
         text: str,
         message: str,
     ) -> None:
+        self.window.end_dictation_display()
         if not success:
             self.window.set_microphone_state("error", message)
             return
@@ -764,19 +847,47 @@ class TrayController:
         self.window.set_transcript(text)
         self.window.set_microphone_state("saved", message)
 
-    def _handle_send_requested(self, text: str) -> None:
+    def _handle_send_requested(
+        self,
+        text: str,
+        capture_source: CaptureSource | None,
+    ) -> None:
         tab_id = self.selected_chatgpt_tab_id
         if tab_id is None:
             self.window.status_label.setText("Select a ChatGPT window first")
             return
 
+        self.window.send_button.setEnabled(False)
+        screenshot = None
+        if capture_source is not None:
+            self.window.status_label.setText("Capturing screenshot…")
+            try:
+                screenshot = capture_webp(capture_source)
+            except Exception as error:
+                logger.error("Unable to capture screenshot", error)
+                self.window.send_button.setEnabled(True)
+                self.window.status_label.setText(
+                    f"Could not capture screenshot: {error}"
+                )
+                return
+
         logger.info(
             "Send requested "
-            f"tab_id={tab_id!r} characters={len(text)}"
+            f"tab_id={tab_id!r} characters={len(text)} "
+            f"screenshot={capture_source.key if capture_source else None!r}"
         )
-        self.window.send_button.setEnabled(False)
         self.window.status_label.setText("Sending to ChatGPT…")
-        self.browser_monitor.request_send(tab_id, text)
+        self.browser_monitor.request_send(tab_id, text, screenshot)
+
+    def _refresh_capture_sources(self) -> None:
+        if self.window.capture_source_combo.view().isVisible():
+            return
+        try:
+            sources = list_capture_sources({int(self.window.winId())})
+        except Exception as error:
+            logger.error("Unable to list screenshot sources", error)
+            return
+        self.window.set_capture_sources(sources)
 
     def _handle_clear_requested(self) -> None:
         tab_id = self.selected_chatgpt_tab_id
@@ -833,6 +944,7 @@ class TrayController:
     def _exit_application(self, checked: bool = False) -> None:
         del checked
         logger.info("Exit requested")
+        self.capture_refresh_timer.stop()
         self.browser_monitor.request_stop()
         if not self.browser_monitor.wait(17_000):
             logger.warning("Browser monitor did not stop before application exit")

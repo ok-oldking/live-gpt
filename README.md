@@ -19,6 +19,9 @@ the dictated text to appear in ChatGPT's composer, and copies that text into
 the Live GPT input. The ChatGPT tab owns microphone capture and speech
 recognition, so the browser may ask for microphone permission the first time.
 Live GPT does not record audio locally or download a speech-recognition model.
+While the button is held, the input area is replaced by a waiting state until
+ChatGPT's dictation-end control appears, followed by a listening state. Closing
+the app cancels these browser waits promptly.
 
 The recognized text remains editable. When the editor contains text, its
 paper-plane button sends the current text through Playwright to the selected
@@ -29,6 +32,15 @@ These browser interactions run without intentionally bringing its window to
 the foreground. While ChatGPT responds, the editor switches to a read-only
 response view, its action buttons and the microphone are hidden, and the status
 label shows activities such as web searching when ChatGPT exposes them in the turn.
+
+The screenshot selector starts with **No screenshot**, followed by one choice
+for each desktop display and then visible windows ordered from largest to
+smallest. A window is listed only when its area is greater than one eighth of
+the display containing it. When sending, Live GPT removes existing ChatGPT
+image attachments and, unless **No screenshot** is selected, captures the
+chosen source, scales its longest edge down to 1920 pixels when necessary, and
+uploads it as lossless WebP before clicking Send. Window capture uses the
+BitBlt/PrintWindow approach with full-content rendering enabled.
 The reply streams into the former input area. After the completed reply becomes
 stable, Live GPT clicks ChatGPT's **Read aloud** button. During playback, the
 response area becomes a large, full-width two-label subtitle view that follows

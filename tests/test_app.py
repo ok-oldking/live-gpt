@@ -16,6 +16,7 @@ from live_gpt.app import (  # noqa: E402
     TranscriptEditor,
     TrayController,
 )
+from live_gpt.screen_capture import CaptureSource  # noqa: E402
 
 
 class TranscriptEditorTests(unittest.TestCase):
@@ -73,6 +74,40 @@ class TranscriptEditorTests(unittest.TestCase):
 
 
 class TrayControllerBrowserTests(unittest.TestCase):
+    def test_overlay_is_fifty_percent_wider(self) -> None:
+        window = OverlayWindow()
+        try:
+            self.assertEqual(window.width(), 1140)
+            self.assertEqual(window.height(), 240)
+        finally:
+            window.close()
+
+    @patch("live_gpt.app.capture_webp", return_value=b"screenshot")
+    def test_send_captures_selected_source(self, capture: Mock) -> None:
+        source = CaptureSource(
+            key="window:123",
+            label="Test window",
+            kind="window",
+            left=0,
+            top=0,
+            width=1200,
+            height=800,
+            hwnd=123,
+        )
+        controller = TrayController.__new__(TrayController)
+        controller.window = Mock()
+        controller.browser_monitor = Mock()
+        controller.selected_chatgpt_tab_id = "selected-tab"
+
+        controller._handle_send_requested("Explain this", source)
+
+        capture.assert_called_once_with(source)
+        controller.browser_monitor.request_send.assert_called_once_with(
+            "selected-tab",
+            "Explain this",
+            b"screenshot",
+        )
+
     def test_clear_queues_selected_browser_composer(self) -> None:
         controller = TrayController.__new__(TrayController)
         controller.window = Mock()
@@ -119,6 +154,47 @@ class TrayControllerBrowserTests(unittest.TestCase):
         finally:
             window.close()
 
+    def test_capture_selector_keeps_no_screenshot_first(self) -> None:
+        window = OverlayWindow()
+        source = CaptureSource(
+            "display:1",
+            "Screenshot desktop",
+            "display",
+            0,
+            0,
+            1920,
+            1080,
+        )
+        try:
+            window.set_capture_sources([source])
+
+            self.assertEqual(window.capture_source_combo.itemText(0), "No screenshot")
+            self.assertIsNone(window.capture_source_combo.itemData(0))
+            self.assertEqual(window.capture_source_combo.itemData(1), source)
+        finally:
+            window.close()
+
+    def test_dictation_states_replace_input_area(self) -> None:
+        window = OverlayWindow()
+        try:
+            window.begin_dictation_waiting()
+
+            self.assertTrue(window.transcript_area.isHidden())
+            self.assertFalse(window.dictation_panel.isHidden())
+            self.assertEqual(
+                window.dictation_state_label.text(),
+                "Waiting for the browser to start listening…",
+            )
+
+            window.set_dictation_listening()
+            self.assertEqual(window.dictation_state_label.text(), "Listening…")
+
+            window.end_dictation_display()
+            self.assertFalse(window.transcript_area.isHidden())
+            self.assertTrue(window.dictation_panel.isHidden())
+        finally:
+            window.close()
+
     def test_microphone_press_and_release_queue_browser_dictation(self) -> None:
         controller = TrayController.__new__(TrayController)
         controller.window = Mock()
@@ -128,6 +204,10 @@ class TrayControllerBrowserTests(unittest.TestCase):
         controller.dictation_tab_id = None
 
         controller.start_dictation()
+        controller._on_dictation_started(
+            True,
+            "Browser dictation is listening",
+        )
         controller.finish_dictation()
 
         controller.browser_monitor.request_start_dictation.assert_called_once_with(
@@ -136,6 +216,9 @@ class TrayControllerBrowserTests(unittest.TestCase):
         controller.browser_monitor.request_finish_dictation.assert_called_once_with(
             "selected-tab"
         )
+        controller.window.begin_dictation_waiting.assert_called_once_with()
+        controller.window.set_dictation_listening.assert_called_once_with()
+        controller.window.set_dictation_finishing.assert_called_once_with()
         self.assertIsNone(controller.dictation_tab_id)
 
     def test_finished_dictation_populates_app_input(self) -> None:
@@ -151,6 +234,7 @@ class TrayControllerBrowserTests(unittest.TestCase):
         controller.window.set_transcript.assert_called_once_with(
             "Text recognized by ChatGPT"
         )
+        controller.window.end_dictation_display.assert_called_once_with()
         controller.window.set_microphone_state.assert_called_once_with(
             "saved",
             "Dictation copied from ChatGPT",

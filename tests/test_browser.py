@@ -77,6 +77,8 @@ class BrowserMonitorTests(unittest.TestCase):
         composer_locator = Mock(first=composer)
         send_button = Mock()
         send_button_locator = Mock(first=send_button)
+        attachment_locator = Mock()
+        attachment_locator.count.return_value = 0
         previous_turn = Mock()
         previous_turn.get_attribute.side_effect = (
             lambda attribute: "previous-turn"
@@ -97,6 +99,8 @@ class BrowserMonitorTests(unittest.TestCase):
                 '[data-turn="assistant"]'
             ):
                 return assistant_turns
+            if selector.startswith('button[aria-label="Remove file"]'):
+                return attachment_locator
             return send_button_locator
 
         page.locator.side_effect = locate
@@ -123,12 +127,54 @@ class BrowserMonitorTests(unittest.TestCase):
             timeout=5_000,
         )
         composer.fill.assert_called_once_with("Hello from Live GPT")
-        send_button.click.assert_called_once_with(timeout=5_000)
+        send_button.click.assert_called_once_with(timeout=15_000)
         self.assertEqual(
             results,
             [(True, "Hello from Live GPT", "Sent to ChatGPT")],
         )
         self.assertIsNotNone(state.active_response)
+
+    def test_send_replaces_existing_attachment_with_screenshot(self) -> None:
+        composer = Mock()
+        remove_button = Mock()
+        remove_button.is_visible.return_value = True
+        remove_buttons = Mock(last=remove_button)
+        remove_buttons.count.return_value = 1
+        file_input = Mock()
+        file_inputs = Mock(last=file_input)
+        file_inputs.count.return_value = 1
+        send_button = Mock()
+
+        page = Mock()
+
+        def locate(selector: str) -> Mock:
+            if selector == "#prompt-textarea":
+                return Mock(first=composer)
+            if selector.startswith('button[aria-label="Remove file"]'):
+                return remove_buttons
+            if selector.startswith('input[type="file"]'):
+                return file_inputs
+            return Mock(first=send_button)
+
+        page.locator.side_effect = locate
+
+        BrowserMonitor._send_to_chatgpt_page(
+            page,
+            "Describe this screenshot",
+            b"png bytes",
+        )
+
+        remove_button.click.assert_called_once_with(timeout=5_000)
+        composer.fill.assert_called_once_with("Describe this screenshot")
+        file_input.set_input_files.assert_called_once_with(
+            {
+                "name": "live-gpt-screenshot.webp",
+                "mimeType": "image/webp",
+                "buffer": b"png bytes",
+            },
+            timeout=10_000,
+        )
+        send_button.click.assert_called_once_with(timeout=15_000)
 
     def test_dictation_press_clicks_chatgpt_microphone(self) -> None:
         composer = Mock()
@@ -226,7 +272,7 @@ class BrowserMonitorTests(unittest.TestCase):
         page.locator.assert_any_call(
             'button[aria-label="Submit dictation"]'
         )
-        page.wait_for_function.assert_called_once()
+        page.wait_for_function.assert_not_called()
         self.assertEqual(
             results,
             [
@@ -238,15 +284,54 @@ class BrowserMonitorTests(unittest.TestCase):
             ],
         )
 
+    def test_unchanged_dictation_text_finishes_without_timeout_error(self) -> None:
+        composer = Mock()
+        composer.evaluate.return_value = "Existing text"
+        done = Mock()
+        done.is_visible.side_effect = [True] + [False] * 50
+        unavailable = Mock()
+        unavailable.is_visible.return_value = False
+        page = Mock()
+
+        def locate(selector: str) -> Mock:
+            if selector == "#prompt-textarea":
+                return Mock(first=composer)
+            if selector == 'button[aria-label="Submit dictation"]':
+                return Mock(last=done)
+            return Mock(last=unavailable)
+
+        page.locator.side_effect = locate
+        monitor = BrowserMonitor()
+
+        text = monitor._finish_browser_dictation(page, "Existing text")
+
+        self.assertEqual(text, "Existing text")
+        done.click.assert_called_once_with(timeout=5_000)
+        self.assertEqual(page.wait_for_timeout.call_count, 15)
+
+    def test_stopping_monitor_cancels_dictation_wait(self) -> None:
+        monitor = BrowserMonitor()
+        monitor.request_stop()
+        page = Mock()
+
+        text = monitor._finish_browser_dictation(page, "Existing text")
+
+        self.assertEqual(text, "Existing text")
+        page.locator.assert_not_called()
+
     def test_completed_response_is_read_aloud(self) -> None:
         page = Mock()
         monitor = BrowserMonitor()
+        response = _ActiveResponse(
+            page=page,
+            turn_marker_before="previous-turn",
+            started_at=90.0,
+            last_text="The completed reply",
+            last_text_changed_at=97.0,
+            completion_candidate_at=97.0,
+        )
         state = _MonitorState(
-            active_response=_ActiveResponse(
-                page=page,
-                turn_marker_before="previous-turn",
-                started_at=time.monotonic() - 2,
-            )
+            active_response=response
         )
         snapshot = _ResponseSnapshot(
             has_new_turn=True,
@@ -269,9 +354,8 @@ class BrowserMonitorTests(unittest.TestCase):
         with (
             patch.object(monitor, "_response_snapshot", return_value=snapshot),
             patch.object(monitor, "_click_read_aloud", return_value=True) as read,
+            patch("live_gpt.browser.time.monotonic", return_value=100.0),
         ):
-            monitor._poll_active_response(state)
-            monitor._poll_active_response(state)
             monitor._poll_active_response(state)
 
         read.assert_called_once_with(page)
@@ -280,6 +364,45 @@ class BrowserMonitorTests(unittest.TestCase):
         self.assertEqual(reading_started, ["Preparing Read aloud…"])
         self.assertIsNone(state.active_response)
         self.assertIsNotNone(state.active_reading)
+
+    def test_late_trailing_text_resets_completion_stability_window(self) -> None:
+        page = Mock()
+        monitor = BrowserMonitor()
+        state = _MonitorState(
+            active_response=_ActiveResponse(
+                page=page,
+                turn_marker_before="previous-turn",
+                started_at=90.0,
+                last_text="Almost complete",
+                last_status="Finishing reply…",
+                last_text_changed_at=95.0,
+                completion_candidate_at=95.0,
+            )
+        )
+        snapshot = _ResponseSnapshot(
+            has_new_turn=True,
+            is_generating=False,
+            has_completion_controls=True,
+            text="Almost complete!",
+            status="Finishing reply…",
+        )
+
+        with (
+            patch.object(monitor, "_response_snapshot", return_value=snapshot),
+            patch.object(monitor, "_click_read_aloud", return_value=True) as read,
+            patch(
+                "live_gpt.browser.time.monotonic",
+                side_effect=[100.0, 101.0, 102.1],
+            ),
+        ):
+            monitor._poll_active_response(state)
+            monitor._poll_active_response(state)
+            read.assert_not_called()
+            monitor._poll_active_response(state)
+
+        read.assert_called_once_with(page)
+        assert state.active_reading is not None
+        self.assertEqual(state.active_reading.full_text, "Almost complete!")
 
     def test_reading_progress_emits_subtitles_and_finishes(self) -> None:
         page = Mock()
@@ -373,11 +496,27 @@ class BrowserMonitorTests(unittest.TestCase):
 
     def test_read_aloud_uses_more_actions_menu(self) -> None:
         turn = Mock()
+        turn.get_attribute.side_effect = (
+            lambda attribute: "turn-id"
+            if attribute == "data-turn-id"
+            else "conversation-turn-8"
+        )
         turns = Mock(last=turn)
         turns.count.return_value = 1
         direct_button = Mock()
+        direct_buttons = Mock(last=direct_button)
+        direct_buttons.count.return_value = 0
         more_actions = Mock()
+        more_buttons = Mock(last=more_actions)
+        more_buttons.count.return_value = 1
         read_aloud = Mock()
+
+        def locate_in_turn(selector: str) -> Mock:
+            if "voice-play-turn-action-button" in selector:
+                return direct_buttons
+            return more_buttons
+
+        turn.locator.side_effect = locate_in_turn
 
         page = Mock()
 
@@ -387,10 +526,6 @@ class BrowserMonitorTests(unittest.TestCase):
                 '[data-turn="assistant"]'
             ):
                 return turns
-            if "voice-play-turn-action-button" in selector:
-                return Mock(last=direct_button)
-            if selector == 'button[aria-label="More actions"]':
-                return Mock(last=more_actions)
             return Mock(last=read_aloud)
 
         page.locator.side_effect = locate
@@ -399,9 +534,30 @@ class BrowserMonitorTests(unittest.TestCase):
         clicked = BrowserMonitor._click_read_aloud(page)
 
         self.assertTrue(clicked)
-        turn.hover.assert_called_once_with(timeout=2_000)
-        more_actions.click.assert_called_once_with(timeout=5_000)
-        read_aloud.click.assert_called_once_with(timeout=5_000)
+        turn.hover.assert_not_called()
+        more_actions.click.assert_called_once_with(timeout=3_000, force=True)
+        read_aloud.click.assert_called_once_with(timeout=3_000, force=True)
+
+    def test_read_aloud_uses_dom_click_when_pointer_click_times_out(self) -> None:
+        direct_button = Mock()
+        direct_button.is_visible.return_value = True
+        direct_button.click.side_effect = RuntimeError("pointer timeout")
+        direct_buttons = Mock(last=direct_button)
+        direct_buttons.count.return_value = 1
+        turn = Mock()
+        turn.get_attribute.return_value = "turn-id"
+        turn.locator.return_value = direct_buttons
+        turns = Mock(last=turn)
+        turns.count.return_value = 1
+        page = Mock()
+        page.locator.return_value = turns
+
+        clicked = BrowserMonitor._click_read_aloud(page)
+
+        self.assertTrue(clicked)
+        direct_button.evaluate.assert_called_once_with(
+            "element => element.click()"
+        )
 
     def test_response_snapshot_reads_current_assistant_section(self) -> None:
         markdown = Mock()

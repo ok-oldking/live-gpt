@@ -30,6 +30,16 @@ logger = Logger.get_logger(__name__)
 ASSISTANT_TURN_SELECTOR = (
     '[data-testid^="conversation-turn-"][data-turn="assistant"]'
 )
+DICTATION_END_SELECTORS = (
+    'button[aria-label="Submit dictation"]',
+    'button[aria-label="Done"]',
+    'button[aria-label="Stop dictation"]',
+    'button[aria-label="Finish dictation"]',
+    'button[aria-label="Stop recording"]',
+    'button[data-testid="composer-dictation-done-button"]',
+    'button[data-testid="dictation-done-button"]',
+    'button:text-is("Done")',
+)
 _MEDIA_TRACKER_SCRIPT = """
 () => {
     if (window.__liveGptMediaTrackerInstalled) return;
@@ -84,6 +94,7 @@ class _MonitorState:
 class _SendRequest:
     tab_id: str
     text: str
+    screenshot_webp: bytes | None = None
 
 
 @dataclass(frozen=True)
@@ -104,7 +115,8 @@ class _ActiveResponse:
     started_at: float = field(default_factory=time.monotonic)
     last_text: str = ""
     last_status: str = ""
-    unchanged_polls: int = 0
+    last_text_changed_at: float = field(default_factory=time.monotonic)
+    completion_candidate_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -163,9 +175,20 @@ class BrowserMonitor(QThread):
         self._retry_connection_requested = True
         self._wake_event.set()
 
-    def request_send(self, tab_id: str, text: str) -> None:
+    def request_send(
+        self,
+        tab_id: str,
+        text: str,
+        screenshot_webp: bytes | None = None,
+    ) -> None:
         """Queue text for the selected ChatGPT page on the worker thread."""
-        self._send_requests.put(_SendRequest(tab_id=tab_id, text=text))
+        self._send_requests.put(
+            _SendRequest(
+                tab_id=tab_id,
+                text=text,
+                screenshot_webp=screenshot_webp,
+            )
+        )
         self._wake_event.set()
 
     def request_start_dictation(self, tab_id: str) -> None:
@@ -512,7 +535,11 @@ class BrowserMonitor(QThread):
 
             try:
                 turn_marker_before = self._assistant_turn_marker(page)
-                self._send_to_chatgpt_page(page, request.text)
+                self._send_to_chatgpt_page(
+                    page,
+                    request.text,
+                    request.screenshot_webp,
+                )
             except Exception as error:
                 logger.error("Unable to send text to ChatGPT", error)
                 self.send_finished.emit(
@@ -551,13 +578,18 @@ class BrowserMonitor(QThread):
             state.active_response = None
             return
 
+        now = time.monotonic()
         text_changed = snapshot.text != response.last_text
-        if not text_changed:
-            if snapshot.has_new_turn:
-                response.unchanged_polls += 1
-        else:
+        if text_changed:
+            logger.debug(
+                "ChatGPT response text changed "
+                f"characters={len(snapshot.text)} "
+                f"generating={snapshot.is_generating} "
+                f"completion_controls={snapshot.has_completion_controls}"
+            )
             response.last_text = snapshot.text
-            response.unchanged_polls = 0
+            response.last_text_changed_at = now
+            response.completion_candidate_at = None
 
         if (
             text_changed
@@ -565,17 +597,34 @@ class BrowserMonitor(QThread):
         ):
             response.last_status = snapshot.status
             self.response_changed.emit(snapshot.status, snapshot.text)
-        elif snapshot.text and response.unchanged_polls == 0:
-            self.response_changed.emit(snapshot.status, snapshot.text)
-
-        response_age = time.monotonic() - response.started_at
-        is_complete = (
+        completion_candidate = (
             snapshot.has_new_turn
             and bool(snapshot.text)
             and not snapshot.is_generating
             and snapshot.has_completion_controls
-            and response.unchanged_polls >= 2
-            and response_age >= 1.0
+        )
+        if completion_candidate:
+            if response.completion_candidate_at is None:
+                response.completion_candidate_at = now
+                logger.debug(
+                    "ChatGPT response completion candidate started "
+                    f"characters={len(snapshot.text)}"
+                )
+        else:
+            response.completion_candidate_at = None
+
+        response_age = now - response.started_at
+        text_stable_for = now - response.last_text_changed_at
+        controls_stable_for = (
+            now - response.completion_candidate_at
+            if response.completion_candidate_at is not None
+            else 0.0
+        )
+        is_complete = (
+            completion_candidate
+            and text_stable_for >= 2.0
+            and controls_stable_for >= 2.0
+            and response_age >= 2.0
         )
         if not is_complete:
             if response_age >= 600:
@@ -586,6 +635,11 @@ class BrowserMonitor(QThread):
                 state.active_response = None
             return
 
+        logger.info(
+            "ChatGPT response is stable; attempting Read aloud "
+            f"characters={len(snapshot.text)} "
+            f"stable_seconds={text_stable_for:.2f}"
+        )
         read_aloud_clicked = self._click_read_aloud(response.page)
         if read_aloud_clicked:
             state.active_reading = _ActiveReading(
@@ -720,17 +774,58 @@ class BrowserMonitor(QThread):
                     continue
         return None
 
-    @staticmethod
-    def _send_to_chatgpt_page(page: Any, text: str) -> None:
+    @classmethod
+    def _send_to_chatgpt_page(
+        cls,
+        page: Any,
+        text: str,
+        screenshot_webp: bytes | None = None,
+    ) -> None:
         composer = page.locator("#prompt-textarea").first
         composer.wait_for(state="visible", timeout=5_000)
+        cls._clear_chatgpt_attachments(page)
         composer.fill(text)
+        if screenshot_webp is not None:
+            cls._paste_screenshot(page, screenshot_webp)
 
         send_button = page.locator(
             'button[data-testid="send-button"]'
         ).first
         send_button.wait_for(state="visible", timeout=5_000)
-        send_button.click(timeout=5_000)
+        send_button.click(timeout=15_000)
+
+    @classmethod
+    def _clear_chatgpt_attachments(cls, page: Any) -> None:
+        remove_buttons = page.locator(
+            'button[aria-label="Remove file"], '
+            'button[aria-label="Remove attachment"], '
+            'button[aria-label="Remove image"], '
+            'button[data-testid*="remove"][data-testid*="file"], '
+            'button[data-testid*="remove"][data-testid*="attachment"]'
+        )
+        for _ in range(min(int(remove_buttons.count()), 20)):
+            button = remove_buttons.last
+            if not cls._locator_is_visible(button):
+                break
+            button.click(timeout=5_000)
+            page.wait_for_timeout(100)
+
+    @staticmethod
+    def _paste_screenshot(page: Any, screenshot_webp: bytes) -> None:
+        file_inputs = page.locator(
+            'input[type="file"][accept*="image"], input[type="file"]'
+        )
+        if int(file_inputs.count()) == 0:
+            raise RuntimeError("ChatGPT's image input was not found")
+        file_inputs.last.set_input_files(
+            {
+                "name": "live-gpt-screenshot.webp",
+                "mimeType": "image/webp",
+                "buffer": screenshot_webp,
+            },
+            timeout=10_000,
+        )
+        page.wait_for_timeout(500)
 
     @staticmethod
     def _clear_chatgpt_composer(page: Any) -> None:
@@ -739,9 +834,9 @@ class BrowserMonitor(QThread):
         composer.fill("")
 
     @staticmethod
-    def _read_composer_text(page: Any) -> str:
+    def _read_composer_text(page: Any, timeout: int = 5_000) -> str:
         composer = page.locator("#prompt-textarea").first
-        composer.wait_for(state="visible", timeout=5_000)
+        composer.wait_for(state="visible", timeout=timeout)
         text = composer.evaluate(
             """
             element => {
@@ -754,9 +849,8 @@ class BrowserMonitor(QThread):
         )
         return str(text or "").strip()
 
-    @classmethod
-    def _start_browser_dictation(cls, page: Any) -> None:
-        button = cls._first_visible_locator(
+    def _start_browser_dictation(self, page: Any) -> None:
+        button = self._first_visible_locator(
             page,
             (
                 'button[aria-label="Start dictation"]',
@@ -769,72 +863,86 @@ class BrowserMonitor(QThread):
             raise RuntimeError("ChatGPT's dictation microphone was not found")
         button.click(timeout=5_000)
 
-    @classmethod
+        end_button = self._first_visible_locator(
+            page,
+            DICTATION_END_SELECTORS,
+            timeout=10_000,
+        )
+        if end_button is None:
+            if self._stop_requested:
+                raise RuntimeError("Dictation cancelled")
+            raise RuntimeError("ChatGPT did not start listening")
+
     def _finish_browser_dictation(
-        cls,
+        self,
         page: Any,
         initial_text: str,
     ) -> str:
-        button = cls._first_visible_locator(
+        button = self._first_visible_locator(
             page,
-            (
-                'button[aria-label="Submit dictation"]',
-                'button[aria-label="Done"]',
-                'button[aria-label="Stop dictation"]',
-                'button[aria-label="Finish dictation"]',
-                'button[aria-label="Stop recording"]',
-                'button[data-testid="composer-dictation-done-button"]',
-                'button[data-testid="dictation-done-button"]',
-                'button:text-is("Done")',
-            ),
-            timeout=15_000,
+            DICTATION_END_SELECTORS,
+            timeout=5_000,
         )
         if button is None:
+            if self._stop_requested:
+                return initial_text
             raise RuntimeError("ChatGPT's dictation Done button was not found")
         button.click(timeout=5_000)
 
-        page.wait_for_function(
-            """
-            previous => {
-                const composer = document.querySelector('#prompt-textarea');
-                if (!composer) return false;
-                const text = typeof composer.value === 'string'
-                    ? composer.value
-                    : (composer.innerText || composer.textContent || '');
-                return text.trim().length > 0 && text.trim() !== previous;
-            }
-            """,
-            arg=initial_text.strip(),
-            timeout=20_000,
-        )
-        text = cls._read_composer_text(page)
+        text = initial_text.strip()
+        changed = False
         stable_polls = 0
-        deadline = time.monotonic() + 3.0
-        while stable_polls < 2 and time.monotonic() < deadline:
+        end_hidden_polls = 0
+        for _ in range(40):
+            if self._stop_requested:
+                break
             page.wait_for_timeout(200)
-            current_text = cls._read_composer_text(page)
+            current_text = self._read_composer_text(page, timeout=1_000)
             if current_text == text:
                 stable_polls += 1
             else:
                 text = current_text
+                changed = text != initial_text.strip()
                 stable_polls = 0
+            if not self._any_visible_locator(page, DICTATION_END_SELECTORS):
+                end_hidden_polls += 1
+            else:
+                end_hidden_polls = 0
+
+            if changed and stable_polls >= 2:
+                return text
+            if (
+                not changed
+                and end_hidden_polls >= 15
+            ):
+                return text
         return text
 
-    @classmethod
     def _first_visible_locator(
-        cls,
+        self,
         page: Any,
         selectors: tuple[str, ...],
         timeout: int,
     ) -> Any | None:
         deadline = time.monotonic() + timeout / 1_000
-        while time.monotonic() < deadline:
+        while time.monotonic() < deadline and not self._stop_requested:
             for selector in selectors:
                 locator = page.locator(selector).last
-                if cls._locator_is_visible(locator):
+                if self._locator_is_visible(locator):
                     return locator
             page.wait_for_timeout(100)
         return None
+
+    @classmethod
+    def _any_visible_locator(
+        cls,
+        page: Any,
+        selectors: tuple[str, ...],
+    ) -> bool:
+        return any(
+            cls._locator_is_visible(page.locator(selector).last)
+            for selector in selectors
+        )
 
     @staticmethod
     def _assistant_turn_marker(page: Any) -> str | None:
@@ -1036,31 +1144,131 @@ class BrowserMonitor(QThread):
         try:
             page.evaluate(_MEDIA_TRACKER_SCRIPT)
             turns = page.locator(ASSISTANT_TURN_SELECTOR)
-            if int(turns.count()) > 0:
-                turns.last.hover(timeout=2_000)
-            direct_button = page.locator(
+            turn_count = int(turns.count())
+            if turn_count == 0:
+                logger.warning("Read aloud inspection found no assistant turn")
+                return False
+
+            turn = turns.last
+            turn_marker = (
+                turn.get_attribute("data-turn-id")
+                or turn.get_attribute("data-testid")
+            )
+            logger.debug(
+                "Read aloud inspection "
+                f"turn_count={turn_count} turn_marker={turn_marker!r}"
+            )
+
+            direct_buttons = turn.locator(
                 'button[data-testid="voice-play-turn-action-button"], '
                 'button[aria-label="Read aloud"]'
-            ).last
-            if cls._locator_is_visible(direct_button):
-                direct_button.click(timeout=5_000)
+            )
+            direct_count = int(direct_buttons.count())
+            direct_button = direct_buttons.last
+            direct_visible = (
+                direct_count > 0
+                and cls._locator_is_visible(direct_button)
+            )
+            logger.debug(
+                "Read aloud direct control "
+                f"count={direct_count} visible={direct_visible}"
+            )
+            if direct_visible:
+                cls._click_action_control(
+                    page,
+                    direct_button,
+                    "direct Read aloud",
+                )
+                click_path = "direct"
             else:
-                more_actions = page.locator(
+                more_action_buttons = turn.locator(
                     'button[aria-label="More actions"]'
-                ).last
-                more_actions.wait_for(state="visible", timeout=5_000)
-                more_actions.click(timeout=5_000)
+                )
+                more_count = int(more_action_buttons.count())
+                more_actions = more_action_buttons.last
+                more_visible = (
+                    more_count > 0
+                    and cls._locator_is_visible(more_actions)
+                )
+                logger.debug(
+                    "Read aloud More actions control "
+                    f"count={more_count} visible={more_visible}"
+                )
+                if not more_visible:
+                    raise RuntimeError(
+                        "The latest assistant turn has no visible More actions button"
+                    )
+                cls._click_action_control(
+                    page,
+                    more_actions,
+                    "More actions",
+                    expanded_control=True,
+                )
                 read_aloud = page.locator(
                     '[role="menuitem"]:has-text("Read aloud"), '
                     '[role="menuitemradio"]:has-text("Read aloud")'
                 ).last
-                read_aloud.wait_for(state="visible", timeout=5_000)
-                read_aloud.click(timeout=5_000)
-            logger.info("Clicked ChatGPT Read aloud")
+                try:
+                    read_aloud.wait_for(state="visible", timeout=5_000)
+                except Exception:
+                    menu_items = page.locator(
+                        '[role="menuitem"], [role="menuitemradio"]'
+                    )
+                    try:
+                        labels = menu_items.all_inner_texts()[:20]
+                    except Exception:
+                        labels = []
+                    logger.debug(
+                        "Read aloud menu inspection "
+                        f"item_count={int(menu_items.count())} labels={labels!r}"
+                    )
+                    raise
+                logger.debug("Read aloud menu item is visible")
+                cls._click_action_control(
+                    page,
+                    read_aloud,
+                    "Read aloud menu item",
+                )
+                click_path = "More actions menu"
+            logger.info(f"Clicked ChatGPT Read aloud path={click_path}")
             return True
         except Exception as error:
             logger.warning(f"Unable to click ChatGPT Read aloud: {error}")
             return False
+
+    @staticmethod
+    def _click_action_control(
+        page: Any,
+        locator: Any,
+        description: str,
+        expanded_control: bool = False,
+    ) -> None:
+        try:
+            locator.click(timeout=3_000, force=True)
+        except Exception as click_error:
+            if (
+                expanded_control
+                and locator.get_attribute("aria-expanded") == "true"
+            ):
+                logger.debug(
+                    f"{description} opened despite Playwright click timeout"
+                )
+                return
+            try:
+                page.wait_for_timeout(150)
+                media = page.evaluate(_MEDIA_PROGRESS_SCRIPT)
+            except Exception:
+                media = None
+            if isinstance(media, dict) and int(media.get("playCount") or 0) > 0:
+                logger.debug(
+                    f"{description} started playback despite click timeout"
+                )
+                return
+            logger.debug(
+                f"Playwright click failed for {description}; "
+                f"using DOM click fallback: {click_error}"
+            )
+            locator.evaluate("element => element.click()")
 
     def _set_status(self, status: str) -> None:
         if status == self._last_status:
