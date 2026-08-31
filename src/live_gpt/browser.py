@@ -43,6 +43,7 @@ DICTATION_RESULT_POLL_INTERVAL_MS = 200
 DICTATION_RESULT_POLL_COUNT = (
     DICTATION_RESULT_TIMEOUT_MS // DICTATION_RESULT_POLL_INTERVAL_MS
 )
+REMOTE_DEBUGGING_RETRY_INTERVAL_SECONDS = 3.0
 DICTATION_END_SELECTORS = (
     'button[aria-label="Submit dictation"]',
     'button[aria-label="Done"]',
@@ -106,7 +107,8 @@ class _MonitorState:
     browser: Any | None = None
     settings_opened: bool = False
     next_settings_attempt: float = 0.0
-    rejected_endpoint: str | None = None
+    retry_endpoint: str | None = None
+    next_connection_attempt: float = 0.0
     last_tabs: list[dict[str, str]] | None = None
     media_reset_pages: set[str] = field(default_factory=set)
     active_response: _ActiveResponse | None = None
@@ -309,15 +311,19 @@ class BrowserMonitor(QThread):
 
         if self._retry_connection_requested:
             self._retry_connection_requested = False
-            state.rejected_endpoint = None
+            state.retry_endpoint = None
+            state.next_connection_attempt = 0.0
 
         if endpoint is None:
             self._prepare_remote_debugging(state)
             return
 
-        if endpoint == state.rejected_endpoint:
+        if (
+            endpoint == state.retry_endpoint
+            and time.monotonic() < state.next_connection_attempt
+        ):
             self._set_status(
-                "Approval declined; click Enable Debugging to retry"
+                "Waiting for remote debugging approval; retrying automatically…"
             )
             return
 
@@ -332,13 +338,18 @@ class BrowserMonitor(QThread):
                 "Unable to connect to remote-debug browser "
                 f"endpoint={endpoint!r}: {error}"
             )
-            state.rejected_endpoint = endpoint
+            state.retry_endpoint = endpoint
+            state.next_connection_attempt = (
+                time.monotonic()
+                + REMOTE_DEBUGGING_RETRY_INTERVAL_SECONDS
+            )
             self._set_status(
-                "Approval declined; click Enable Debugging to retry"
+                "Waiting for remote debugging approval; retrying automatically…"
             )
             return
 
-        state.rejected_endpoint = None
+        state.retry_endpoint = None
+        state.next_connection_attempt = 0.0
         state.media_reset_pages.clear()
         state.settings_opened = False
         self._set_status("Browser connected")

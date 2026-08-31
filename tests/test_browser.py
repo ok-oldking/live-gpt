@@ -10,6 +10,7 @@ from live_gpt.browser import (
     DICTATION_CANCEL_SELECTORS,
     DICTATION_RESULT_POLL_COUNT,
     DICTATION_RESULT_TIMEOUT_MS,
+    REMOTE_DEBUGGING_RETRY_INTERVAL_SECONDS,
     _ActiveReading,
     BrowserMonitor,
     _ActiveResponse,
@@ -59,7 +60,7 @@ class BrowserMonitorTests(unittest.TestCase):
         hidden_composer.wait_for.assert_not_called()
 
     @patch("live_gpt.browser.discover_cdp_endpoint")
-    def test_declined_endpoint_is_not_retried_until_requested(
+    def test_timed_out_endpoint_is_retried_automatically(
         self,
         discover_endpoint: Mock,
     ) -> None:
@@ -70,12 +71,35 @@ class BrowserMonitorTests(unittest.TestCase):
         monitor = BrowserMonitor()
         state = _MonitorState()
 
-        monitor._try_connect(playwright, FakePlaywrightError, state)
-        monitor._try_connect(playwright, FakePlaywrightError, state)
-        self.assertEqual(chromium.connect_over_cdp.call_count, 1)
+        with patch("live_gpt.browser.time.monotonic") as monotonic:
+            monotonic.return_value = 100.0
+            monitor._try_connect(playwright, FakePlaywrightError, state)
+            monitor._try_connect(playwright, FakePlaywrightError, state)
+            self.assertEqual(chromium.connect_over_cdp.call_count, 1)
 
-        monitor.request_retry_connection()
-        monitor._try_connect(playwright, FakePlaywrightError, state)
+            monotonic.return_value = (
+                100.0 + REMOTE_DEBUGGING_RETRY_INTERVAL_SECONDS
+            )
+            monitor._try_connect(playwright, FakePlaywrightError, state)
+        self.assertEqual(chromium.connect_over_cdp.call_count, 2)
+
+    @patch("live_gpt.browser.discover_cdp_endpoint")
+    def test_requested_retry_does_not_wait_for_interval(
+        self,
+        discover_endpoint: Mock,
+    ) -> None:
+        discover_endpoint.return_value = "http://127.0.0.1:9222"
+        chromium = Mock()
+        chromium.connect_over_cdp.side_effect = FakePlaywrightError("declined")
+        playwright = Mock(chromium=chromium)
+        monitor = BrowserMonitor()
+        state = _MonitorState()
+
+        with patch("live_gpt.browser.time.monotonic", return_value=100.0):
+            monitor._try_connect(playwright, FakePlaywrightError, state)
+            monitor.request_retry_connection()
+            monitor._try_connect(playwright, FakePlaywrightError, state)
+
         self.assertEqual(chromium.connect_over_cdp.call_count, 2)
 
     def test_native_color_scheme_is_restored_once_per_page(self) -> None:
