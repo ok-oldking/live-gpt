@@ -15,8 +15,17 @@ it. The lock button beside **Configure** freezes both its position and size;
 click it again to unlock. When the pointer is outside the overlay, its frame,
 title controls, and microphone become fully transparent while the input area
 stays visible. They return when the pointer enters or while a border is being
-resized. Use the overlay's **Hide** and **Exit** buttons, or double-click the
-tray icon to restore a hidden overlay.
+resized. The **Auto-hide** button hides the overlay completely so clicks pass
+through to the underlying app. In auto-hide mode it reappears for dictation,
+incoming replies, and Read Aloud, then hides five seconds after playback ends.
+If dictation produces text, the overlay stays visible so that text can be
+reviewed or sent; enabling auto-hide does not hide unsent text or interrupt
+dictation, response generation, playback, or an expanded subtitle. Enable
+**Auto Send** to send successful dictation
+immediately, using the selected screenshot when one is selected and sending
+without one when **No screenshot** is selected.
+Double-click the tray icon to reveal it and turn auto-hide off. The **Exit**
+button closes the app.
 
 Press and hold the microphone button to start ChatGPT's browser dictation
 through Playwright. Releasing it clicks ChatGPT's **Done** control, waits for
@@ -31,15 +40,14 @@ cancels any stale browser dictation. A mouse dictation must remain held for at
 least 0.5 seconds after ChatGPT starts listening or it is cancelled. The global
 hold hotkey waits 0.3 seconds before starting, so a quick tap has no effect.
 
-The recognized text remains editable. When the editor contains text, its
-paper-plane button sends the current text through Playwright to the selected
+The recognized text remains editable. Its paper-plane button sends the current
+text through Playwright to the selected
 ChatGPT tab, and its **X** button clears the editor. The app fills ChatGPT's
 composer and clicks its send button, then clears the local text after ChatGPT
 accepts it. The **X** button also clears the selected ChatGPT tab's composer.
 These browser interactions run without intentionally bringing its window to
-the foreground. While ChatGPT responds, the editor switches to a read-only
-response view, its action buttons and the microphone are hidden, and the status
-label shows activities such as web searching when ChatGPT exposes them in the turn.
+the foreground. A send initiated inside the overlay restores focus to the
+previous app; a global-hotkey send leaves focus unchanged.
 
 The screenshot selector starts with **No screenshot**, followed by one choice
 for each desktop display and then visible windows ordered from largest to
@@ -49,9 +57,10 @@ image attachments and, unless **No screenshot** is selected, captures the
 chosen source, scales its longest edge down to 1920 pixels when necessary, and
 uploads it as lossless WebP before clicking Send. Window capture uses the
 BitBlt/PrintWindow approach with full-content rendering enabled.
-When a screenshot source is selected, a **No screenshot** action also appears
-inside the editor so the current prompt can be sent as text without changing
-the selector.
+When a screenshot source is selected, the **With Screenshot** action remains
+available even with an empty prompt. If the editor also contains text, a
+paper-plane **No Screenshot** action appears so the prompt can be sent without
+changing the selector.
 
 The **Configure** button opens the global-hotkey settings. Defaults are
 **Caps Lock** (hold to dictate), **Ctrl+S** (send with the selected screenshot),
@@ -63,15 +72,19 @@ The editor and microphone remain disabled until a ChatGPT window is connected.
 Status tips appear as the editor hint rather than in a separate row; errors use
 a red hint.
 
-The reply streams into the former input area. After the completed reply becomes
-stable, Live GPT clicks ChatGPT's **Read aloud** button. During playback, the
-response area becomes a large, full-width two-label subtitle view that follows
-the browser media's playback progress and rolls forward one line at a time. If ChatGPT
-does not expose its media element, subtitle timing falls back to an estimate.
-The full response and microphone return when playback finishes. Click the
-completed reply or press the microphone to start another prompt. Press
-**Enter** to send a prompt or **Shift+Enter** to insert a newline. Both editor
-buttons remain hidden while the editor is empty.
+Sending switches directly to a full-width two-label subtitle view. While
+ChatGPT responds, its first line shows the sent prompt and its second line
+shows the current status. When **Read aloud** starts, the prompt is removed and
+both lines show the response. During playback, subtitles follow the browser
+media's progress and roll forward one line at a time. Hover over the subtitle
+area to expand a full-response view whose height fits the wrapped text. Moving
+the pointer outside always restores the two-line view at the current playback
+line. Left-click it to return to input mode. If
+ChatGPT does not expose its media element, subtitle timing falls back to an
+estimate. Press the microphone or its hotkey to dismiss subtitles and dictate
+another prompt. Press
+**Enter** to send a prompt or **Shift+Enter** to insert a newline. With no
+screenshot selected, the send actions remain hidden while the editor is empty.
 
 At startup, Live GPT connects through Playwright to a local Chromium browser
 that was started with remote debugging enabled. It discovers ChatGPT tabs and

@@ -61,9 +61,10 @@ from .window_focus import ForegroundWindowRestorer
 ASSET_DIRECTORY = Path(__file__).resolve().parent / "assets"
 ICON_PATH = ASSET_DIRECTORY / "app-icon.ico"
 MICROPHONE_ICON_PATH = ASSET_DIRECTORY / "microphone.svg"
-HIDE_ICON_PATH = ASSET_DIRECTORY / "hide.svg"
+AUTO_HIDE_ICON_PATH = ASSET_DIRECTORY / "auto-hide.svg"
 EXIT_ICON_PATH = ASSET_DIRECTORY / "exit.svg"
 SEND_ICON_PATH = ASSET_DIRECTORY / "send.svg"
+CHECK_ICON_PATH = ASSET_DIRECTORY / "check.svg"
 SETTINGS_ICON_PATH = ASSET_DIRECTORY / "settings.svg"
 LOCK_ICON_PATH = ASSET_DIRECTORY / "lock.svg"
 UNLOCK_ICON_PATH = ASSET_DIRECTORY / "unlock.svg"
@@ -116,6 +117,12 @@ class HotkeyConfigDialog(QDialog):
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
             | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setToolTip(
+            "Save hotkey settings"
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setToolTip(
+            "Close without saving"
         )
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
@@ -186,19 +193,39 @@ class TranscriptEditor(QPlainTextEdit):
         self.send_button.setToolTip("Send")
 
         self.send_without_screenshot_button = QPushButton(
-            "No screenshot",
+            "No Screenshot",
             self,
         )
         self.send_without_screenshot_button.setObjectName(
             "sendWithoutScreenshotButton"
         )
-        self.send_without_screenshot_button.setFixedSize(108, 32)
+        self.send_without_screenshot_button.setIcon(
+            QIcon(str(SEND_ICON_PATH))
+        )
+        self.send_without_screenshot_button.setIconSize(QSize(16, 16))
+        self.send_without_screenshot_button.setFixedSize(132, 32)
         self.send_without_screenshot_button.setAccessibleName(
             "Send without screenshot"
         )
         self.send_without_screenshot_button.setToolTip(
             "Send the text without the selected screenshot"
         )
+
+        self.auto_send_button = QPushButton("Auto Send", self)
+        self.auto_send_button.setObjectName("autoSendButton")
+        self.auto_send_button.setCheckable(True)
+        self.auto_send_button.setFixedSize(104, 32)
+        self.auto_send_button.setAccessibleName(
+            "Automatically send dictated text"
+        )
+        self.auto_send_button.setToolTip(
+            "Automatically send dictated text using the selected "
+            "screenshot option"
+        )
+        self.auto_send_button.toggled.connect(
+            self._sync_auto_send_icon
+        )
+        self._sync_auto_send_icon(False)
 
         self.textChanged.connect(self._sync_action_visibility)
         self._sync_action_visibility()
@@ -207,26 +234,28 @@ class TranscriptEditor(QPlainTextEdit):
         super().resizeEvent(event)
         self._position_action_buttons()
 
+    def _sync_auto_send_icon(self, enabled: bool) -> None:
+        icon = QIcon(str(CHECK_ICON_PATH)) if enabled else QIcon()
+        self.auto_send_button.setIcon(icon)
+        self.auto_send_button.setIconSize(QSize(16, 16))
+
     def _position_action_buttons(self) -> None:
         margin = 8
         spacing = 6
         y = self.height() - self.send_button.height() - margin
-        send_x = self.width() - self.send_button.width() - margin
-        if self._screenshot_selected:
-            no_screenshot_x = (
-                send_x
-                - self.send_without_screenshot_button.width()
-                - spacing
-            )
-            clear_x = no_screenshot_x - self.clear_button.width() - spacing
-            self.send_without_screenshot_button.move(no_screenshot_x, y)
-        else:
-            clear_x = send_x - self.clear_button.width() - spacing
-        self.clear_button.move(clear_x, y)
-        self.send_button.move(send_x, y)
-        self.clear_button.raise_()
-        self.send_without_screenshot_button.raise_()
-        self.send_button.raise_()
+        right = self.width() - margin
+        for button in (
+            self.send_button,
+            self.send_without_screenshot_button,
+            self.auto_send_button,
+            self.clear_button,
+        ):
+            if button.isHidden():
+                continue
+            right -= button.width()
+            button.move(right, y)
+            button.raise_()
+            right -= spacing
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
         if self._response_mode:
@@ -245,7 +274,7 @@ class TranscriptEditor(QPlainTextEdit):
             event.modifiers() & Qt.KeyboardModifier.ShiftModifier
         )
         if is_enter and not wants_newline and not self._response_mode:
-            if self.toPlainText().strip():
+            if self.toPlainText().strip() or self._screenshot_selected:
                 self.send_button.click()
             event.accept()
             return
@@ -254,6 +283,14 @@ class TranscriptEditor(QPlainTextEdit):
     @property
     def is_showing_response(self) -> bool:
         return self._response_mode
+
+    @property
+    def is_response_complete(self) -> bool:
+        return self._response_complete
+
+    @property
+    def auto_send_enabled(self) -> bool:
+        return self.auto_send_button.isChecked()
 
     def begin_response(self) -> None:
         self._response_mode = True
@@ -297,6 +334,18 @@ class TranscriptEditor(QPlainTextEdit):
 
     def set_screenshot_selected(self, selected: bool) -> None:
         self._screenshot_selected = selected
+        if selected:
+            self.send_button.setText("With Screenshot")
+            self.send_button.setFixedSize(144, 32)
+            self.send_button.setAccessibleName("Send with screenshot")
+            self.send_button.setToolTip(
+                "Send the message with the selected screenshot"
+            )
+        else:
+            self.send_button.setText("")
+            self.send_button.setFixedSize(32, 32)
+            self.send_button.setAccessibleName("Send")
+            self.send_button.setToolTip("Send the message")
         self._sync_action_visibility()
         self._position_action_buttons()
 
@@ -314,18 +363,35 @@ class TranscriptEditor(QPlainTextEdit):
 
     def _sync_action_visibility(self) -> None:
         has_text = bool(self.toPlainText().strip()) and not self._response_mode
+        can_send = (
+            not self._response_mode
+            and (has_text or self._screenshot_selected)
+        )
         self.clear_button.setVisible(has_text)
-        self.send_button.setVisible(has_text)
+        self.send_button.setVisible(can_send)
         self.send_without_screenshot_button.setVisible(
             has_text and self._screenshot_selected
         )
-        right_margin = 190 if has_text and self._screenshot_selected else 76
-        self.setViewportMargins(0, 0, right_margin if has_text else 0, 0)
+        self.auto_send_button.setVisible(not self._response_mode)
+        visible_buttons = [
+            button
+            for button in (
+                self.clear_button,
+                self.auto_send_button,
+                self.send_without_screenshot_button,
+                self.send_button,
+            )
+            if not button.isHidden()
+        ]
+        right_margin = sum(button.width() for button in visible_buttons)
+        if visible_buttons:
+            right_margin += 8 + 6 * (len(visible_buttons) - 1)
+        self.setViewportMargins(0, 0, right_margin, 0)
+        self._position_action_buttons()
 
 
 class OverlayWindow(QMainWindow):
     exit_requested = Signal()
-    hide_requested = Signal()
     dictation_requested = Signal()
     dictation_finish_requested = Signal()
     clear_requested = Signal()
@@ -345,6 +411,7 @@ class OverlayWindow(QMainWindow):
         self._resize_start_geometry: QRect | None = None
         self._chrome_visible = False
         self._focus_restorer = ForegroundWindowRestorer()
+        self._auto_hide_enabled = False
         self.setWindowTitle("Live GPT")
         self.setMinimumSize(760, 180)
         self.setWindowFlags(
@@ -359,6 +426,9 @@ class OverlayWindow(QMainWindow):
             self._focus_restorer.remember_foreground
         )
         self._focus_history_timer.start(75)
+        self._auto_hide_timer = QTimer(self)
+        self._auto_hide_timer.setSingleShot(True)
+        self._auto_hide_timer.timeout.connect(self._hide_for_auto_hide)
 
         container = QWidget(self)
         container.setObjectName("overlayContainer")
@@ -448,15 +518,18 @@ class OverlayWindow(QMainWindow):
         self.lock_button.toggled.connect(self._set_position_locked)
         title_layout.addWidget(self.lock_button)
 
-        self.hide_button = QPushButton()
-        self.hide_button.setObjectName("hideButton")
+        self.auto_hide_button = QPushButton()
+        self.auto_hide_button.setObjectName("autoHideButton")
+        self.auto_hide_button.setCheckable(True)
         self._configure_icon_button(
-            self.hide_button,
-            HIDE_ICON_PATH,
-            "Hide",
+            self.auto_hide_button,
+            AUTO_HIDE_ICON_PATH,
+            "Enable auto-hide",
         )
-        self.hide_button.clicked.connect(self.hide_requested.emit)
-        title_layout.addWidget(self.hide_button)
+        self.auto_hide_button.toggled.connect(
+            self._set_auto_hide_enabled
+        )
+        title_layout.addWidget(self.auto_hide_button)
 
         self.exit_button = QPushButton()
         self.exit_button.setObjectName("exitButton")
@@ -502,8 +575,11 @@ class OverlayWindow(QMainWindow):
         self._subtitle_dismissed = False
         self._subtitle_expanded = False
         self._subtitle_reading_active = False
+        self._subtitle_reading_started = False
         self._subtitle_status_text = ""
+        self._sent_message_text = ""
         self._subtitle_collapsed_geometry: QRect | None = None
+        self._subtitle_hover_origin: QPoint | None = None
         subtitle_layout.addWidget(self.subtitle_line_one, 1)
         subtitle_layout.addWidget(self.subtitle_line_two, 1)
         subtitle_layout.addWidget(self.subtitle_full_text, 1)
@@ -555,6 +631,7 @@ class OverlayWindow(QMainWindow):
         self.send_without_screenshot_button.clicked.connect(
             self._request_send_without_screenshot
         )
+        self.auto_send_button = self.transcript_area.auto_send_button
 
         self.clear_button = self.transcript_area.clear_button
         self.clear_button.clicked.connect(self._request_clear)
@@ -670,7 +747,7 @@ class OverlayWindow(QMainWindow):
             QPushButton:hover {
                 background-color: rgba(76, 201, 240, 150);
             }
-            QPushButton#hideButton,
+            QPushButton#autoHideButton,
             QPushButton#configureButton,
             QPushButton#lockButton,
             QPushButton#exitButton {
@@ -687,6 +764,7 @@ class OverlayWindow(QMainWindow):
             }
             QPushButton#sendButton,
             QPushButton#clearButton,
+            QPushButton#autoSendButton,
             QPushButton#sendWithoutScreenshotButton {
                 min-width: 32px;
                 min-height: 32px;
@@ -694,7 +772,6 @@ class OverlayWindow(QMainWindow):
                 padding: 0;
                 border-radius: 8px;
             }
-            QPushButton#sendButton,
             QPushButton#clearButton {
                 max-width: 32px;
             }
@@ -705,6 +782,10 @@ class OverlayWindow(QMainWindow):
                 background-color: rgba(35, 155, 116, 190);
                 border-color: rgba(130, 255, 195, 190);
             }
+            QPushButton#autoHideButton:checked {
+                background-color: rgba(35, 155, 116, 190);
+                border-color: rgba(130, 255, 195, 190);
+            }
             QPushButton#sendButton {
                 background-color: rgba(35, 155, 116, 190);
             }
@@ -712,12 +793,20 @@ class OverlayWindow(QMainWindow):
                 background-color: rgba(40, 190, 140, 220);
             }
             QPushButton#sendWithoutScreenshotButton {
-                min-width: 108px;
-                max-width: 108px;
+                min-width: 132px;
+                max-width: 132px;
                 background-color: rgba(38, 112, 145, 190);
             }
             QPushButton#sendWithoutScreenshotButton:hover {
                 background-color: rgba(48, 145, 185, 220);
+            }
+            QPushButton#autoSendButton {
+                min-width: 104px;
+                max-width: 104px;
+            }
+            QPushButton#autoSendButton:checked {
+                background-color: rgba(35, 155, 116, 190);
+                border-color: rgba(130, 255, 195, 190);
             }
             QPushButton#clearButton:hover {
                 background-color: rgba(210, 116, 34, 190);
@@ -862,15 +951,17 @@ class OverlayWindow(QMainWindow):
         self.send_button.setEnabled(True)
         self.send_without_screenshot_button.setEnabled(True)
         if not success:
+            self.show_for_auto_hide()
             self.dismiss_subtitle_mode()
             self.set_transcript(sent_text)
             self.microphone_button.setVisible(True)
             self.set_status(message, error=True)
+            self.schedule_auto_hide(5_000)
             return
 
-        del sent_text, message
+        del message
         if not self._subtitle_mode_active:
-            self.begin_response_display()
+            self.begin_response_display(sent_text)
         self._set_subtitle_status("Waiting for ChatGPT…")
         self.set_status("Waiting for ChatGPT…")
 
@@ -879,11 +970,13 @@ class OverlayWindow(QMainWindow):
         sent_text: str = "",
         message: str = "Sending to ChatGPT…",
     ) -> None:
-        del sent_text
         self._collapse_subtitle()
         self._subtitle_mode_active = True
         self._subtitle_dismissed = False
         self._subtitle_reading_active = False
+        self._subtitle_reading_started = False
+        self._subtitle_hover_origin = None
+        self._sent_message_text = " ".join(sent_text.split())
         self._reading_full_text = ""
         self._reading_fraction = 0.0
         self._subtitle_line_index = -1
@@ -896,6 +989,7 @@ class OverlayWindow(QMainWindow):
         self.set_status(message)
 
     def set_response_update(self, status: str, text: str) -> None:
+        self.show_for_auto_hide()
         self.set_status(status)
         if self._subtitle_dismissed:
             return
@@ -903,27 +997,30 @@ class OverlayWindow(QMainWindow):
         if not self._subtitle_mode_active:
             self.begin_response_display(message=status)
         self._reading_full_text = text
-        self._reading_fraction = 1.0
+        self._reading_fraction = 0.0
+        self._set_subtitle_status(status)
         if text:
-            self._render_reading_subtitle(resized=True, latest=True)
             self._update_expanded_subtitle()
-        else:
-            self._set_subtitle_status(status)
 
     def set_response_finished(self, success: bool, message: str) -> None:
         if self._subtitle_dismissed:
             return
+        self.show_for_auto_hide()
         self.transcript_area.finish_response()
         self.microphone_button.setVisible(True)
         self.set_status(message, error=not success)
-        if self._subtitle_mode_active and not self._reading_full_text:
+        if self._subtitle_mode_active:
             self._set_subtitle_status(message)
+        self.schedule_auto_hide(5_000)
 
     def begin_reading(self, message: str) -> None:
         if self._subtitle_dismissed:
             return
+        self.show_for_auto_hide()
         self.transcript_area.begin_reading()
         self._subtitle_reading_active = True
+        self._subtitle_reading_started = True
+        self._subtitle_hover_origin = None
         self._reading_fraction = 0.0
         self._subtitle_line_index = -1
         self._subtitle_mode_active = True
@@ -991,7 +1088,6 @@ class OverlayWindow(QMainWindow):
         self,
         *,
         resized: bool = False,
-        latest: bool = False,
     ) -> None:
         lines = self._subtitle_lines()
         if not lines:
@@ -1000,11 +1096,7 @@ class OverlayWindow(QMainWindow):
             self._subtitle_line_index = -1
             return
 
-        target_index = (
-            max(len(lines) - 2, 0)
-            if latest
-            else self._subtitle_index_at_progress(lines)
-        )
+        target_index = self._subtitle_index_at_progress(lines)
         if (
             not resized
             and self._subtitle_line_index >= 0
@@ -1025,26 +1117,41 @@ class OverlayWindow(QMainWindow):
         if self._subtitle_dismissed:
             return
         self.transcript_area.finish_reading()
+        self._subtitle_reading_active = False
         self.microphone_button.setVisible(True)
         self.set_status(message, error=not success)
+        self.schedule_auto_hide(5_000)
 
     def _set_subtitle_status(self, message: str) -> None:
         self._subtitle_status_text = message
-        self.subtitle_line_one.setText(message)
-        self.subtitle_line_two.clear()
-        self.subtitle_full_text.setPlainText(
-            self._reading_full_text or message
-        )
+        if self._subtitle_mode_active and not self._subtitle_reading_started:
+            self.subtitle_line_one.setText(self._sent_message_text)
+            self.subtitle_line_two.setText(message)
+        else:
+            self.subtitle_line_one.setText(message)
+            self.subtitle_line_two.clear()
+        full_text = self._reading_full_text or message
+        if (
+            not self._subtitle_expanded
+            and self.subtitle_full_text.toPlainText() != full_text
+        ):
+            self.subtitle_full_text.setPlainText(full_text)
 
     def _update_expanded_subtitle(self) -> None:
         if not self._subtitle_expanded:
             return
-        self.subtitle_full_text.setPlainText(
-            self._reading_full_text or self._subtitle_status_text
-        )
-        cursor = self.subtitle_full_text.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-        self.subtitle_full_text.setTextCursor(cursor)
+        text = self._reading_full_text or self._subtitle_status_text
+        if self.subtitle_full_text.toPlainText() == text:
+            return
+        scrollbar = self.subtitle_full_text.verticalScrollBar()
+        previous_value = scrollbar.value()
+        was_at_bottom = previous_value >= scrollbar.maximum() - 1
+        self.subtitle_full_text.setPlainText(text)
+        if was_at_bottom:
+            scrollbar.setValue(scrollbar.maximum())
+        else:
+            scrollbar.setValue(min(previous_value, scrollbar.maximum()))
+        self._fit_expanded_subtitle_height()
 
     def _expand_subtitle(self) -> None:
         if not self._subtitle_mode_active or self._subtitle_expanded:
@@ -1057,19 +1164,42 @@ class OverlayWindow(QMainWindow):
         self.subtitle_line_one.hide()
         self.subtitle_line_two.hide()
         self.subtitle_full_text.show()
+        self._fit_expanded_subtitle_height()
 
+    def _fit_expanded_subtitle_height(self) -> None:
+        if (
+            not self._subtitle_expanded
+            or self._subtitle_collapsed_geometry is None
+        ):
+            return
         available = self.screen().availableGeometry()
-        target_height = min(
-            max(self.height() * 2, 420),
-            max(available.height() - 40, self.height()),
+        collapsed = self._subtitle_collapsed_geometry
+        content_width = max(self.subtitle_panel.width() - 40, 1)
+        text = self._reading_full_text or self._subtitle_status_text
+        metrics = self.subtitle_full_text.fontMetrics()
+        text_height = metrics.boundingRect(
+            QRect(0, 0, content_width, 16_777_215),
+            Qt.TextFlag.TextWordWrap,
+            text,
+        ).height()
+        panel_height = max(text_height, metrics.lineSpacing()) + 32
+        fixed_chrome_height = max(
+            collapsed.height() - self.subtitle_panel.height(),
+            0,
         )
-        if target_height > self.height() and not self._position_locked:
-            geometry = QRect(self.geometry())
-            geometry.setTop(
-                max(available.top(), geometry.bottom() - target_height + 1)
-            )
-            geometry.setHeight(target_height)
-            self.setGeometry(geometry)
+        target_height = min(
+            max(collapsed.height(), fixed_chrome_height + panel_height),
+            max(available.height() - 40, collapsed.height()),
+        )
+        if self._position_locked:
+            self.setMinimumSize(760, 180)
+            self.setMaximumSize(16_777_215, 16_777_215)
+        geometry = QRect(collapsed)
+        geometry.setTop(
+            max(available.top(), collapsed.bottom() - target_height + 1)
+        )
+        geometry.setHeight(target_height)
+        self.setGeometry(geometry)
 
     def _collapse_subtitle(self) -> None:
         if not self._subtitle_expanded:
@@ -1078,12 +1208,15 @@ class OverlayWindow(QMainWindow):
         self.subtitle_full_text.hide()
         self.subtitle_line_one.show()
         self.subtitle_line_two.show()
-        if (
-            self._subtitle_collapsed_geometry is not None
-            and not self._position_locked
-        ):
+        if self._subtitle_collapsed_geometry is not None:
             self.setGeometry(self._subtitle_collapsed_geometry)
+            if self._position_locked:
+                self.setFixedSize(self._subtitle_collapsed_geometry.size())
         self._subtitle_collapsed_geometry = None
+        if self._subtitle_reading_started and self._reading_full_text:
+            self._render_reading_subtitle(resized=True)
+        else:
+            self._set_subtitle_status(self._subtitle_status_text)
 
     def _collapse_subtitle_if_outside(self) -> None:
         if not self._subtitle_expanded:
@@ -1091,6 +1224,7 @@ class OverlayWindow(QMainWindow):
         position = self.subtitle_panel.mapFromGlobal(QCursor.pos())
         if not self.subtitle_panel.rect().contains(position):
             self._collapse_subtitle()
+            self.schedule_auto_hide(5_000)
 
     def dismiss_subtitle_mode(self) -> bool:
         if not self._subtitle_mode_active:
@@ -1099,16 +1233,19 @@ class OverlayWindow(QMainWindow):
         self._subtitle_mode_active = False
         self._subtitle_dismissed = True
         self._subtitle_reading_active = False
+        self._subtitle_reading_started = False
         self.subtitle_panel.hide()
         self.dictation_panel.hide()
         self.transcript_area.begin_composing()
         self.transcript_area.show()
         self.microphone_button.setVisible(True)
         self.set_status("Hold the microphone or enter a message")
+        self.schedule_auto_hide()
         return True
 
     def begin_dictation_waiting(self) -> None:
         self.dismiss_subtitle_mode()
+        self.show_for_auto_hide()
         self.subtitle_panel.hide()
         self.transcript_area.hide()
         self.dictation_state_label.setText(
@@ -1157,17 +1294,21 @@ class OverlayWindow(QMainWindow):
             self.set_status("Wait for the current response to finish")
             return
         text = self.transcript_area.toPlainText().strip()
-        if not text:
-            self.set_status("Enter text before sending", error=True)
-            return
         capture_source = (
             self.capture_source_combo.currentData()
             if include_screenshot
             else None
         )
+        if not text and capture_source is None:
+            self.set_status(
+                "Enter text or select a screenshot before sending",
+                error=True,
+            )
+            return
         self.send_requested.emit(text, capture_source)
         if restore_focus:
             QTimer.singleShot(0, self._restore_previous_focus)
+        self.schedule_auto_hide()
 
     def _request_send_without_screenshot(self) -> None:
         self._request_send(include_screenshot=False)
@@ -1178,6 +1319,9 @@ class OverlayWindow(QMainWindow):
             restore_focus=False,
         )
 
+    def request_auto_send(self) -> None:
+        self._request_send(include_screenshot=True, restore_focus=False)
+
     def remember_foreground_app(self) -> None:
         self._focus_restorer.remember_foreground()
 
@@ -1186,6 +1330,68 @@ class OverlayWindow(QMainWindow):
             logger.debug("Restored focus to the previous application")
         else:
             logger.debug("No external application was available to restore")
+
+    @property
+    def auto_hide_enabled(self) -> bool:
+        return self._auto_hide_enabled
+
+    @property
+    def auto_send_enabled(self) -> bool:
+        return self.transcript_area.auto_send_enabled
+
+    def disable_auto_hide(self) -> None:
+        if self.auto_hide_button.isChecked():
+            self.auto_hide_button.setChecked(False)
+        else:
+            self._set_auto_hide_enabled(False)
+
+    def _set_auto_hide_enabled(self, enabled: bool) -> None:
+        self._auto_hide_enabled = enabled
+        label = "Disable auto-hide" if enabled else "Enable auto-hide"
+        self.auto_hide_button.setAccessibleName(label)
+        self.auto_hide_button.setToolTip(
+            f"{label}; the overlay appears for dictation and ChatGPT replies"
+        )
+        if enabled:
+            self.schedule_auto_hide()
+        else:
+            self._auto_hide_timer.stop()
+
+    def _can_auto_hide(self) -> bool:
+        if not self._auto_hide_enabled:
+            return False
+        if not self.dictation_panel.isHidden():
+            return False
+        if (
+            not self.transcript_area.is_showing_response
+            and bool(self.transcript_area.toPlainText().strip())
+        ):
+            return False
+        if self._subtitle_mode_active and (
+            not self.transcript_area.is_response_complete
+            or self._subtitle_reading_active
+            or self._subtitle_expanded
+        ):
+            return False
+        return True
+
+    def show_for_auto_hide(self) -> None:
+        if not self._auto_hide_enabled:
+            return
+        self._auto_hide_timer.stop()
+        if self.isHidden():
+            self.showNormal()
+        self.raise_()
+
+    def schedule_auto_hide(self, delay_ms: int = 0) -> None:
+        if self._can_auto_hide():
+            self._auto_hide_timer.start(max(delay_ms, 0))
+        else:
+            self._auto_hide_timer.stop()
+
+    def _hide_for_auto_hide(self) -> None:
+        if self._can_auto_hide():
+            self.hide()
 
     def _set_position_locked(self, locked: bool) -> None:
         self._position_locked = locked
@@ -1225,10 +1431,10 @@ class OverlayWindow(QMainWindow):
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
         if hasattr(self, "_reading_full_text"):
-            self._render_reading_subtitle(
-                resized=True,
-                latest=not self._subtitle_reading_active,
-            )
+            if self._subtitle_reading_started and self._reading_full_text:
+                self._render_reading_subtitle(resized=True)
+            elif self._subtitle_mode_active:
+                self._set_subtitle_status(self._subtitle_status_text)
 
     def leaveEvent(self, event) -> None:  # noqa: N802
         QTimer.singleShot(0, self._hide_chrome_if_outside)
@@ -1243,9 +1449,28 @@ class OverlayWindow(QMainWindow):
         if watched in subtitle_widgets:
             event_type = event.type()
             if event_type == QEvent.Type.Enter:
-                self._expand_subtitle()
+                self._subtitle_hover_origin = (
+                    event.globalPosition().toPoint()
+                    if hasattr(event, "globalPosition")
+                    else QCursor.pos()
+                )
+            elif event_type == QEvent.Type.MouseMove:
+                position = (
+                    event.globalPosition().toPoint()
+                    if hasattr(event, "globalPosition")
+                    else QCursor.pos()
+                )
+                if self._subtitle_hover_origin is None:
+                    self._subtitle_hover_origin = position
+                elif (
+                    position - self._subtitle_hover_origin
+                ).manhattanLength() >= 4:
+                    QTimer.singleShot(0, self._expand_subtitle)
             elif event_type == QEvent.Type.Leave:
-                QTimer.singleShot(0, self._collapse_subtitle_if_outside)
+                QTimer.singleShot(
+                    0,
+                    self._collapse_subtitle_if_outside,
+                )
             elif (
                 event_type == QEvent.Type.MouseButtonPress
                 and event.button() == Qt.MouseButton.LeftButton
@@ -1449,7 +1674,6 @@ class TrayController:
         self.application.setWindowIcon(self.icon)
         self.window.setWindowIcon(self.icon)
         self.window.exit_requested.connect(self._exit_application)
-        self.window.hide_requested.connect(self.hide_window)
         self.window.dictation_requested.connect(self.start_dictation)
         self.window.dictation_finish_requested.connect(self.finish_dictation)
         self.window.clear_requested.connect(self._handle_clear_requested)
@@ -1608,6 +1832,7 @@ class TrayController:
     ) -> None:
         logger.debug(f"Tray icon activated: {reason.name}")
         if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+            self.window.disable_auto_hide()
             self.show_window()
 
     def show_window(self) -> None:
@@ -1617,16 +1842,13 @@ class TrayController:
         self.window.raise_()
         self.window.activateWindow()
 
-    def hide_window(self) -> None:
-        logger.info("Hiding the overlay window")
-        self.window.hide()
-
     def start_dictation(self) -> None:
         self._dictation_input_held = True
         state = getattr(self, "_dictation_state", "idle")
         if state != "idle":
             return
 
+        self.window.show_for_auto_hide()
         dismissed = self.window.dismiss_subtitle_mode()
         if (
             not dismissed
@@ -1641,6 +1863,7 @@ class TrayController:
                 "error",
                 "Select a ChatGPT window first",
             )
+            self.window.schedule_auto_hide(5_000)
             return
 
         logger.info(f"Starting ChatGPT dictation tab_id={tab_id!r}")
@@ -1713,6 +1936,7 @@ class TrayController:
         self.dictation_tab_id = None
         self.window.end_dictation_display()
         self.window.set_microphone_state("error", message)
+        self.window.schedule_auto_hide(5_000)
 
     def _on_dictation_finished(
         self,
@@ -1729,6 +1953,7 @@ class TrayController:
         if not success:
             self._dictation_input_held = False
             self.window.set_microphone_state("error", message)
+            self.window.schedule_auto_hide(5_000)
             return
 
         if was_cancelled:
@@ -1736,7 +1961,19 @@ class TrayController:
         else:
             self.window.set_transcript(text)
             self.window.set_microphone_state("saved", message)
-        if restart:
+        auto_sent = bool(
+            not was_cancelled
+            and text.strip()
+            and self.window.auto_send_enabled
+        )
+        if auto_sent:
+            self._dictation_input_held = False
+            self.window.request_auto_send()
+        elif text.strip():
+            self.window.show_for_auto_hide()
+        else:
+            self.window.schedule_auto_hide()
+        if restart and not auto_sent:
             self.start_dictation()
 
     def _handle_send_requested(

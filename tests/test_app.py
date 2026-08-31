@@ -8,10 +8,14 @@ from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QPoint, QRect, Qt  # noqa: E402
+from PySide6.QtCore import QEvent, QPoint, QRect, Qt  # noqa: E402
 from PySide6.QtGui import QPalette  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
-from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtWidgets import (  # noqa: E402
+    QApplication,
+    QPushButton,
+    QSystemTrayIcon,
+)
 
 from live_gpt.app import (  # noqa: E402
     OverlayWindow,
@@ -74,6 +78,19 @@ class TranscriptEditorTests(unittest.TestCase):
 
         self.assertEqual(self.editor.toPlainText(), full_response)
 
+    def test_auto_send_shows_check_icon_only_while_enabled(self) -> None:
+        self.assertTrue(self.editor.auto_send_button.icon().isNull())
+
+        self.editor.auto_send_button.click()
+
+        self.assertTrue(self.editor.auto_send_button.isChecked())
+        self.assertFalse(self.editor.auto_send_button.icon().isNull())
+
+        self.editor.auto_send_button.click()
+
+        self.assertFalse(self.editor.auto_send_button.isChecked())
+        self.assertTrue(self.editor.auto_send_button.icon().isNull())
+
 
 class TrayControllerBrowserTests(unittest.TestCase):
     def test_overlay_is_fifty_percent_wider(self) -> None:
@@ -90,7 +107,7 @@ class TrayControllerBrowserTests(unittest.TestCase):
             )
             self.assertLess(
                 window.lock_button.geometry().left(),
-                window.hide_button.geometry().left(),
+                window.auto_hide_button.geometry().left(),
             )
         finally:
             window.close()
@@ -300,7 +317,7 @@ class TrayControllerBrowserTests(unittest.TestCase):
         finally:
             window.close()
 
-    def test_subtitle_hover_expands_full_text_and_click_dismisses(self) -> None:
+    def test_subtitle_hover_expands_and_mouse_leave_collapses(self) -> None:
         window = OverlayWindow()
         try:
             window.show()
@@ -311,6 +328,25 @@ class TrayControllerBrowserTests(unittest.TestCase):
             window.set_response_update("Writing…", response)
             QApplication.processEvents()
             collapsed_height = window.height()
+            collapsed_panel_height = window.subtitle_panel.height()
+            available = window.screen().availableGeometry()
+            content_width = max(window.subtitle_panel.width() - 40, 1)
+            metrics = window.subtitle_full_text.fontMetrics()
+            text_height = metrics.boundingRect(
+                QRect(0, 0, content_width, 16_777_215),
+                Qt.TextFlag.TextWordWrap,
+                response,
+            ).height()
+            expected_height = min(
+                max(
+                    collapsed_height,
+                    collapsed_height
+                    - collapsed_panel_height
+                    + max(text_height, metrics.lineSpacing())
+                    + 32,
+                ),
+                max(available.height() - 40, collapsed_height),
+            )
 
             window._expand_subtitle()
             QApplication.processEvents()
@@ -321,17 +357,171 @@ class TrayControllerBrowserTests(unittest.TestCase):
                 window.subtitle_full_text.toPlainText(),
                 response,
             )
-            self.assertGreater(window.height(), collapsed_height)
+            self.assertEqual(window.height(), expected_height)
 
-            QTest.mouseClick(
-                window.subtitle_full_text.viewport(),
-                Qt.MouseButton.LeftButton,
+            with patch(
+                "live_gpt.app.QCursor.pos",
+                return_value=QPoint(-10_000, -10_000),
+            ):
+                window._collapse_subtitle_if_outside()
+
+            self.assertFalse(window._subtitle_expanded)
+            self.assertEqual(window.height(), collapsed_height)
+            self.assertFalse(window.subtitle_line_one.isHidden())
+            self.assertTrue(window.subtitle_full_text.isHidden())
+            self.assertEqual(window.subtitle_line_one.text(), "Question")
+            self.assertEqual(window.subtitle_line_two.text(), "Writing…")
+        finally:
+            window.close()
+
+    def test_response_shows_prompt_and_status_until_read_aloud(self) -> None:
+        window = OverlayWindow()
+        try:
+            window.show()
+            window.begin_response_display("Sent question")
+            QApplication.processEvents()
+            response = " ".join(
+                f"preview-word-{index}" for index in range(100)
+            )
+
+            window.set_response_update("Searching websites…", response)
+            lines = window._subtitle_lines()
+
+            self.assertGreater(len(lines), 2)
+            self.assertEqual(window.subtitle_line_one.text(), "Sent question")
+            self.assertEqual(
+                window.subtitle_line_two.text(),
+                "Searching websites…",
+            )
+
+            window.begin_reading("Preparing Read aloud…")
+
+            self.assertEqual(window._subtitle_line_index, 0)
+            self.assertEqual(window.subtitle_line_one.text(), lines[0])
+            self.assertEqual(window.subtitle_line_two.text(), lines[1])
+
+            reading_lines = (
+                window.subtitle_line_one.text(),
+                window.subtitle_line_two.text(),
+            )
+            window.finish_reading(True, "Read aloud complete")
+            window.resize(window.width(), window.height() + 10)
+            QApplication.processEvents()
+
+            self.assertEqual(
+                (
+                    window.subtitle_line_one.text(),
+                    window.subtitle_line_two.text(),
+                ),
+                reading_lines,
+            )
+        finally:
+            window.close()
+
+    def test_subtitle_starts_in_two_line_mode_on_pointer_enter(self) -> None:
+        window = OverlayWindow()
+        try:
+            window.show()
+            window.begin_reading("Reading aloud…")
+            window.set_reading_subtitle(
+                {
+                    "text": "First rendered subtitle line. Second rendered line.",
+                    "fraction": 0.0,
+                }
+            )
+
+            QApplication.processEvents()
+
+            self.assertFalse(window._subtitle_expanded)
+            self.assertFalse(window.subtitle_line_one.isHidden())
+            self.assertFalse(window.subtitle_line_two.isHidden())
+            self.assertTrue(window.subtitle_full_text.isHidden())
+        finally:
+            window.close()
+
+    def test_expanded_subtitle_is_stable_during_playback_progress(self) -> None:
+        window = OverlayWindow()
+        try:
+            window.show()
+            window.begin_reading("Reading aloud…")
+            response = " ".join(
+                f"stable-subtitle-word-{index}" for index in range(1_000)
+            )
+            window.set_reading_subtitle(
+                {"text": response, "fraction": 0.1}
+            )
+            window._expand_subtitle()
+            QApplication.processEvents()
+
+            scrollbar = window.subtitle_full_text.verticalScrollBar()
+            self.assertGreater(scrollbar.maximum(), 0)
+            scrollbar.setValue(scrollbar.maximum() // 3)
+            scroll_position = scrollbar.value()
+            geometry = window.geometry()
+            revision = window.subtitle_full_text.document().revision()
+
+            window.set_reading_subtitle(
+                {"text": response, "fraction": 0.8}
             )
             QApplication.processEvents()
 
-            self.assertTrue(window.subtitle_panel.isHidden())
-            self.assertFalse(window.transcript_area.isHidden())
-            self.assertFalse(window.transcript_area.is_showing_response)
+            self.assertEqual(scrollbar.value(), scroll_position)
+            self.assertEqual(window.geometry(), geometry)
+            self.assertEqual(
+                window.subtitle_full_text.document().revision(),
+                revision,
+            )
+        finally:
+            window.close()
+
+    def test_reading_subtitle_collapses_to_two_lines_after_mouse_leaves(
+        self,
+    ) -> None:
+        window = OverlayWindow()
+        try:
+            window.show()
+            window.begin_reading("Reading aloud…")
+            response = " ".join(
+                f"current-playback-word-{index}" for index in range(80)
+            )
+            window.set_reading_subtitle(
+                {
+                    "text": response,
+                    "fraction": 0.0,
+                }
+            )
+            window._expand_subtitle()
+            QApplication.processEvents()
+            self.assertTrue(window._subtitle_expanded)
+
+            lines = window._subtitle_lines()
+            weights = [max(len(line), 12) for line in lines]
+            after_first_line = (weights[0] + 0.1) / sum(weights)
+            window.set_reading_subtitle(
+                {"text": response, "fraction": after_first_line}
+            )
+
+            with patch(
+                "live_gpt.app.QCursor.pos",
+                return_value=QPoint(-10_000, -10_000),
+            ):
+                current_lines = (
+                    window.subtitle_line_one.text(),
+                    window.subtitle_line_two.text(),
+                )
+                window._collapse_subtitle_if_outside()
+
+            self.assertFalse(window._subtitle_expanded)
+            self.assertFalse(window.subtitle_line_one.isHidden())
+            self.assertFalse(window.subtitle_line_two.isHidden())
+            self.assertTrue(window.subtitle_full_text.isHidden())
+            self.assertEqual(
+                (
+                    window.subtitle_line_one.text(),
+                    window.subtitle_line_two.text(),
+                ),
+                current_lines,
+            )
         finally:
             window.close()
 
@@ -426,7 +616,13 @@ class TrayControllerBrowserTests(unittest.TestCase):
         )
         try:
             window.set_chatgpt_tabs(
-                [{"id": "tab", "title": "ChatGPT", "url": "https://chatgpt.com"}]
+                [
+                    {
+                        "id": "tab",
+                        "title": "ChatGPT",
+                        "url": "https://chatgpt.com",
+                    }
+                ]
             )
             window.set_capture_sources([source])
             window.capture_source_combo.setCurrentIndex(1)
@@ -435,9 +631,160 @@ class TrayControllerBrowserTests(unittest.TestCase):
             self.assertFalse(
                 window.send_without_screenshot_button.isHidden()
             )
+            self.assertEqual(
+                window.send_without_screenshot_button.text(),
+                "No Screenshot",
+            )
+            self.assertFalse(
+                window.send_without_screenshot_button.icon().isNull()
+            )
+            self.assertEqual(window.send_button.text(), "With Screenshot")
+            self.assertLess(
+                window.auto_send_button.geometry().left(),
+                window.send_without_screenshot_button.geometry().left(),
+            )
             window.send_without_screenshot_button.click()
 
             self.assertEqual(requests, [("Explain this", None)])
+        finally:
+            window.close()
+
+    def test_auto_send_uses_current_screenshot_selection(self) -> None:
+        window = OverlayWindow()
+        source = CaptureSource(
+            "display:1",
+            "Screenshot desktop",
+            "display",
+            0,
+            0,
+            1920,
+            1080,
+        )
+        requests: list[tuple[str, object]] = []
+        window.send_requested.connect(
+            lambda text, selected: requests.append((text, selected))
+        )
+        try:
+            window.set_chatgpt_tabs(
+                [{"id": "tab", "title": "ChatGPT", "url": "https://chatgpt.com"}]
+            )
+            window.set_capture_sources([source])
+            window.set_transcript("First dictated prompt")
+
+            window.request_auto_send()
+            window.set_transcript("Second dictated prompt")
+            window.capture_source_combo.setCurrentIndex(1)
+            window.request_auto_send()
+
+            self.assertEqual(
+                requests,
+                [
+                    ("First dictated prompt", None),
+                    ("Second dictated prompt", source),
+                ],
+            )
+        finally:
+            window.close()
+
+    def test_selected_screenshot_can_be_sent_without_text(self) -> None:
+        window = OverlayWindow()
+        source = CaptureSource(
+            "display:1",
+            "Screenshot desktop",
+            "display",
+            0,
+            0,
+            1920,
+            1080,
+        )
+        requests: list[tuple[str, object]] = []
+        window.send_requested.connect(
+            lambda text, selected: requests.append((text, selected))
+        )
+        try:
+            window.set_chatgpt_tabs(
+                [{"id": "tab", "title": "ChatGPT", "url": "https://chatgpt.com"}]
+            )
+            window.set_capture_sources([source])
+            window.capture_source_combo.setCurrentIndex(1)
+
+            self.assertEqual(window.transcript_area.toPlainText(), "")
+            self.assertFalse(window.send_button.isHidden())
+            self.assertEqual(window.send_button.text(), "With Screenshot")
+            self.assertTrue(
+                window.send_without_screenshot_button.isHidden()
+            )
+
+            window.send_button.click()
+
+            self.assertEqual(requests, [("", source)])
+        finally:
+            window.close()
+
+    def test_every_overlay_button_has_a_tooltip(self) -> None:
+        window = OverlayWindow()
+        try:
+            buttons = window.findChildren(QPushButton)
+            self.assertTrue(buttons)
+            self.assertEqual(
+                [button.objectName() for button in buttons if not button.toolTip()],
+                [],
+            )
+        finally:
+            window.close()
+
+    def test_auto_hide_reveals_for_activity_and_hides_afterwards(self) -> None:
+        window = OverlayWindow()
+        try:
+            window.show()
+            window.auto_hide_button.click()
+            QApplication.processEvents()
+
+            self.assertTrue(window.auto_hide_enabled)
+            self.assertTrue(window.isHidden())
+
+            window.begin_dictation_waiting()
+            QApplication.processEvents()
+            self.assertFalse(window.isHidden())
+
+            window.end_dictation_display()
+            QApplication.processEvents()
+            self.assertFalse(window.isHidden())
+            self.assertFalse(window._auto_hide_timer.isActive())
+
+            window.begin_response_display()
+            window.set_response_update("Writing…", "Incoming reply")
+            QApplication.processEvents()
+            self.assertFalse(window.isHidden())
+
+            window.begin_reading("Reading aloud…")
+            window.finish_reading(True, "Read aloud complete")
+            self.assertTrue(window._auto_hide_timer.isActive())
+            self.assertEqual(window._auto_hide_timer.interval(), 5_000)
+
+            window._hide_for_auto_hide()
+            self.assertTrue(window.isHidden())
+        finally:
+            window.close()
+
+    def test_auto_hide_waits_while_unsent_dictation_is_present(self) -> None:
+        window = OverlayWindow()
+        try:
+            window.show()
+            window.set_transcript("Unsent dictated text")
+
+            window.auto_hide_button.click()
+            QApplication.processEvents()
+
+            self.assertTrue(window.auto_hide_enabled)
+            self.assertFalse(window.isHidden())
+            self.assertFalse(window._auto_hide_timer.isActive())
+
+            window.clear_transcript()
+            window.schedule_auto_hide()
+            QApplication.processEvents()
+
+            self.assertTrue(window.isHidden())
         finally:
             window.close()
 
@@ -634,6 +981,7 @@ class TrayControllerBrowserTests(unittest.TestCase):
     def test_finished_dictation_populates_app_input(self) -> None:
         controller = TrayController.__new__(TrayController)
         controller.window = Mock()
+        controller.window.auto_send_enabled = False
 
         controller._on_dictation_finished(
             True,
@@ -649,6 +997,51 @@ class TrayControllerBrowserTests(unittest.TestCase):
             "saved",
             "Dictation copied from ChatGPT",
         )
+        controller.window.show_for_auto_hide.assert_called_once_with()
+        controller.window.schedule_auto_hide.assert_not_called()
+
+    def test_finished_dictation_auto_sends_when_enabled(self) -> None:
+        controller = TrayController.__new__(TrayController)
+        controller.window = Mock()
+        controller.window.auto_send_enabled = True
+        controller._dictation_input_held = False
+
+        controller._on_dictation_finished(
+            True,
+            "Text recognized by ChatGPT",
+            "Dictation copied from ChatGPT",
+        )
+
+        controller.window.set_transcript.assert_called_once_with(
+            "Text recognized by ChatGPT"
+        )
+        controller.window.request_auto_send.assert_called_once_with()
+        controller.window.show_for_auto_hide.assert_not_called()
+
+    def test_tray_double_click_disables_auto_hide_before_showing(self) -> None:
+        controller = TrayController.__new__(TrayController)
+        controller.window = Mock()
+        controller.show_window = Mock()
+
+        controller._handle_activation(
+            QSystemTrayIcon.ActivationReason.DoubleClick
+        )
+
+        controller.window.disable_auto_hide.assert_called_once_with()
+        controller.show_window.assert_called_once_with()
+
+    def test_empty_dictation_returns_to_auto_hidden_state(self) -> None:
+        controller = TrayController.__new__(TrayController)
+        controller.window = Mock()
+
+        controller._on_dictation_finished(
+            True,
+            "",
+            "No dictated text",
+        )
+
+        controller.window.show_for_auto_hide.assert_not_called()
+        controller.window.schedule_auto_hide.assert_called_once_with()
 
     @patch("live_gpt.app.open_remote_debugging_settings")
     @patch("live_gpt.app.discover_cdp_endpoint")
