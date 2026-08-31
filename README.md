@@ -60,7 +60,9 @@ BitBlt/PrintWindow approach with full-content rendering enabled.
 When a screenshot source is selected, the **With Screenshot** action remains
 available even with an empty prompt. If the editor also contains text, a
 paper-plane **No Screenshot** action appears so the prompt can be sent without
-changing the selector.
+changing the selector. For dictated prompts using **Auto Send**, the screenshot
+is captured when the microphone key or button is released, so browser
+dictation processing time does not change the captured moment.
 
 The **Configure** button opens the application settings, organized into global
 shortcut and interface-language pages in the left navigation. English and

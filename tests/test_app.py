@@ -1023,6 +1023,61 @@ class TrayControllerBrowserTests(unittest.TestCase):
         controller.window.set_dictation_finishing.assert_called_once_with()
         self.assertEqual(controller._dictation_state, "finishing")
 
+    @patch("live_gpt.app.capture_webp", return_value=b"release-screenshot")
+    def test_auto_send_screenshot_is_frozen_on_microphone_release(
+        self,
+        capture: Mock,
+    ) -> None:
+        release_source = CaptureSource(
+            key="window:release",
+            label="Window at release",
+            kind="window",
+            left=0,
+            top=0,
+            width=1200,
+            height=800,
+            hwnd=123,
+        )
+        later_source = CaptureSource(
+            key="window:later",
+            label="Window selected later",
+            kind="window",
+            left=0,
+            top=0,
+            width=1000,
+            height=700,
+            hwnd=456,
+        )
+        controller = TrayController.__new__(TrayController)
+        controller.window = Mock()
+        controller.window.auto_send_enabled = True
+        controller.window.capture_source_combo.currentData.return_value = (
+            release_source
+        )
+        controller.browser_monitor = Mock()
+        controller.selected_chatgpt_tab_id = "selected-tab"
+        controller.dictation_tab_id = "selected-tab"
+        controller._dictation_state = "listening"
+        controller._dictation_input_held = True
+        controller._dictation_listening_since = time.monotonic() - 0.6
+        controller._pending_dictation_capture = None
+
+        controller.finish_dictation()
+
+        capture.assert_called_once_with(release_source)
+        controller.browser_monitor.request_finish_dictation.assert_called_once_with(
+            "selected-tab"
+        )
+
+        controller._handle_send_requested("Dictated text", later_source)
+
+        capture.assert_called_once_with(release_source)
+        controller.browser_monitor.request_send.assert_called_once_with(
+            "selected-tab",
+            "Dictated text",
+            b"release-screenshot",
+        )
+
     def test_short_mouse_dictation_is_cancelled(self) -> None:
         controller = TrayController.__new__(TrayController)
         controller.window = Mock()

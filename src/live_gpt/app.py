@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from PySide6.QtCore import (
@@ -90,6 +91,13 @@ LEGACY_HOTKEY_SETTING_KEYS = {
     "send": "hotkeys/send",
     "send_without_screenshot": "hotkeys/send_without_screenshot",
 }
+
+
+@dataclass(frozen=True)
+class _PendingDictationCapture:
+    source: CaptureSource | None
+    screenshot: bytes | None
+    error: str | None = None
 
 
 class HotkeyConfigDialog(QDialog):
@@ -2139,6 +2147,7 @@ class TrayController:
         self._dictation_state = "idle"
         self._dictation_input_held = False
         self._dictation_listening_since: float | None = None
+        self._pending_dictation_capture: _PendingDictationCapture | None = None
         self._hotkey_sequences = self._load_hotkey_sequences()
         bindings = self._bindings_for_sequences(self._hotkey_sequences)
         self.hotkey_monitor = GlobalHotkeyMonitor(
@@ -2373,6 +2382,7 @@ class TrayController:
         state = getattr(self, "_dictation_state", "idle")
         if state != "idle":
             return
+        self._pending_dictation_capture = None
 
         self.window.show_for_auto_hide()
         dismissed = self.window.dismiss_subtitle_mode()
@@ -2421,6 +2431,7 @@ class TrayController:
             self._cancel_dictation(tab_id)
             return
 
+        self._capture_dictation_screenshot_on_release()
         self._dictation_state = "finishing"
         logger.info(f"Finishing ChatGPT dictation tab_id={tab_id!r}")
         self.window.set_dictation_finishing()
@@ -2429,6 +2440,43 @@ class TrayController:
             "Finishing ChatGPT dictation…",
         )
         self.browser_monitor.request_finish_dictation(tab_id)
+
+    def _capture_dictation_screenshot_on_release(self) -> None:
+        self._pending_dictation_capture = None
+        if self.window.auto_send_enabled is not True:
+            return
+
+        selected = self.window.capture_source_combo.currentData()
+        source = selected if isinstance(selected, CaptureSource) else None
+        if source is None:
+            self._pending_dictation_capture = _PendingDictationCapture(
+                source=None,
+                screenshot=None,
+            )
+            return
+
+        try:
+            screenshot = capture_webp(source)
+        except Exception as error:
+            logger.error(
+                "Unable to capture screenshot on microphone release",
+                error,
+            )
+            self._pending_dictation_capture = _PendingDictationCapture(
+                source=source,
+                screenshot=None,
+                error=str(error),
+            )
+            return
+
+        self._pending_dictation_capture = _PendingDictationCapture(
+            source=source,
+            screenshot=screenshot,
+        )
+        logger.info(
+            "Captured auto-send screenshot on microphone release "
+            f"source={source.key!r}"
+        )
 
     def _cancel_dictation(self, tab_id: str) -> None:
         self._dictation_state = "cancelling"
@@ -2460,6 +2508,7 @@ class TrayController:
         self._dictation_input_held = False
         self._dictation_listening_since = None
         self.dictation_tab_id = None
+        self._pending_dictation_capture = None
         self.window.end_dictation_display()
         self.window.set_microphone_state("error", message)
         self.window.schedule_auto_hide(5_000)
@@ -2478,11 +2527,13 @@ class TrayController:
         self.window.end_dictation_display()
         if not success:
             self._dictation_input_held = False
+            self._pending_dictation_capture = None
             self.window.set_microphone_state("error", message)
             self.window.schedule_auto_hide(5_000)
             return
 
         if was_cancelled:
+            self._pending_dictation_capture = None
             self.window.set_microphone_state("idle", message)
         else:
             self.window.set_transcript(text)
@@ -2495,9 +2546,12 @@ class TrayController:
         if auto_sent:
             self._dictation_input_held = False
             self.window.request_auto_send()
+            self._pending_dictation_capture = None
         elif text.strip():
+            self._pending_dictation_capture = None
             self.window.show_for_auto_hide()
         else:
+            self._pending_dictation_capture = None
             self.window.schedule_auto_hide()
         if restart and not auto_sent:
             self.start_dictation()
@@ -2507,6 +2561,12 @@ class TrayController:
         text: str,
         capture_source: CaptureSource | None,
     ) -> None:
+        pending_capture = getattr(
+            self,
+            "_pending_dictation_capture",
+            None,
+        )
+        self._pending_dictation_capture = None
         tab_id = self.selected_chatgpt_tab_id
         if tab_id is None:
             self.window.set_status(
@@ -2517,8 +2577,22 @@ class TrayController:
 
         self.window.send_button.setEnabled(False)
         self.window.send_without_screenshot_button.setEnabled(False)
-        screenshot = None
-        if capture_source is not None:
+        if pending_capture is not None:
+            capture_source = pending_capture.source
+            screenshot = pending_capture.screenshot
+            if pending_capture.error is not None:
+                self.window.send_button.setEnabled(True)
+                self.window.send_without_screenshot_button.setEnabled(True)
+                self.window.set_status(
+                    "Could not capture screenshot when the microphone was "
+                    f"released: {pending_capture.error}",
+                    error=True,
+                )
+                return
+        else:
+            screenshot = None
+
+        if capture_source is not None and pending_capture is None:
             self.window.set_status("Capturing screenshot…")
             try:
                 screenshot = capture_webp(capture_source)
