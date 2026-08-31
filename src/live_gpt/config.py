@@ -1,0 +1,181 @@
+from __future__ import annotations
+
+import copy
+import json
+import os
+import sys
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any
+
+from .logger import Logger
+
+
+logger = Logger.get_logger(__name__)
+
+DEFAULT_CONFIG: dict[str, Any] = {
+    "version": 1,
+    "language": "en",
+    "hotkey_hold": "CapsLock",
+    "hotkey_send": "Ctrl+S",
+    "hotkey_send_without_screenshot": "Ctrl+D",
+    "auto_send": False,
+    "auto_hide": False,
+    "capture_source": "",
+    "chatgpt_window": "",
+    "window_geometry": [],
+    "window_locked": False,
+}
+
+
+def default_config_path() -> Path:
+    """Return the per-user JSON configuration path."""
+    if sys.platform == "win32":
+        root = Path(
+            os.environ.get(
+                "APPDATA",
+                Path.home() / "AppData" / "Roaming",
+            )
+        )
+        return root / "Live GPT" / "config.json"
+    if sys.platform == "darwin":
+        return (
+            Path.home()
+            / "Library"
+            / "Application Support"
+            / "Live GPT"
+            / "config.json"
+        )
+    root = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    return root / "live-gpt" / "config.json"
+
+
+def _valid_value(key: str, value: Any, default: Any) -> bool:
+    if type(value) is not type(default):
+        return False
+    if key == "version":
+        return value == DEFAULT_CONFIG["version"]
+    if key == "language":
+        return value in ("en", "zh")
+    if key.startswith("hotkey_"):
+        return bool(value.strip())
+    if key == "window_geometry":
+        return value == [] or (
+            len(value) == 4
+            and all(type(part) is int for part in value)
+            and value[2] >= 760
+            and value[3] >= 180
+        )
+    return True
+
+
+class Config(dict[str, Any]):
+    """Validated JSON settings that save automatically when changed."""
+
+    def __init__(
+        self,
+        path: str | Path | None = None,
+        default: Mapping[str, Any] | None = None,
+    ) -> None:
+        self.default = copy.deepcopy(dict(default or DEFAULT_CONFIG))
+        self.path = Path(path) if path is not None else default_config_path()
+        self.file_existed = self.path.is_file()
+        loaded = self._read_file()
+        verified, modified = self._verify(loaded)
+        dict.__init__(self, verified)
+        if modified:
+            self.save_file()
+
+    def _read_file(self) -> Any:
+        if not self.file_existed:
+            return None
+        try:
+            with self.path.open("r", encoding="utf-8") as stream:
+                return json.load(stream)
+        except Exception as error:
+            logger.error(f"Unable to load config {self.path}", error)
+            return None
+
+    def _verify(self, loaded: Any) -> tuple[dict[str, Any], bool]:
+        if not isinstance(loaded, dict):
+            return copy.deepcopy(self.default), True
+
+        modified = set(loaded) != set(self.default)
+        verified: dict[str, Any] = {}
+        for key, default in self.default.items():
+            value = loaded.get(key, default)
+            if not _valid_value(key, value, default):
+                value = copy.deepcopy(default)
+                modified = True
+            verified[key] = value
+        return verified, modified
+
+    def save_file(self) -> None:
+        """Atomically write the current settings to disk."""
+        temporary_path = self.path.with_suffix(self.path.suffix + ".tmp")
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with temporary_path.open("w", encoding="utf-8") as stream:
+                json.dump(self, stream, ensure_ascii=False, indent=2)
+                stream.write("\n")
+            os.replace(temporary_path, self.path)
+        except Exception as error:
+            logger.error(f"Unable to save config {self.path}", error)
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        if key not in self.default:
+            logger.warning(f"Ignoring unknown config key {key!r}")
+            return
+        if not _valid_value(key, value, self.default[key]):
+            logger.warning(f"Ignoring invalid config value for {key!r}")
+            return
+        if self.get(key) == value:
+            return
+        dict.__setitem__(self, key, copy.deepcopy(value))
+        self.save_file()
+
+    def update(self, *args: Any, **kwargs: Any) -> None:
+        updates = dict(*args, **kwargs)
+        changed = False
+        for key, value in updates.items():
+            if key not in self.default:
+                logger.warning(f"Ignoring unknown config key {key!r}")
+                continue
+            if not _valid_value(key, value, self.default[key]):
+                logger.warning(f"Ignoring invalid config value for {key!r}")
+                continue
+            if self.get(key) != value:
+                dict.__setitem__(self, key, copy.deepcopy(value))
+                changed = True
+        if changed:
+            self.save_file()
+
+    def pop(self, key: str, default: Any = None) -> Any:
+        result = dict.pop(self, key, default)
+        self.save_file()
+        return result
+
+    def popitem(self) -> tuple[str, Any]:
+        result = dict.popitem(self)
+        self.save_file()
+        return result
+
+    def clear(self) -> None:
+        if self:
+            dict.clear(self)
+            self.save_file()
+
+    def reset_to_default(self) -> None:
+        dict.clear(self)
+        dict.update(self, copy.deepcopy(self.default))
+        self.save_file()
+
+    def get_default(self, key: str) -> Any:
+        return copy.deepcopy(self.default.get(key))
+
+
+__all__ = ["Config", "DEFAULT_CONFIG", "default_config_path"]

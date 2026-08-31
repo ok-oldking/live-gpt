@@ -137,6 +137,21 @@ class SettingsDialogTests(unittest.TestCase):
         finally:
             dialog.close()
 
+        chinese_dialog = HotkeyConfigDialog(
+            QKeySequence("CapsLock"),
+            QKeySequence("Ctrl+S"),
+            QKeySequence("Ctrl+D"),
+            language="zh",
+        )
+        try:
+            self.assertEqual(chinese_dialog.language(), "zh")
+            self.assertEqual(
+                chinese_dialog.language_combo.currentText(),
+                "中文 (Chinese)",
+            )
+        finally:
+            chinese_dialog.close()
+
 
 class TrayControllerBrowserTests(unittest.TestCase):
     def test_overlay_is_fifty_percent_wider(self) -> None:
@@ -642,6 +657,77 @@ class TrayControllerBrowserTests(unittest.TestCase):
             self.assertEqual(window.capture_source_combo.itemText(0), "No screenshot")
             self.assertIsNone(window.capture_source_combo.itemData(0))
             self.assertEqual(window.capture_source_combo.itemData(1), source)
+        finally:
+            window.close()
+
+    def test_capture_selector_restores_and_updates_preference(self) -> None:
+        window = OverlayWindow()
+        first = CaptureSource(
+            "display:1",
+            "Screenshot desktop 1",
+            "display",
+            0,
+            0,
+            1920,
+            1080,
+        )
+        second = CaptureSource(
+            "display:2",
+            "Screenshot desktop 2",
+            "display",
+            1920,
+            0,
+            1920,
+            1080,
+        )
+        preferences: list[str] = []
+        window.capture_source_selected.connect(preferences.append)
+        try:
+            window.set_preferred_capture_source(second.key)
+            window.set_capture_sources([first, second])
+
+            self.assertEqual(window.capture_source_combo.currentData(), second)
+            self.assertEqual(preferences, [])
+
+            window.capture_source_combo.setCurrentIndex(1)
+            self.assertEqual(preferences, [first.key])
+        finally:
+            window.close()
+
+    def test_chatgpt_selector_restores_preferred_url(self) -> None:
+        window = OverlayWindow()
+        selected_tabs: list[str] = []
+        preferences: list[str] = []
+        window.chatgpt_tab_selected.connect(selected_tabs.append)
+        window.chatgpt_preference_changed.connect(preferences.append)
+        try:
+            window.set_preferred_chatgpt_window(
+                "https://chatgpt.com/c/second"
+            )
+            window.set_chatgpt_tabs(
+                [
+                    {
+                        "id": "first",
+                        "title": "First",
+                        "url": "https://chatgpt.com/c/first",
+                    },
+                    {
+                        "id": "second",
+                        "title": "Second",
+                        "url": "https://chatgpt.com/c/second",
+                    },
+                ]
+            )
+
+            self.assertEqual(window.chatgpt_tab_combo.currentData(), "second")
+            self.assertEqual(selected_tabs, ["second"])
+            self.assertEqual(preferences, [])
+
+            window.chatgpt_tab_combo.setCurrentIndex(0)
+            self.assertEqual(
+                preferences,
+                ["https://chatgpt.com/c/first"],
+            )
         finally:
             window.close()
 

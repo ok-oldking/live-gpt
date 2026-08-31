@@ -54,6 +54,7 @@ from .browser import (
     discover_cdp_endpoint,
     open_remote_debugging_settings,
 )
+from .config import Config, DEFAULT_CONFIG
 from .logger import Logger, config_logger, shutdown_logger
 from .hotkeys import GlobalHotkeyMonitor, HotkeyBinding
 from .screen_capture import CaptureSource, capture_webp, list_capture_sources
@@ -74,10 +75,17 @@ LOCK_ICON_PATH = ASSET_DIRECTORY / "lock.svg"
 UNLOCK_ICON_PATH = ASSET_DIRECTORY / "unlock.svg"
 logger = Logger.get_logger(__name__)
 
-DEFAULT_HOLD_MIC_HOTKEY = "CapsLock"
-DEFAULT_SEND_HOTKEY = "Ctrl+S"
-DEFAULT_SEND_WITHOUT_SCREENSHOT_HOTKEY = "Ctrl+D"
-HOTKEY_SETTING_KEYS = {
+DEFAULT_HOLD_MIC_HOTKEY = str(DEFAULT_CONFIG["hotkey_hold"])
+DEFAULT_SEND_HOTKEY = str(DEFAULT_CONFIG["hotkey_send"])
+DEFAULT_SEND_WITHOUT_SCREENSHOT_HOTKEY = str(
+    DEFAULT_CONFIG["hotkey_send_without_screenshot"]
+)
+HOTKEY_CONFIG_KEYS = {
+    "hold": "hotkey_hold",
+    "send": "hotkey_send",
+    "send_without_screenshot": "hotkey_send_without_screenshot",
+}
+LEGACY_HOTKEY_SETTING_KEYS = {
     "hold": "hotkeys/hold_microphone",
     "send": "hotkeys/send",
     "send_without_screenshot": "hotkeys/send_without_screenshot",
@@ -93,6 +101,8 @@ class HotkeyConfigDialog(QDialog):
         send: QKeySequence,
         send_without_screenshot: QKeySequence,
         parent: QWidget | None = None,
+        *,
+        language: str = "en",
     ) -> None:
         super().__init__(parent)
         self._title_drag_offset: QPoint | None = None
@@ -263,6 +273,7 @@ class HotkeyConfigDialog(QDialog):
         self.language_combo.setObjectName("languageCombo")
         self.language_combo.setAccessibleName("Interface language")
         self.language_combo.addItems(("English", "中文 (Chinese)"))
+        self.language_combo.setCurrentIndex(1 if language == "zh" else 0)
         self.language_combo.setToolTip(
             "Choose an interface language preview"
         )
@@ -528,6 +539,9 @@ class HotkeyConfigDialog(QDialog):
             ),
         }
 
+    def language(self) -> str:
+        return "zh" if self.language_combo.currentIndex() == 1 else "en"
+
     def bindings(self) -> dict[str, HotkeyBinding]:
         bindings = {
             name: HotkeyBinding.from_sequence(sequence)
@@ -781,6 +795,9 @@ class OverlayWindow(QMainWindow):
     open_remote_debugging_requested = Signal()
     chatgpt_tab_selected = Signal(str)
     chatgpt_connection_changed = Signal(bool)
+    chatgpt_preference_changed = Signal(str)
+    capture_source_selected = Signal(str)
+    geometry_changed = Signal(object)
 
     def __init__(self) -> None:
         super().__init__()
@@ -793,6 +810,8 @@ class OverlayWindow(QMainWindow):
         self._chrome_visible = False
         self._focus_restorer = ForegroundWindowRestorer()
         self._auto_hide_enabled = False
+        self._preferred_capture_source_key = ""
+        self._preferred_chatgpt_url = ""
         self.setWindowTitle("Live GPT")
         self.setMinimumSize(760, 180)
         self.setWindowFlags(
@@ -1285,13 +1304,25 @@ class OverlayWindow(QMainWindow):
             self.transcript_area.setEnabled(True)
             self.set_status("Hold the microphone or enter a message")
             selected_index = self.chatgpt_tab_combo.findData(selected_id)
+            if selected_index < 0 and self._preferred_chatgpt_url:
+                for index in range(self.chatgpt_tab_combo.count()):
+                    url = self.chatgpt_tab_combo.itemData(
+                        index,
+                        Qt.ItemDataRole.ToolTipRole,
+                    )
+                    if url == self._preferred_chatgpt_url:
+                        selected_index = index
+                        break
             self.chatgpt_tab_combo.setCurrentIndex(
                 selected_index if selected_index >= 0 else 0
             )
         self.chatgpt_tab_combo.blockSignals(False)
         self.chatgpt_connection_changed.emit(bool(tabs))
         if tabs:
-            self._chatgpt_tab_changed(self.chatgpt_tab_combo.currentIndex())
+            self._activate_chatgpt_tab(
+                self.chatgpt_tab_combo.currentIndex(),
+                save_preference=not bool(self._preferred_chatgpt_url),
+            )
 
     def set_browser_status(self, status: str) -> None:
         self.chatgpt_tab_combo.setToolTip(status)
@@ -1308,20 +1339,33 @@ class OverlayWindow(QMainWindow):
 
     def set_capture_sources(self, sources: list[CaptureSource]) -> None:
         selected = self.capture_source_combo.currentData()
-        selected_key = selected.key if isinstance(selected, CaptureSource) else None
+        selected_key = (
+            selected.key
+            if isinstance(selected, CaptureSource)
+            else self._preferred_capture_source_key
+        )
         self.capture_source_combo.blockSignals(True)
         self.capture_source_combo.clear()
         self.capture_source_combo.addItem("No screenshot", None)
         for source in sources:
             self.capture_source_combo.addItem(source.label, source)
-        if selected_key is not None:
+        if selected_key:
             for index in range(1, self.capture_source_combo.count()):
                 source = self.capture_source_combo.itemData(index)
                 if isinstance(source, CaptureSource) and source.key == selected_key:
                     self.capture_source_combo.setCurrentIndex(index)
                     break
         self.capture_source_combo.blockSignals(False)
-        self._capture_source_changed(self.capture_source_combo.currentIndex())
+        self._apply_capture_source(
+            self.capture_source_combo.currentIndex(),
+            save_preference=False,
+        )
+
+    def set_preferred_capture_source(self, source_key: str) -> None:
+        self._preferred_capture_source_key = source_key
+
+    def set_preferred_chatgpt_window(self, url: str) -> None:
+        self._preferred_chatgpt_url = url
 
     def set_send_result(
         self,
@@ -1648,14 +1692,46 @@ class OverlayWindow(QMainWindow):
         self.transcript_area.show()
 
     def _chatgpt_tab_changed(self, index: int) -> None:
+        self._activate_chatgpt_tab(index, save_preference=True)
+
+    def _activate_chatgpt_tab(
+        self,
+        index: int,
+        *,
+        save_preference: bool,
+    ) -> None:
         tab_id = self.chatgpt_tab_combo.itemData(index)
         if tab_id:
             self.chatgpt_tab_selected.emit(str(tab_id))
+            if save_preference:
+                url = self.chatgpt_tab_combo.itemData(
+                    index,
+                    Qt.ItemDataRole.ToolTipRole,
+                )
+                self._preferred_chatgpt_url = str(url or "")
+                self.chatgpt_preference_changed.emit(
+                    self._preferred_chatgpt_url
+                )
 
     def _capture_source_changed(self, index: int) -> None:
+        self._apply_capture_source(index, save_preference=True)
+
+    def _apply_capture_source(
+        self,
+        index: int,
+        *,
+        save_preference: bool,
+    ) -> None:
+        source = self.capture_source_combo.itemData(index)
         self.transcript_area.set_screenshot_selected(
-            self.capture_source_combo.itemData(index) is not None
+            source is not None
         )
+        if save_preference:
+            source_key = (
+                source.key if isinstance(source, CaptureSource) else ""
+            )
+            self._preferred_capture_source_key = source_key
+            self.capture_source_selected.emit(source_key)
 
     def clear_transcript(self) -> None:
         self.transcript_area.clear()
@@ -1816,6 +1892,13 @@ class OverlayWindow(QMainWindow):
                 self._render_reading_subtitle(resized=True)
             elif self._subtitle_mode_active:
                 self._set_subtitle_status(self._subtitle_status_text)
+        if not getattr(self, "_subtitle_mode_active", False):
+            self.geometry_changed.emit(QRect(self.geometry()))
+
+    def moveEvent(self, event) -> None:  # noqa: N802
+        super().moveEvent(event)
+        if not getattr(self, "_subtitle_mode_active", False):
+            self.geometry_changed.emit(QRect(self.geometry()))
 
     def leaveEvent(self, event) -> None:  # noqa: N802
         QTimer.singleShot(0, self._hide_chrome_if_outside)
@@ -2035,14 +2118,27 @@ class TrayController:
         logger.debug("Creating tray controller")
         self.application = application
         self.icon = QIcon(str(ICON_PATH))
+        self.config = Config()
+        self._migrate_legacy_hotkeys()
         self.window = OverlayWindow()
+        self.window.set_preferred_capture_source(
+            str(self.config["capture_source"])
+        )
+        self.window.set_preferred_chatgpt_window(
+            str(self.config["chatgpt_window"])
+        )
+        self.window.auto_send_button.setChecked(
+            bool(self.config["auto_send"])
+        )
+        self.window.auto_hide_button.setChecked(
+            bool(self.config["auto_hide"])
+        )
         self.browser_monitor = BrowserMonitor()
         self.selected_chatgpt_tab_id: str | None = None
         self.dictation_tab_id: str | None = None
         self._dictation_state = "idle"
         self._dictation_input_held = False
         self._dictation_listening_since: float | None = None
-        self.settings = QSettings("Live GPT", "Live GPT")
         self._hotkey_sequences = self._load_hotkey_sequences()
         bindings = self._bindings_for_sequences(self._hotkey_sequences)
         self.hotkey_monitor = GlobalHotkeyMonitor(
@@ -2068,6 +2164,12 @@ class TrayController:
         )
         self.window.chatgpt_connection_changed.connect(
             self._set_chatgpt_connection
+        )
+        self.window.chatgpt_preference_changed.connect(
+            self._save_chatgpt_preference
+        )
+        self.window.capture_source_selected.connect(
+            self._save_capture_source_preference
         )
         self.browser_monitor.tabs_changed.connect(self.window.set_chatgpt_tabs)
         self.browser_monitor.status_changed.connect(
@@ -2109,6 +2211,27 @@ class TrayController:
             lambda: self.window.request_send_from_hotkey(False)
         )
 
+        self._position_overlay()
+        self._restore_window_geometry()
+        self.window.lock_button.setChecked(
+            bool(self.config["window_locked"])
+        )
+        self.window.auto_send_button.toggled.connect(
+            lambda enabled: self.config.__setitem__("auto_send", enabled)
+        )
+        self.window.auto_hide_button.toggled.connect(
+            lambda enabled: self.config.__setitem__("auto_hide", enabled)
+        )
+        self.window.lock_button.toggled.connect(
+            lambda enabled: self.config.__setitem__("window_locked", enabled)
+        )
+        self._geometry_save_timer = QTimer(self.window)
+        self._geometry_save_timer.setSingleShot(True)
+        self._geometry_save_timer.timeout.connect(self._save_window_geometry)
+        self.window.geometry_changed.connect(
+            self._schedule_window_geometry_save
+        )
+
         self.browser_monitor.start()
         self.hotkey_monitor.start()
 
@@ -2130,7 +2253,6 @@ class TrayController:
         self.tray_icon.activated.connect(self._handle_activation)
         self.tray_icon.show()
         logger.info("System tray icon is ready")
-        self._position_overlay()
         self.show_window()
 
     @staticmethod
@@ -2145,6 +2267,19 @@ class TrayController:
             raise ValueError("Each action must use a different hotkey")
         return bindings
 
+    def _migrate_legacy_hotkeys(self) -> None:
+        if self.config.file_existed:
+            return
+        legacy_settings = QSettings("Live GPT", "Live GPT")
+        migrated: dict[str, str] = {}
+        for name, legacy_key in LEGACY_HOTKEY_SETTING_KEYS.items():
+            value = legacy_settings.value(legacy_key)
+            if value is not None and str(value).strip():
+                migrated[HOTKEY_CONFIG_KEYS[name]] = str(value)
+        if migrated:
+            self.config.update(migrated)
+            logger.info("Migrated legacy hotkeys to JSON configuration")
+
     def _load_hotkey_sequences(self) -> dict[str, QKeySequence]:
         defaults = {
             "hold": DEFAULT_HOLD_MIC_HOTKEY,
@@ -2155,18 +2290,26 @@ class TrayController:
         }
         sequences = {
             name: QKeySequence(
-                str(self.settings.value(HOTKEY_SETTING_KEYS[name], default))
+                str(self.config[HOTKEY_CONFIG_KEYS[name]])
             )
-            for name, default in defaults.items()
+            for name in defaults
         }
         try:
             self._bindings_for_sequences(sequences)
         except ValueError as error:
             logger.warning(f"Invalid saved hotkey configuration: {error}")
-            return {
+            sequences = {
                 name: QKeySequence(default)
                 for name, default in defaults.items()
             }
+            self.config.update(
+                {
+                    HOTKEY_CONFIG_KEYS[name]: sequence.toString(
+                        QKeySequence.SequenceFormat.PortableText
+                    )
+                    for name, sequence in sequences.items()
+                }
+            )
         return sequences
 
     def _open_configuration(self) -> None:
@@ -2177,6 +2320,7 @@ class TrayController:
                 self._hotkey_sequences["send"],
                 self._hotkey_sequences["send_without_screenshot"],
                 self.window,
+                language=str(self.config["language"]),
             )
             if dialog.exec() != QDialog.DialogCode.Accepted:
                 return
@@ -2184,20 +2328,21 @@ class TrayController:
             sequences = dialog.sequences()
             bindings = dialog.bindings()
             self._hotkey_sequences = sequences
-            for name, sequence in sequences.items():
-                self.settings.setValue(
-                    HOTKEY_SETTING_KEYS[name],
-                    sequence.toString(
+            self.config.update(
+                {
+                    HOTKEY_CONFIG_KEYS[name]: sequence.toString(
                         QKeySequence.SequenceFormat.PortableText
-                    ),
-                )
-            self.settings.sync()
+                    )
+                    for name, sequence in sequences.items()
+                }
+                | {"language": dialog.language()}
+            )
             self.hotkey_monitor.update_bindings(
                 bindings["hold"],
                 bindings["send"],
                 bindings["send_without_screenshot"],
             )
-            self.window.set_status("Global hotkeys updated")
+            self.window.set_status("Settings updated")
             logger.info(
                 "Updated global hotkeys "
                 + ", ".join(
@@ -2431,6 +2576,12 @@ class TrayController:
             return
         self.selected_chatgpt_tab_id = None
 
+    def _save_chatgpt_preference(self, url: str) -> None:
+        self.config["chatgpt_window"] = url
+
+    def _save_capture_source_preference(self, source_key: str) -> None:
+        self.config["capture_source"] = source_key
+
     def _open_remote_debugging_settings(self) -> None:
         endpoint = discover_cdp_endpoint()
         if endpoint is not None:
@@ -2463,9 +2614,40 @@ class TrayController:
             available.bottom() - self.window.height() - bottom_margin + 1,
         )
 
+    def _restore_window_geometry(self) -> None:
+        geometry = self.config["window_geometry"]
+        if not geometry:
+            return
+        restored = QRect(*geometry)
+        if not any(
+            screen.availableGeometry().intersects(restored)
+            for screen in self.application.screens()
+        ):
+            logger.warning("Saved overlay geometry is outside visible screens")
+            self.config["window_geometry"] = []
+            return
+        self.window.setGeometry(restored)
+
+    def _schedule_window_geometry_save(self, geometry: QRect) -> None:
+        del geometry
+        self._geometry_save_timer.start(250)
+
+    def _save_window_geometry(self) -> None:
+        geometry = (
+            self.window._subtitle_collapsed_geometry
+            or self.window.geometry()
+        )
+        self.config["window_geometry"] = [
+            geometry.x(),
+            geometry.y(),
+            geometry.width(),
+            geometry.height(),
+        ]
+
     def _exit_application(self, checked: bool = False) -> None:
         del checked
         logger.info("Exit requested")
+        self._save_window_geometry()
         self.capture_refresh_timer.stop()
         self.hotkey_monitor.stop()
         self.browser_monitor.request_stop()

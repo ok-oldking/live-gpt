@@ -71,6 +71,14 @@ and **Ctrl+D** (send without a screenshot). The shortcuts work while the
 overlay is hidden or unfocused. Live GPT observes their key state without
 registering or swallowing the keys, so the foreground program continues to
 receive the same keystrokes. Changes are saved for the current Windows user.
+
+Preferences are stored as JSON in `%APPDATA%\Live GPT\config.json`. The file is
+updated automatically when a preference changes and includes the language,
+hotkeys, auto-send and auto-hide states, selected screenshot source, selected
+ChatGPT conversation, overlay position and size, and position-lock state. A
+missing, unreadable, or invalid configuration falls back to safe defaults and
+is repaired on disk. Existing registry-based hotkeys are migrated on the first
+JSON-configured launch.
 The editor and microphone remain disabled until a ChatGPT window is connected.
 Status tips appear as the editor hint rather than in a separate row; errors use
 a red hint.
