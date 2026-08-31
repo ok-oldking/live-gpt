@@ -9,7 +9,7 @@ from unittest.mock import Mock, patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QEvent, QPoint, QRect, Qt  # noqa: E402
-from PySide6.QtGui import QPalette  # noqa: E402
+from PySide6.QtGui import QKeySequence, QPalette  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
     QApplication,
@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (  # noqa: E402
 )
 
 from live_gpt.app import (  # noqa: E402
+    HotkeyConfigDialog,
     OverlayWindow,
     TranscriptEditor,
     TrayController,
@@ -90,6 +91,51 @@ class TranscriptEditorTests(unittest.TestCase):
 
         self.assertFalse(self.editor.auto_send_button.isChecked())
         self.assertTrue(self.editor.auto_send_button.icon().isNull())
+
+
+class SettingsDialogTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.application = QApplication.instance() or QApplication([])
+
+    def test_settings_use_navigation_and_selectable_language_preview(self) -> None:
+        dialog = HotkeyConfigDialog(
+            QKeySequence("CapsLock"),
+            QKeySequence("Ctrl+S"),
+            QKeySequence("Ctrl+D"),
+        )
+        try:
+            self.assertEqual(dialog.windowTitle(), "Live GPT settings")
+            self.assertEqual(
+                dialog.hotkey_section.objectName(),
+                "settingsPage",
+            )
+            self.assertEqual(
+                dialog.language_section.objectName(),
+                "settingsPage",
+            )
+            self.assertTrue(
+                dialog.windowFlags() & Qt.WindowType.FramelessWindowHint
+            )
+            self.assertFalse(dialog.close_button.icon().isNull())
+            self.assertFalse(dialog.shortcuts_nav_button.icon().isNull())
+            self.assertFalse(dialog.language_nav_button.icon().isNull())
+            self.assertTrue(dialog.language_combo.isEnabled())
+            self.assertEqual(dialog.language_combo.currentText(), "English")
+            self.assertEqual(dialog.language_combo.count(), 2)
+
+            dialog.language_nav_button.click()
+            self.assertEqual(dialog.settings_pages.currentIndex(), 1)
+            dialog.language_combo.setCurrentIndex(1)
+            self.assertEqual(
+                dialog.language_combo.currentText(),
+                "中文 (Chinese)",
+            )
+
+            dialog.shortcuts_nav_button.click()
+            self.assertEqual(dialog.settings_pages.currentIndex(), 0)
+        finally:
+            dialog.close()
 
 
 class TrayControllerBrowserTests(unittest.TestCase):

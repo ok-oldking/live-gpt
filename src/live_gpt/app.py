@@ -28,6 +28,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -42,6 +43,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QStackedWidget,
     QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
@@ -66,6 +68,8 @@ EXIT_ICON_PATH = ASSET_DIRECTORY / "exit.svg"
 SEND_ICON_PATH = ASSET_DIRECTORY / "send.svg"
 CHECK_ICON_PATH = ASSET_DIRECTORY / "check.svg"
 SETTINGS_ICON_PATH = ASSET_DIRECTORY / "settings.svg"
+SHORTCUTS_ICON_PATH = ASSET_DIRECTORY / "shortcuts.svg"
+LANGUAGE_ICON_PATH = ASSET_DIRECTORY / "language.svg"
 LOCK_ICON_PATH = ASSET_DIRECTORY / "lock.svg"
 UNLOCK_ICON_PATH = ASSET_DIRECTORY / "unlock.svg"
 logger = Logger.get_logger(__name__)
@@ -81,7 +85,7 @@ HOTKEY_SETTING_KEYS = {
 
 
 class HotkeyConfigDialog(QDialog):
-    """Edit the pass-through global shortcuts used by the overlay."""
+    """Edit Live GPT settings, including pass-through global shortcuts."""
 
     def __init__(
         self,
@@ -91,8 +95,15 @@ class HotkeyConfigDialog(QDialog):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Live GPT configuration")
-        self.setMinimumWidth(430)
+        self._title_drag_offset: QPoint | None = None
+        self.setObjectName("settingsDialog")
+        self.setWindowTitle("Live GPT settings")
+        self.setWindowFlags(
+            Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setMinimumSize(720, 480)
+        self.resize(780, 520)
 
         self.hold_microphone_edit = self._sequence_edit(hold_microphone)
         self.send_edit = self._sequence_edit(send)
@@ -100,23 +111,189 @@ class HotkeyConfigDialog(QDialog):
             send_without_screenshot
         )
 
+        self.settings_shell = QFrame()
+        self.settings_shell.setObjectName("settingsShell")
+        shell_layout = QVBoxLayout(self.settings_shell)
+        shell_layout.setContentsMargins(0, 0, 0, 0)
+        shell_layout.setSpacing(0)
+
+        self.title_bar = QFrame()
+        self.title_bar.setObjectName("settingsTitleBar")
+        self.title_bar.setFixedHeight(56)
+        title_layout = QHBoxLayout(self.title_bar)
+        title_layout.setContentsMargins(20, 0, 12, 0)
+        title_layout.setSpacing(10)
+        app_title = QLabel("Live GPT")
+        app_title.setObjectName("settingsAppTitle")
+        title_separator = QLabel("/")
+        title_separator.setObjectName("settingsTitleSeparator")
+        window_title = QLabel("Settings")
+        window_title.setObjectName("settingsWindowTitle")
+        title_layout.addWidget(app_title)
+        title_layout.addWidget(title_separator)
+        title_layout.addWidget(window_title)
+        title_layout.addStretch()
+
+        self.close_button = QPushButton()
+        self.close_button.setObjectName("settingsCloseButton")
+        self.close_button.setIcon(QIcon(str(EXIT_ICON_PATH)))
+        self.close_button.setIconSize(QSize(16, 16))
+        self.close_button.setFixedSize(36, 36)
+        self.close_button.setAccessibleName("Close settings")
+        self.close_button.setToolTip("Close without saving")
+        self.close_button.clicked.connect(self.reject)
+        title_layout.addWidget(self.close_button)
+        shell_layout.addWidget(self.title_bar)
+
+        body = QWidget()
+        body.setObjectName("settingsBody")
+        body_layout = QHBoxLayout(body)
+        body_layout.setContentsMargins(0, 0, 0, 0)
+        body_layout.setSpacing(0)
+
+        navigation = QFrame()
+        navigation.setObjectName("settingsNavigation")
+        navigation.setFixedWidth(190)
+        navigation_layout = QVBoxLayout(navigation)
+        navigation_layout.setContentsMargins(14, 24, 14, 18)
+        navigation_layout.setSpacing(8)
+        navigation_label = QLabel("SETTINGS")
+        navigation_label.setObjectName("settingsNavigationLabel")
+        navigation_layout.addWidget(navigation_label)
+        navigation_layout.addSpacing(8)
+
+        self.shortcuts_nav_button = self._navigation_button(
+            "Shortcuts",
+            SHORTCUTS_ICON_PATH,
+        )
+        self.language_nav_button = self._navigation_button(
+            "Language",
+            LANGUAGE_ICON_PATH,
+        )
+        self.navigation_group = QButtonGroup(self)
+        self.navigation_group.setExclusive(True)
+        self.navigation_group.addButton(self.shortcuts_nav_button, 0)
+        self.navigation_group.addButton(self.language_nav_button, 1)
+        self.shortcuts_nav_button.setChecked(True)
+        navigation_layout.addWidget(self.shortcuts_nav_button)
+        navigation_layout.addWidget(self.language_nav_button)
+        navigation_layout.addStretch()
+        body_layout.addWidget(navigation)
+
+        content = QWidget()
+        content.setObjectName("settingsContent")
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(28, 24, 28, 22)
+        content_layout.setSpacing(16)
+
+        self.settings_pages = QStackedWidget()
+        self.settings_pages.setObjectName("settingsPages")
+
+        self.hotkey_section = QWidget()
+        self.hotkey_section.setObjectName("settingsPage")
+        hotkey_page_layout = QVBoxLayout(self.hotkey_section)
+        hotkey_page_layout.setContentsMargins(0, 0, 0, 0)
+        hotkey_page_layout.setSpacing(16)
+        hotkey_title = QLabel("Keyboard shortcuts")
+        hotkey_title.setObjectName("settingsPageTitle")
+        hotkey_description = QLabel(
+            "Control Live GPT without leaving the app you are using."
+        )
+        hotkey_description.setObjectName("settingsPageDescription")
+        hotkey_description.setWordWrap(True)
+        hotkey_page_layout.addWidget(hotkey_title)
+        hotkey_page_layout.addWidget(hotkey_description)
+
+        hotkey_card = QFrame()
+        hotkey_card.setObjectName("settingsCard")
+        hotkey_card_layout = QVBoxLayout(hotkey_card)
+        hotkey_card_layout.setContentsMargins(20, 20, 20, 20)
+        hotkey_card_layout.setSpacing(14)
+        card_title = QLabel("Global shortcuts")
+        card_title.setObjectName("settingsCardTitle")
+        hotkey_card_layout.addWidget(card_title)
+
         form = QFormLayout()
-        form.addRow("Hold microphone:", self.hold_microphone_edit)
-        form.addRow("Send:", self.send_edit)
+        form.setContentsMargins(0, 4, 0, 0)
+        form.setHorizontalSpacing(22)
+        form.setVerticalSpacing(12)
+        form.addRow("Hold microphone", self.hold_microphone_edit)
+        form.addRow("Send with screenshot", self.send_edit)
         form.addRow(
-            "Send without screenshot:",
+            "Send without screenshot",
             self.send_without_screenshot_edit,
         )
+        hotkey_card_layout.addLayout(form)
 
         note = QLabel(
             "These shortcuts work globally and are still passed to the "
             "foreground program."
         )
+        note.setObjectName("settingsNote")
         note.setWordWrap(True)
+        hotkey_card_layout.addWidget(note)
+        hotkey_page_layout.addWidget(hotkey_card)
+        hotkey_page_layout.addStretch()
+
+        self.language_section = QWidget()
+        self.language_section.setObjectName("settingsPage")
+        language_page_layout = QVBoxLayout(self.language_section)
+        language_page_layout.setContentsMargins(0, 0, 0, 0)
+        language_page_layout.setSpacing(16)
+        language_title = QLabel("Interface language")
+        language_title.setObjectName("settingsPageTitle")
+        language_description = QLabel(
+            "Choose the language used for menus, labels, and messages."
+        )
+        language_description.setObjectName("settingsPageDescription")
+        language_description.setWordWrap(True)
+        language_page_layout.addWidget(language_title)
+        language_page_layout.addWidget(language_description)
+
+        language_card = QFrame()
+        language_card.setObjectName("settingsCard")
+        language_card_layout = QVBoxLayout(language_card)
+        language_card_layout.setContentsMargins(20, 20, 20, 20)
+        language_card_layout.setSpacing(14)
+        language_card_title = QLabel("Display language")
+        language_card_title.setObjectName("settingsCardTitle")
+        language_card_layout.addWidget(language_card_title)
+
+        self.language_combo = QComboBox()
+        self.language_combo.setObjectName("languageCombo")
+        self.language_combo.setAccessibleName("Interface language")
+        self.language_combo.addItems(("English", "中文 (Chinese)"))
+        self.language_combo.setToolTip(
+            "Choose an interface language preview"
+        )
+        language_card_layout.addWidget(self.language_combo)
+        self.language_status = QLabel(
+            "Language selection is available in settings, but translations "
+            "are not applied yet."
+        )
+        self.language_status.setObjectName("settingsNote")
+        self.language_status.setWordWrap(True)
+        language_card_layout.addWidget(self.language_status)
+        language_page_layout.addWidget(language_card)
+        language_page_layout.addStretch()
+
+        self.settings_pages.addWidget(self.hotkey_section)
+        self.settings_pages.addWidget(self.language_section)
+        self.shortcuts_nav_button.clicked.connect(
+            lambda checked: checked and self.settings_pages.setCurrentIndex(0)
+        )
+        self.language_nav_button.clicked.connect(
+            lambda checked: checked and self.settings_pages.setCurrentIndex(1)
+        )
+        content_layout.addWidget(self.settings_pages, 1)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
             | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.setObjectName("settingsButtons")
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText(
+            "Save changes"
         )
         buttons.button(QDialogButtonBox.StandardButton.Ok).setToolTip(
             "Save hotkey settings"
@@ -126,11 +303,215 @@ class HotkeyConfigDialog(QDialog):
         )
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
+        content_layout.addWidget(buttons)
+        body_layout.addWidget(content, 1)
+        shell_layout.addWidget(body, 1)
 
         layout = QVBoxLayout(self)
-        layout.addLayout(form)
-        layout.addWidget(note)
-        layout.addWidget(buttons)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.settings_shell)
+
+        self._title_drag_widgets = (
+            self.title_bar,
+            app_title,
+            title_separator,
+            window_title,
+        )
+        for widget in self._title_drag_widgets:
+            widget.installEventFilter(self)
+
+        self.setStyleSheet(
+            """
+            QDialog#settingsDialog {
+                background: transparent;
+            }
+            QFrame#settingsShell {
+                color: #f5f7ff;
+                background-color: #0c1430;
+                border: 1px solid rgba(130, 165, 230, 75);
+                border-radius: 14px;
+            }
+            QFrame#settingsTitleBar {
+                background-color: #10182e;
+                border: none;
+                border-bottom: 1px solid rgba(130, 165, 230, 45);
+                border-top-left-radius: 14px;
+                border-top-right-radius: 14px;
+            }
+            QLabel#settingsAppTitle {
+                color: #f5f7ff;
+                background: transparent;
+                font-size: 15px;
+                font-weight: 700;
+            }
+            QLabel#settingsTitleSeparator,
+            QLabel#settingsWindowTitle {
+                color: #8795b8;
+                background: transparent;
+                font-size: 14px;
+            }
+            QPushButton#settingsCloseButton {
+                background: transparent;
+                border: none;
+                border-radius: 8px;
+            }
+            QPushButton#settingsCloseButton:hover {
+                background-color: rgba(239, 68, 88, 190);
+            }
+            QWidget#settingsBody,
+            QWidget#settingsContent,
+            QWidget#settingsPage,
+            QStackedWidget#settingsPages {
+                background: transparent;
+                border: none;
+            }
+            QFrame#settingsNavigation {
+                background-color: rgba(8, 14, 34, 120);
+                border: none;
+                border-right: 1px solid rgba(130, 165, 230, 45);
+                border-bottom-left-radius: 14px;
+            }
+            QLabel#settingsNavigationLabel {
+                color: #7180a4;
+                background: transparent;
+                border: none;
+                padding-left: 10px;
+                font-size: 10px;
+                font-weight: 700;
+            }
+            QPushButton#settingsNavigationButton {
+                min-height: 42px;
+                padding: 0 12px;
+                color: #cbd4ed;
+                background: transparent;
+                border: 1px solid transparent;
+                border-radius: 9px;
+                text-align: left;
+                font-size: 14px;
+            }
+            QPushButton#settingsNavigationButton:hover {
+                color: #f5f7ff;
+                background-color: rgba(70, 88, 140, 80);
+            }
+            QPushButton#settingsNavigationButton:checked {
+                color: #f5f7ff;
+                background-color: rgba(38, 112, 145, 115);
+                border-color: rgba(76, 201, 240, 80);
+            }
+            QLabel#settingsPageTitle {
+                color: #f5f7ff;
+                background: transparent;
+                font-size: 24px;
+                font-weight: 700;
+            }
+            QLabel#settingsPageDescription {
+                color: #aeb9d5;
+                background: transparent;
+                font-size: 14px;
+            }
+            QFrame#settingsCard {
+                color: #f5f7ff;
+                background-color: #121c3a;
+                border: 1px solid rgba(130, 165, 230, 70);
+                border-radius: 12px;
+            }
+            QFrame#settingsCard QLabel {
+                color: #e9edff;
+                background: transparent;
+                border: none;
+            }
+            QLabel#settingsCardTitle {
+                color: #f5f7ff;
+                font-size: 16px;
+                font-weight: 700;
+            }
+            QLabel#settingsNote {
+                color: #8795b8;
+                font-size: 12px;
+            }
+            QKeySequenceEdit {
+                min-width: 230px;
+                background: transparent;
+                border: none;
+            }
+            QKeySequenceEdit QLineEdit,
+            QComboBox#languageCombo {
+                min-height: 34px;
+                min-width: 230px;
+                padding: 0 10px;
+                color: #f5f7ff;
+                background-color: rgba(5, 10, 28, 165);
+                border: 1px solid rgba(130, 165, 230, 85);
+                border-radius: 8px;
+                selection-background-color: rgba(76, 201, 240, 130);
+            }
+            QKeySequenceEdit QLineEdit:focus {
+                border-color: rgba(76, 201, 240, 190);
+            }
+            QComboBox#languageCombo QAbstractItemView {
+                color: #f5f7ff;
+                background-color: #182342;
+                border: 1px solid rgba(130, 165, 230, 85);
+                selection-background-color: rgb(38, 112, 145);
+            }
+            QDialogButtonBox#settingsButtons QPushButton {
+                min-height: 34px;
+                min-width: 96px;
+                padding: 0 14px;
+                color: #f5f7ff;
+                background-color: rgba(70, 88, 140, 150);
+                border: 1px solid rgba(170, 195, 255, 90);
+                border-radius: 8px;
+            }
+            QDialogButtonBox#settingsButtons QPushButton:hover {
+                background-color: rgba(76, 201, 240, 150);
+            }
+            QDialogButtonBox#settingsButtons QPushButton:default {
+                background-color: rgba(35, 155, 116, 210);
+                border-color: rgba(130, 255, 195, 150);
+            }
+            QDialogButtonBox#settingsButtons QPushButton:default:hover {
+                background-color: rgba(40, 190, 140, 230);
+            }
+            """
+        )
+
+    @staticmethod
+    def _navigation_button(text: str, icon_path: Path) -> QPushButton:
+        button = QPushButton(text)
+        button.setObjectName("settingsNavigationButton")
+        button.setCheckable(True)
+        button.setIcon(QIcon(str(icon_path)))
+        button.setIconSize(QSize(19, 19))
+        return button
+
+    def eventFilter(self, watched: object, event: QEvent) -> bool:
+        if watched in self._title_drag_widgets:
+            if (
+                event.type() == QEvent.Type.MouseButtonPress
+                and isinstance(event, QMouseEvent)
+                and event.button() == Qt.MouseButton.LeftButton
+            ):
+                self._title_drag_offset = (
+                    event.globalPosition().toPoint()
+                    - self.frameGeometry().topLeft()
+                )
+                return True
+            if (
+                event.type() == QEvent.Type.MouseMove
+                and isinstance(event, QMouseEvent)
+                and self._title_drag_offset is not None
+                and event.buttons() & Qt.MouseButton.LeftButton
+            ):
+                self.move(
+                    event.globalPosition().toPoint()
+                    - self._title_drag_offset
+                )
+                return True
+            if event.type() == QEvent.Type.MouseButtonRelease:
+                self._title_drag_offset = None
+                return True
+        return super().eventFilter(watched, event)
 
     @staticmethod
     def _sequence_edit(sequence: QKeySequence) -> QKeySequenceEdit:
@@ -502,7 +883,7 @@ class OverlayWindow(QMainWindow):
         self._configure_icon_button(
             self.configure_button,
             SETTINGS_ICON_PATH,
-            "Configure hotkeys",
+            "Open settings",
         )
         self.configure_button.clicked.connect(self.configure_requested.emit)
         title_layout.addWidget(self.configure_button)

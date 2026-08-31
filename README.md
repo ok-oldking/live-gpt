@@ -62,7 +62,10 @@ available even with an empty prompt. If the editor also contains text, a
 paper-plane **No Screenshot** action appears so the prompt can be sent without
 changing the selector.
 
-The **Configure** button opens the global-hotkey settings. Defaults are
+The **Configure** button opens the application settings, organized into global
+shortcut and interface-language pages in the left navigation. English and
+Chinese can be selected as a preview, but the selection does not change the UI
+yet. Hotkey defaults are
 **Caps Lock** (hold to dictate), **Ctrl+S** (send with the selected screenshot),
 and **Ctrl+D** (send without a screenshot). The shortcuts work while the
 overlay is hidden or unfocused. Live GPT observes their key state without
