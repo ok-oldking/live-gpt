@@ -64,10 +64,24 @@ changing the selector. For dictated prompts using **Auto Send**, the screenshot
 is captured when the microphone key or button is released, so browser
 dictation processing time does not change the captured moment.
 
-The **Configure** button opens the application settings, organized into global
-shortcut and interface-language pages in the left navigation. English and
+The **Configure** button opens the application settings, organized into
+Shortcuts, Language, Recording, and Playing pages in the left navigation. English and
 Chinese can be selected as a preview, but the selection does not change the UI
-yet. Hotkey defaults are
+yet. Recording and Playing each independently choose ChatGPT's browser engine
+or local Sherpa-ONNX; local controls stay hidden when the corresponding web
+engine is selected. The STT catalog includes five Mandarin and five English options;
+the TTS catalog includes Kokoro, Supertonic 3, Piper LibriTTS, MeloTTS, and
+KittenTTS, with speaker selection where the model supports multiple voices. It
+installs a pinned
+Sherpa-ONNX, NumPy, and audio runtime (including their transitive dependencies)
+through the current Python interpreter only when requested, verifies installed
+wheel files and versions, and validates model
+downloads against their published size and SHA-256 checksum. **Record
+microphone** tests the selected STT model, and **Play text** tests the selected
+TTS model and speaker. Offline and streaming models are labeled explicitly.
+Streaming recording models decode microphone chunks continuously and update the
+test transcript in real time. Each test reports its inference or generation latency.
+Hotkey defaults are
 **Caps Lock** (hold to dictate), **Ctrl+S** (send with the selected screenshot),
 and **Ctrl+D** (send without a screenshot). The shortcuts work while the
 overlay is hidden or unfocused. Live GPT observes their key state without
@@ -77,7 +91,8 @@ receive the same keystrokes. Changes are saved for the current Windows user.
 Preferences are stored as JSON in `%APPDATA%\Live GPT\config.json`. The file is
 updated automatically when a preference changes and includes the language,
 hotkeys, auto-send and auto-hide states, selected screenshot source, selected
-ChatGPT conversation, overlay position and size, and position-lock state. A
+ChatGPT conversation, independent recording/playback backends, local STT/TTS
+models and TTS speaker, overlay position and size, and position-lock state. A
 missing, unreadable, or invalid configuration falls back to safe defaults and
 is repaired on disk. Existing registry-based hotkeys are migrated on the first
 JSON-configured launch.

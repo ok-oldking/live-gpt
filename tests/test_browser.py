@@ -482,6 +482,50 @@ class BrowserMonitorTests(unittest.TestCase):
         self.assertIsNone(state.active_response)
         self.assertIsNotNone(state.active_reading)
 
+    def test_completed_response_uses_local_voice_when_selected(self) -> None:
+        page = Mock()
+        monitor = BrowserMonitor()
+        monitor.set_use_browser_voice(False)
+        state = _MonitorState(
+            active_response=_ActiveResponse(
+                page=page,
+                turn_marker_before="previous-turn",
+                started_at=90.0,
+                last_text="Local reply",
+                last_text_changed_at=97.0,
+                completion_candidate_at=97.0,
+            )
+        )
+        snapshot = _ResponseSnapshot(
+            has_new_turn=True,
+            is_generating=False,
+            has_completion_controls=True,
+            text="Local reply",
+            status="Finishing reply…",
+        )
+        requested: list[str] = []
+        finished: list[tuple[bool, str]] = []
+        monitor.local_voice_requested.connect(requested.append)
+        monitor.response_finished.connect(
+            lambda success, message: finished.append((success, message))
+        )
+
+        with (
+            patch.object(monitor, "_response_snapshot", return_value=snapshot),
+            patch.object(monitor, "_click_read_aloud") as read,
+            patch("live_gpt.browser.time.monotonic", return_value=100.0),
+        ):
+            monitor._poll_active_response(state)
+
+        read.assert_not_called()
+        self.assertEqual(requested, ["Local reply"])
+        self.assertEqual(
+            finished,
+            [(True, "Reply complete · Starting local voice")],
+        )
+        self.assertIsNone(state.active_response)
+        self.assertIsNone(state.active_reading)
+
     def test_late_trailing_text_resets_completion_stability_window(self) -> None:
         page = Mock()
         monitor = BrowserMonitor()

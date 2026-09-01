@@ -120,6 +120,8 @@ class SettingsDialogTests(unittest.TestCase):
             self.assertFalse(dialog.close_button.icon().isNull())
             self.assertFalse(dialog.shortcuts_nav_button.icon().isNull())
             self.assertFalse(dialog.language_nav_button.icon().isNull())
+            self.assertFalse(dialog.recording_nav_button.icon().isNull())
+            self.assertFalse(dialog.playing_nav_button.icon().isNull())
             self.assertTrue(dialog.language_combo.isEnabled())
             self.assertEqual(dialog.language_combo.currentText(), "English")
             self.assertEqual(dialog.language_combo.count(), 2)
@@ -134,6 +136,29 @@ class SettingsDialogTests(unittest.TestCase):
 
             dialog.shortcuts_nav_button.click()
             self.assertEqual(dialog.settings_pages.currentIndex(), 0)
+
+            dialog.recording_nav_button.click()
+            self.assertEqual(dialog.settings_pages.currentIndex(), 2)
+            self.assertEqual(dialog.recording_backend(), "web")
+            self.assertEqual(dialog.stt_model_combo.count(), 10)
+            self.assertIn("[Offline]", dialog.stt_model_combo.itemText(0))
+            streaming_index = dialog.stt_model_combo.findData(
+                "zh_streaming_zipformer_small_ctc_int8_2025_04_01"
+            )
+            self.assertIn(
+                "[Streaming]", dialog.stt_model_combo.itemText(streaming_index)
+            )
+            dialog._voice_record_partial("实时转写")
+            self.assertEqual(dialog.stt_test_result.text(), "实时转写")
+            self.assertTrue(dialog.recording_sherpa_card.isHidden())
+
+            dialog.playing_nav_button.click()
+            self.assertEqual(dialog.settings_pages.currentIndex(), 3)
+            self.assertEqual(dialog.playing_backend(), "web")
+            self.assertEqual(dialog.tts_model_combo.count(), 5)
+            self.assertEqual(dialog.voice_record_button.text(), "Record microphone")
+            self.assertEqual(dialog.voice_play_button.text(), "Play text")
+            self.assertTrue(dialog.playing_sherpa_card.isHidden())
         finally:
             dialog.close()
 
@@ -151,6 +176,27 @@ class SettingsDialogTests(unittest.TestCase):
             )
         finally:
             chinese_dialog.close()
+
+        local_dialog = HotkeyConfigDialog(
+            QKeySequence("CapsLock"),
+            QKeySequence("Ctrl+S"),
+            QKeySequence("Ctrl+D"),
+            recording_backend="sherpa",
+            playing_backend="web",
+            stt_model="en_moonshine_tiny_int8",
+            tts_model="kitten_tts",
+            tts_speaker=3,
+        )
+        try:
+            self.assertEqual(local_dialog.recording_backend(), "sherpa")
+            self.assertEqual(local_dialog.playing_backend(), "web")
+            self.assertEqual(local_dialog.stt_model(), "en_moonshine_tiny_int8")
+            self.assertEqual(local_dialog.tts_model(), "kitten_tts")
+            self.assertEqual(local_dialog.tts_speaker(), 3)
+            self.assertFalse(local_dialog.recording_sherpa_card.isHidden())
+            self.assertTrue(local_dialog.playing_sherpa_card.isHidden())
+        finally:
+            local_dialog.close()
 
 
 class TrayControllerBrowserTests(unittest.TestCase):

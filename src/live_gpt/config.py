@@ -25,6 +25,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "chatgpt_window": "",
     "window_geometry": [],
     "window_locked": False,
+    "recording_backend": "web",
+    "playing_backend": "web",
+    "stt_model": "zh_zipformer_ctc_int8_2025_07_03",
+    "tts_model": "kokoro_multilang_v1_0",
+    "tts_speaker": 0,
 }
 
 
@@ -57,6 +62,31 @@ def _valid_value(key: str, value: Any, default: Any) -> bool:
         return value == DEFAULT_CONFIG["version"]
     if key == "language":
         return value in ("en", "zh")
+    if key in ("recording_backend", "playing_backend"):
+        return value in ("web", "sherpa")
+    if key == "stt_model":
+        return value in (
+            "zh_zipformer_ctc_int8_2025_07_03",
+            "zh_streaming_zipformer_ctc_int8_2025_06_30",
+            "zh_streaming_zipformer_small_ctc_int8_2025_04_01",
+            "zh_paraformer_int8",
+            "zh_sense_voice_small_int8",
+            "en_parakeet_tdt_ctc_110m_int8",
+            "en_nemo_conformer_ctc_small",
+            "en_moonshine_tiny_int8",
+            "en_moonshine_base_int8",
+            "en_paraformer_int8",
+        )
+    if key == "tts_model":
+        return value in (
+            "kokoro_multilang_v1_0",
+            "supertonic_3_int8",
+            "piper_libritts",
+            "melotts_zh_en",
+            "kitten_tts",
+        )
+    if key == "tts_speaker":
+        return value >= 0
     if key.startswith("hotkey_"):
         return bool(value.strip())
     if key == "window_geometry":
@@ -81,9 +111,16 @@ class Config(dict[str, Any]):
         self.path = Path(path) if path is not None else default_config_path()
         self.file_existed = self.path.is_file()
         loaded = self._read_file()
+        migrated = False
+        if isinstance(loaded, dict) and "voice_backend" in loaded:
+            loaded = dict(loaded)
+            legacy_backend = loaded.pop("voice_backend")
+            loaded.setdefault("recording_backend", legacy_backend)
+            loaded.setdefault("playing_backend", legacy_backend)
+            migrated = True
         verified, modified = self._verify(loaded)
         dict.__init__(self, verified)
-        if modified:
+        if modified or migrated:
             self.save_file()
 
     def _read_file(self) -> Any:

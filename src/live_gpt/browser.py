@@ -178,6 +178,7 @@ class BrowserMonitor(QThread):
     reading_started = Signal(str)
     reading_changed = Signal(object)
     reading_finished = Signal(bool, str)
+    local_voice_requested = Signal(str)
     dictation_started = Signal(bool, str)
     dictation_finished = Signal(bool, str, str)
     clear_finished = Signal(bool, str)
@@ -192,6 +193,10 @@ class BrowserMonitor(QThread):
         self._wake_event = threading.Event()
         self._dictation_initial_text: dict[str, str] = {}
         self._last_status = ""
+        self._use_browser_voice = True
+
+    def set_use_browser_voice(self, enabled: bool) -> None:
+        self._use_browser_voice = bool(enabled)
 
     def request_stop(self) -> None:
         self._stop_requested = True
@@ -689,6 +694,19 @@ class BrowserMonitor(QThread):
                     "Timed out while waiting for ChatGPT's reply",
                 )
                 state.active_response = None
+            return
+
+        if not self._use_browser_voice:
+            logger.info(
+                "ChatGPT response is stable; handing reply to local voice "
+                f"characters={len(snapshot.text)}"
+            )
+            self.response_finished.emit(
+                True,
+                "Reply complete · Starting local voice",
+            )
+            self.local_voice_requested.emit(snapshot.text)
+            state.active_response = None
             return
 
         logger.info(

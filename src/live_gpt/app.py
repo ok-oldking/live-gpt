@@ -12,6 +12,7 @@ from PySide6.QtCore import (
     QRect,
     QSettings,
     QSize,
+    QThread,
     QTimer,
     Signal,
     Qt,
@@ -39,11 +40,14 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QKeySequenceEdit,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMenu,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QProgressBar,
+    QScrollArea,
     QStackedWidget,
     QSystemTrayIcon,
     QVBoxLayout,
@@ -60,6 +64,12 @@ from .logger import Logger, config_logger, shutdown_logger
 from .hotkeys import GlobalHotkeyMonitor, HotkeyBinding
 from .screen_capture import CaptureSource, capture_webp, list_capture_sources
 from .window_focus import ForegroundWindowRestorer
+from .voice_models import (
+    LocalDictationSession,
+    STT_MODELS,
+    SherpaVoiceManager,
+    TTS_MODELS,
+)
 
 
 ASSET_DIRECTORY = Path(__file__).resolve().parent / "assets"
@@ -100,6 +110,119 @@ class _PendingDictationCapture:
     error: str | None = None
 
 
+class _VoiceOperationThread(QThread):
+    progress = Signal(str, object)
+    completed = Signal(bool, str, object)
+
+    def __init__(
+        self,
+        manager: SherpaVoiceManager,
+        action: str,
+        model_type: str = "",
+        model_key: str = "",
+    ) -> None:
+        super().__init__()
+        self.manager = manager
+        self.action = action
+        self.model_type = model_type
+        self.model_key = model_key
+
+    def run(self) -> None:
+        try:
+            result: object = None
+            if self.action == "status":
+                dependency_ok, dependency_message = (
+                    self.manager.dependency_status()
+                )
+                model_ok, model_message = self.manager.model_status(
+                    self.model_type, self.model_key
+                )
+                result = {
+                    "dependency_ok": dependency_ok,
+                    "dependency_message": dependency_message,
+                    "model_ok": model_ok,
+                    "model_message": model_message,
+                }
+                message = dependency_message
+            elif self.action == "install":
+                message = self.manager.install_dependencies(
+                    self.progress.emit
+                )
+            elif self.action == "download":
+                message = self.manager.download_model(
+                    self.model_type,
+                    self.model_key,
+                    self.progress.emit,
+                )
+            else:
+                raise RuntimeError(f"Unknown voice operation {self.action!r}")
+            self.completed.emit(True, message, result)
+        except Exception as error:
+            logger.error(f"Voice operation {self.action!r} failed", error)
+            self.completed.emit(False, str(error), None)
+
+
+class _LocalDictationThread(QThread):
+    listening = Signal()
+    partial_text = Signal(str)
+    completed = Signal(bool, str, str)
+
+    def __init__(self, session: LocalDictationSession) -> None:
+        super().__init__()
+        self.session = session
+
+    def stop_recording(self, *, cancel: bool = False) -> None:
+        self.session.stop(cancel=cancel)
+
+    def run(self) -> None:
+        success, text, message = self.session.run(
+            self.listening.emit,
+            self.partial_text.emit,
+        )
+        self.completed.emit(success, text, message)
+
+
+class _LocalSpeechThread(QThread):
+    started = Signal(str)
+    progress = Signal(object)
+    completed = Signal(bool, str)
+
+    def __init__(
+        self,
+        manager: SherpaVoiceManager,
+        tts_model: str,
+        text: str,
+        speaker: int = 0,
+    ) -> None:
+        super().__init__()
+        self.manager = manager
+        self.tts_model = tts_model
+        self.text = text
+        self.speaker = speaker
+
+    def run(self) -> None:
+        try:
+            import sounddevice as sd
+
+            synthesis_started = time.perf_counter()
+            samples, sample_rate = self.manager.synthesize(
+                self.tts_model, self.text, self.speaker
+            )
+            latency_ms = (time.perf_counter() - synthesis_started) * 1000
+            audio_seconds = len(samples) / sample_rate
+            self.started.emit("Playing with Sherpa-ONNX…")
+            self.progress.emit({"text": self.text, "fraction": 0.0})
+            sd.play(samples, sample_rate, blocking=True)
+            self.progress.emit({"text": self.text, "fraction": 1.0})
+            self.completed.emit(
+                True,
+                f"Generated in {latency_ms:.0f} ms · audio {audio_seconds:.1f} s",
+            )
+        except Exception as error:
+            logger.error("Local voice playback failed", error)
+            self.completed.emit(False, f"Local voice playback failed: {error}")
+
+
 class HotkeyConfigDialog(QDialog):
     """Edit Live GPT settings, including pass-through global shortcuts."""
 
@@ -111,17 +234,29 @@ class HotkeyConfigDialog(QDialog):
         parent: QWidget | None = None,
         *,
         language: str = "en",
+        recording_backend: str = "web",
+        playing_backend: str = "web",
+        stt_model: str = "zh_zipformer_ctc_int8_2025_07_03",
+        tts_model: str = "kokoro_multilang_v1_0",
+        tts_speaker: int = 0,
+        voice_manager: SherpaVoiceManager | None = None,
     ) -> None:
         super().__init__(parent)
         self._title_drag_offset: QPoint | None = None
+        self.voice_manager = voice_manager or SherpaVoiceManager()
+        self._voice_worker: _VoiceOperationThread | None = None
+        self._voice_record_thread: _LocalDictationThread | None = None
+        self._voice_play_thread: _LocalSpeechThread | None = None
+        self._voice_status_checked = {"stt": False, "tts": False}
+        self._voice_operation_type = "stt"
         self.setObjectName("settingsDialog")
         self.setWindowTitle("Live GPT settings")
         self.setWindowFlags(
             Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setMinimumSize(720, 480)
-        self.resize(780, 520)
+        self.setMinimumSize(860, 680)
+        self.resize(940, 820)
 
         self.hold_microphone_edit = self._sequence_edit(hold_microphone)
         self.send_edit = self._sequence_edit(send)
@@ -188,13 +323,25 @@ class HotkeyConfigDialog(QDialog):
             "Language",
             LANGUAGE_ICON_PATH,
         )
+        self.recording_nav_button = self._navigation_button(
+            "Recording",
+            MICROPHONE_ICON_PATH,
+        )
+        self.playing_nav_button = self._navigation_button(
+            "Playing",
+            SEND_ICON_PATH,
+        )
         self.navigation_group = QButtonGroup(self)
         self.navigation_group.setExclusive(True)
         self.navigation_group.addButton(self.shortcuts_nav_button, 0)
         self.navigation_group.addButton(self.language_nav_button, 1)
+        self.navigation_group.addButton(self.recording_nav_button, 2)
+        self.navigation_group.addButton(self.playing_nav_button, 3)
         self.shortcuts_nav_button.setChecked(True)
         navigation_layout.addWidget(self.shortcuts_nav_button)
         navigation_layout.addWidget(self.language_nav_button)
+        navigation_layout.addWidget(self.recording_nav_button)
+        navigation_layout.addWidget(self.playing_nav_button)
         navigation_layout.addStretch()
         body_layout.addWidget(navigation)
 
@@ -296,33 +443,290 @@ class HotkeyConfigDialog(QDialog):
         language_page_layout.addWidget(language_card)
         language_page_layout.addStretch()
 
+        self.recording_section = QWidget()
+        self.recording_section.setObjectName("settingsPage")
+        recording_layout = QVBoxLayout(self.recording_section)
+        recording_layout.setContentsMargins(0, 0, 0, 0)
+        recording_layout.setSpacing(12)
+        recording_title = QLabel("Recording")
+        recording_title.setObjectName("settingsPageTitle")
+        recording_description = QLabel(
+            "Configure microphone transcription independently from voice playback."
+        )
+        recording_description.setObjectName("settingsPageDescription")
+        recording_description.setWordWrap(True)
+        recording_layout.addWidget(recording_title)
+        recording_layout.addWidget(recording_description)
+
+        recording_backend_card = QFrame()
+        recording_backend_card.setObjectName("settingsCard")
+        recording_backend_layout = QVBoxLayout(recording_backend_card)
+        recording_backend_layout.setContentsMargins(18, 16, 18, 16)
+        recording_backend_layout.setSpacing(10)
+        recording_backend_title = QLabel("Recording engine")
+        recording_backend_title.setObjectName("settingsCardTitle")
+        recording_backend_layout.addWidget(recording_backend_title)
+        self.recording_backend_combo = QComboBox()
+        self.recording_backend_combo.setObjectName("voiceCombo")
+        self.recording_backend_combo.addItem("Web built-in (browser)", "web")
+        self.recording_backend_combo.addItem("Sherpa-ONNX (local)", "sherpa")
+        recording_backend_index = self.recording_backend_combo.findData(
+            recording_backend
+        )
+        self.recording_backend_combo.setCurrentIndex(
+            max(recording_backend_index, 0)
+        )
+        recording_backend_layout.addWidget(self.recording_backend_combo)
+        recording_layout.addWidget(recording_backend_card)
+
+        self.recording_sherpa_card = QFrame()
+        self.recording_sherpa_card.setObjectName("settingsCard")
+        recording_sherpa_layout = QVBoxLayout(self.recording_sherpa_card)
+        recording_sherpa_layout.setContentsMargins(18, 16, 18, 16)
+        recording_sherpa_layout.setSpacing(10)
+        recording_sherpa_title = QLabel("Local speech to text")
+        recording_sherpa_title.setObjectName("settingsCardTitle")
+        recording_sherpa_layout.addWidget(recording_sherpa_title)
+        recording_runtime_row = QHBoxLayout()
+        recording_runtime_row.setSpacing(8)
+        self.recording_check_button = QPushButton("Check")
+        self.recording_install_button = QPushButton("Install / Repair runtime")
+        for button in (self.recording_check_button, self.recording_install_button):
+            button.setObjectName("voiceActionButton")
+            recording_runtime_row.addWidget(button)
+        recording_runtime_row.addStretch()
+        recording_sherpa_layout.addLayout(recording_runtime_row)
+
+        self.stt_model_combo = QComboBox()
+        self.stt_model_combo.setObjectName("voiceCombo")
+        for model in STT_MODELS.values():
+            size_mb = round(model.asset.size / 1024 / 1024)
+            self.stt_model_combo.addItem(
+                f"[{model.mode}] {model.language} · {model.label} · {size_mb} MB",
+                model.key,
+            )
+        stt_index = self.stt_model_combo.findData(stt_model)
+        self.stt_model_combo.setCurrentIndex(max(stt_index, 0))
+        recording_sherpa_layout.addWidget(self.stt_model_combo)
+        self.stt_model_description = QLabel()
+        self.stt_model_description.setObjectName("settingsNote")
+        self.stt_model_description.setWordWrap(True)
+        recording_sherpa_layout.addWidget(self.stt_model_description)
+        self.stt_test_result = QLineEdit()
+        self.stt_test_result.setObjectName("voiceTestText")
+        self.stt_test_result.setReadOnly(True)
+        self.stt_test_result.setPlaceholderText(
+            "Live transcription appears here while streaming"
+        )
+        recording_sherpa_layout.addWidget(self.stt_test_result)
+        stt_action_row = QHBoxLayout()
+        stt_action_row.setSpacing(8)
+        self.stt_download_button = QPushButton("Download STT model")
+        self.voice_record_button = QPushButton("Record microphone")
+        for button in (self.stt_download_button, self.voice_record_button):
+            button.setObjectName("voiceActionButton")
+            stt_action_row.addWidget(button)
+        stt_action_row.addStretch()
+        recording_sherpa_layout.addLayout(stt_action_row)
+        self.recording_progress = QProgressBar()
+        self.recording_progress.setObjectName("voiceProgress")
+        self.recording_progress.setRange(0, 100)
+        self.recording_progress.hide()
+        recording_sherpa_layout.addWidget(self.recording_progress)
+        self.recording_status = QLabel(
+            "Select Check to validate the runtime and selected recording model."
+        )
+        self.recording_status.setObjectName("voiceStatus")
+        self.recording_status.setWordWrap(True)
+        recording_sherpa_layout.addWidget(self.recording_status)
+        recording_layout.addWidget(self.recording_sherpa_card)
+        recording_layout.addStretch()
+
+        self.playing_section = QWidget()
+        self.playing_section.setObjectName("settingsPage")
+        playing_layout = QVBoxLayout(self.playing_section)
+        playing_layout.setContentsMargins(0, 0, 0, 0)
+        playing_layout.setSpacing(12)
+        playing_title = QLabel("Playing")
+        playing_title.setObjectName("settingsPageTitle")
+        playing_description = QLabel(
+            "Configure reply speech independently from microphone transcription."
+        )
+        playing_description.setObjectName("settingsPageDescription")
+        playing_description.setWordWrap(True)
+        playing_layout.addWidget(playing_title)
+        playing_layout.addWidget(playing_description)
+
+        playing_backend_card = QFrame()
+        playing_backend_card.setObjectName("settingsCard")
+        playing_backend_layout = QVBoxLayout(playing_backend_card)
+        playing_backend_layout.setContentsMargins(18, 16, 18, 16)
+        playing_backend_layout.setSpacing(10)
+        playing_backend_title = QLabel("Playback engine")
+        playing_backend_title.setObjectName("settingsCardTitle")
+        playing_backend_layout.addWidget(playing_backend_title)
+        self.playing_backend_combo = QComboBox()
+        self.playing_backend_combo.setObjectName("voiceCombo")
+        self.playing_backend_combo.addItem("Web built-in (browser)", "web")
+        self.playing_backend_combo.addItem("Sherpa-ONNX (local)", "sherpa")
+        playing_backend_index = self.playing_backend_combo.findData(
+            playing_backend
+        )
+        self.playing_backend_combo.setCurrentIndex(max(playing_backend_index, 0))
+        playing_backend_layout.addWidget(self.playing_backend_combo)
+        playing_layout.addWidget(playing_backend_card)
+
+        self.playing_sherpa_card = QFrame()
+        self.playing_sherpa_card.setObjectName("settingsCard")
+        playing_sherpa_layout = QVBoxLayout(self.playing_sherpa_card)
+        playing_sherpa_layout.setContentsMargins(18, 16, 18, 16)
+        playing_sherpa_layout.setSpacing(10)
+        playing_sherpa_title = QLabel("Local text to speech")
+        playing_sherpa_title.setObjectName("settingsCardTitle")
+        playing_sherpa_layout.addWidget(playing_sherpa_title)
+        playing_runtime_row = QHBoxLayout()
+        playing_runtime_row.setSpacing(8)
+        self.playing_check_button = QPushButton("Check")
+        self.playing_install_button = QPushButton("Install / Repair runtime")
+        for button in (self.playing_check_button, self.playing_install_button):
+            button.setObjectName("voiceActionButton")
+            playing_runtime_row.addWidget(button)
+        playing_runtime_row.addStretch()
+        playing_sherpa_layout.addLayout(playing_runtime_row)
+
+        self.tts_model_combo = QComboBox()
+        self.tts_model_combo.setObjectName("voiceCombo")
+        for model in TTS_MODELS.values():
+            size_mb = round(model.asset.size / 1024 / 1024)
+            self.tts_model_combo.addItem(
+                f"[Offline] {model.label} · {model.languages} · {size_mb} MB",
+                model.key,
+            )
+        tts_index = self.tts_model_combo.findData(tts_model)
+        self.tts_model_combo.setCurrentIndex(max(tts_index, 0))
+        playing_sherpa_layout.addWidget(self.tts_model_combo)
+        self.tts_model_description = QLabel()
+        self.tts_model_description.setObjectName("settingsNote")
+        self.tts_model_description.setWordWrap(True)
+        playing_sherpa_layout.addWidget(self.tts_model_description)
+
+        speaker_row = QHBoxLayout()
+        speaker_row.setSpacing(8)
+        speaker_label = QLabel("Speaker")
+        self.tts_speaker_combo = QComboBox()
+        self.tts_speaker_combo.setObjectName("voiceCombo")
+        speaker_row.addWidget(speaker_label)
+        speaker_row.addWidget(self.tts_speaker_combo, 1)
+        playing_sherpa_layout.addLayout(speaker_row)
+
+        self.voice_test_text = QLineEdit()
+        self.voice_test_text.setObjectName("voiceTestText")
+        self.voice_test_text.setPlaceholderText("Text to synthesize")
+        tts_action_row = QHBoxLayout()
+        tts_action_row.setSpacing(8)
+        self.tts_download_button = QPushButton("Download TTS model")
+        self.voice_play_button = QPushButton("Play text")
+        for button in (self.tts_download_button, self.voice_play_button):
+            button.setObjectName("voiceActionButton")
+            tts_action_row.addWidget(button)
+        playing_sherpa_layout.addWidget(self.voice_test_text)
+        playing_sherpa_layout.addLayout(tts_action_row)
+        self.playing_progress = QProgressBar()
+        self.playing_progress.setObjectName("voiceProgress")
+        self.playing_progress.setRange(0, 100)
+        self.playing_progress.hide()
+        playing_sherpa_layout.addWidget(self.playing_progress)
+        self.playing_status = QLabel(
+            "Select Check to validate the runtime and selected playback model."
+        )
+        self.playing_status.setObjectName("voiceStatus")
+        self.playing_status.setWordWrap(True)
+        playing_sherpa_layout.addWidget(self.playing_status)
+        playing_layout.addWidget(self.playing_sherpa_card)
+        playing_layout.addStretch()
+
+        self.recording_scroll = QScrollArea()
+        self.recording_scroll.setObjectName("settingsVoiceScroll")
+        self.recording_scroll.setWidgetResizable(True)
+        self.recording_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.recording_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.recording_scroll.setWidget(self.recording_section)
+        self.playing_scroll = QScrollArea()
+        self.playing_scroll.setObjectName("settingsVoiceScroll")
+        self.playing_scroll.setWidgetResizable(True)
+        self.playing_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.playing_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.playing_scroll.setWidget(self.playing_section)
         self.settings_pages.addWidget(self.hotkey_section)
         self.settings_pages.addWidget(self.language_section)
+        self.settings_pages.addWidget(self.recording_scroll)
+        self.settings_pages.addWidget(self.playing_scroll)
         self.shortcuts_nav_button.clicked.connect(
             lambda checked: checked and self.settings_pages.setCurrentIndex(0)
         )
         self.language_nav_button.clicked.connect(
             lambda checked: checked and self.settings_pages.setCurrentIndex(1)
         )
+        self.recording_nav_button.clicked.connect(self._show_recording_page)
+        self.playing_nav_button.clicked.connect(self._show_playing_page)
+        self.recording_backend_combo.currentIndexChanged.connect(
+            self._sync_recording_controls
+        )
+        self.playing_backend_combo.currentIndexChanged.connect(
+            self._sync_playing_controls
+        )
+        self.stt_model_combo.currentIndexChanged.connect(self._stt_model_changed)
+        self.tts_model_combo.currentIndexChanged.connect(self._tts_model_changed)
+        self.recording_check_button.clicked.connect(
+            lambda: self._start_voice_operation("status", "stt")
+        )
+        self.recording_install_button.clicked.connect(
+            lambda: self._start_voice_operation("install", "stt")
+        )
+        self.playing_check_button.clicked.connect(
+            lambda: self._start_voice_operation("status", "tts")
+        )
+        self.playing_install_button.clicked.connect(
+            lambda: self._start_voice_operation("install", "tts")
+        )
+        self.stt_download_button.clicked.connect(
+            lambda: self._start_voice_operation("download", "stt")
+        )
+        self.tts_download_button.clicked.connect(
+            lambda: self._start_voice_operation("download", "tts")
+        )
+        self.voice_record_button.clicked.connect(self._toggle_voice_record_test)
+        self.voice_play_button.clicked.connect(self._start_voice_play_test)
+        self._pending_tts_speaker = tts_speaker
+        self._stt_model_changed()
+        self._tts_model_changed()
+        self._sync_recording_controls()
+        self._sync_playing_controls()
         content_layout.addWidget(self.settings_pages, 1)
 
-        buttons = QDialogButtonBox(
+        self.settings_buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
             | QDialogButtonBox.StandardButton.Cancel
         )
-        buttons.setObjectName("settingsButtons")
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setText(
+        self.settings_buttons.setObjectName("settingsButtons")
+        self.settings_buttons.button(QDialogButtonBox.StandardButton.Ok).setText(
             "Save changes"
         )
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setToolTip(
+        self.settings_buttons.button(QDialogButtonBox.StandardButton.Ok).setToolTip(
             "Save hotkey settings"
         )
-        buttons.button(QDialogButtonBox.StandardButton.Cancel).setToolTip(
+        self.settings_buttons.button(
+            QDialogButtonBox.StandardButton.Cancel
+        ).setToolTip(
             "Close without saving"
         )
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        content_layout.addWidget(buttons)
+        self.settings_buttons.accepted.connect(self.accept)
+        self.settings_buttons.rejected.connect(self.reject)
+        content_layout.addWidget(self.settings_buttons)
         body_layout.addWidget(content, 1)
         shell_layout.addWidget(body, 1)
 
@@ -380,6 +784,8 @@ class HotkeyConfigDialog(QDialog):
             QWidget#settingsBody,
             QWidget#settingsContent,
             QWidget#settingsPage,
+            QScrollArea#settingsVoiceScroll,
+            QScrollArea#settingsVoiceScroll QWidget#qt_scrollarea_viewport,
             QStackedWidget#settingsPages {
                 background: transparent;
                 border: none;
@@ -454,7 +860,9 @@ class HotkeyConfigDialog(QDialog):
                 border: none;
             }
             QKeySequenceEdit QLineEdit,
-            QComboBox#languageCombo {
+            QComboBox#languageCombo,
+            QComboBox#voiceCombo,
+            QLineEdit#voiceTestText {
                 min-height: 34px;
                 min-width: 230px;
                 padding: 0 10px;
@@ -467,11 +875,62 @@ class HotkeyConfigDialog(QDialog):
             QKeySequenceEdit QLineEdit:focus {
                 border-color: rgba(76, 201, 240, 190);
             }
-            QComboBox#languageCombo QAbstractItemView {
+            QComboBox#languageCombo QAbstractItemView,
+            QComboBox#voiceCombo QAbstractItemView {
                 color: #f5f7ff;
                 background-color: #182342;
                 border: 1px solid rgba(130, 165, 230, 85);
                 selection-background-color: rgb(38, 112, 145);
+            }
+            QScrollArea#settingsVoiceScroll QScrollBar:vertical {
+                width: 10px;
+                margin: 0;
+                background: rgba(5, 10, 28, 130);
+                border: none;
+            }
+            QScrollArea#settingsVoiceScroll QScrollBar::handle:vertical {
+                min-height: 36px;
+                background: rgba(76, 201, 240, 120);
+                border-radius: 5px;
+            }
+            QScrollArea#settingsVoiceScroll QScrollBar::add-line:vertical,
+            QScrollArea#settingsVoiceScroll QScrollBar::sub-line:vertical {
+                height: 0;
+            }
+            QPushButton#voiceActionButton {
+                min-height: 32px;
+                padding: 0 12px;
+                color: #f5f7ff;
+                background-color: rgba(38, 112, 145, 125);
+                border: 1px solid rgba(76, 201, 240, 95);
+                border-radius: 8px;
+            }
+            QPushButton#voiceActionButton:hover {
+                background-color: rgba(44, 140, 175, 170);
+            }
+            QPushButton#voiceActionButton:disabled {
+                color: #6f7893;
+                background-color: rgba(40, 50, 80, 80);
+                border-color: rgba(100, 115, 150, 45);
+            }
+            QProgressBar#voiceProgress {
+                min-height: 8px;
+                max-height: 8px;
+                color: transparent;
+                background-color: rgba(5, 10, 28, 165);
+                border: none;
+                border-radius: 4px;
+            }
+            QProgressBar#voiceProgress::chunk {
+                background-color: rgb(76, 201, 240);
+                border-radius: 4px;
+            }
+            QLabel#voiceStatus {
+                color: #9eacce;
+                font-size: 12px;
+            }
+            QLabel#voiceStatus[error="true"] {
+                color: #ff8d9b;
             }
             QDialogButtonBox#settingsButtons QPushButton {
                 min-height: 34px;
@@ -494,6 +953,287 @@ class HotkeyConfigDialog(QDialog):
             }
             """
         )
+
+    def _show_recording_page(self, checked: bool) -> None:
+        if checked:
+            self.settings_pages.setCurrentIndex(2)
+            self._check_voice_page_when_needed("stt")
+
+    def _show_playing_page(self, checked: bool) -> None:
+        if checked:
+            self.settings_pages.setCurrentIndex(3)
+            self._check_voice_page_when_needed("tts")
+
+    def _check_voice_page_when_needed(self, model_type: str) -> None:
+        if (
+            self._voice_backend(model_type) == "sherpa"
+            and not self._voice_status_checked[model_type]
+        ):
+            self._voice_status_checked[model_type] = True
+            QTimer.singleShot(
+                0,
+                lambda: self._start_voice_operation("status", model_type),
+            )
+
+    def _sync_recording_controls(self) -> None:
+        enabled = self.recording_backend() == "sherpa"
+        self.recording_sherpa_card.setVisible(enabled)
+        if enabled and self.settings_pages.currentIndex() == 2:
+            self._check_voice_page_when_needed("stt")
+
+    def _sync_playing_controls(self) -> None:
+        enabled = self.playing_backend() == "sherpa"
+        self.playing_sherpa_card.setVisible(enabled)
+        if enabled and self.settings_pages.currentIndex() == 3:
+            self._check_voice_page_when_needed("tts")
+
+    def _stt_model_changed(self) -> None:
+        model = STT_MODELS[self.stt_model()]
+        self.stt_model_description.setText(model.description)
+        self.stt_test_result.clear()
+        self._voice_status_checked["stt"] = False
+
+    def _tts_model_changed(self) -> None:
+        model = TTS_MODELS[self.tts_model()]
+        self.tts_model_description.setText(model.description)
+        selected_speaker = getattr(self, "_pending_tts_speaker", 0)
+        self.tts_speaker_combo.clear()
+        for speaker in range(model.speakers):
+            self.tts_speaker_combo.addItem(f"Speaker {speaker + 1}", speaker)
+        speaker_index = self.tts_speaker_combo.findData(
+            min(selected_speaker, model.speakers - 1)
+        )
+        self.tts_speaker_combo.setCurrentIndex(max(speaker_index, 0))
+        self._pending_tts_speaker = 0
+        self.tts_speaker_combo.setEnabled(model.speakers > 1)
+        self.voice_test_text.setText(model.test_text)
+        self._voice_status_checked["tts"] = False
+
+    def _voice_backend(self, model_type: str) -> str:
+        return (
+            self.recording_backend()
+            if model_type == "stt"
+            else self.playing_backend()
+        )
+
+    def _voice_widgets(self, model_type: str) -> tuple[QLabel, QProgressBar]:
+        if model_type == "stt":
+            return self.recording_status, self.recording_progress
+        return self.playing_status, self.playing_progress
+
+    def _start_voice_operation(
+        self, action: str, model_type: str = ""
+    ) -> None:
+        if self._voice_worker is not None or self._voice_test_running():
+            return
+        if self._voice_backend(model_type) != "sherpa":
+            return
+        if action == "status":
+            self._voice_status_checked[model_type] = True
+        self._set_voice_busy(True)
+        self._voice_operation_type = model_type
+        status, progress = self._voice_widgets(model_type)
+        progress.show()
+        progress.setRange(0, 0)
+        status.setProperty("error", False)
+        status.setText(
+            {
+                "status": "Checking versions and file integrity…",
+                "install": "Installing the local voice runtime…",
+                "download": "Preparing verified model download…",
+            }[action]
+        )
+        self._refresh_voice_status_style(status)
+        worker = _VoiceOperationThread(
+            self.voice_manager,
+            action,
+            model_type,
+            self.stt_model() if model_type == "stt" else self.tts_model(),
+        )
+        self._voice_worker = worker
+        worker.progress.connect(self._voice_operation_progress)
+        worker.completed.connect(self._voice_operation_completed)
+        worker.finished.connect(self._voice_operation_thread_finished)
+        worker.start()
+
+    def _voice_operation_progress(
+        self,
+        message: str,
+        percent: object,
+    ) -> None:
+        status, progress = self._voice_widgets(self._voice_operation_type)
+        status.setText(message)
+        if isinstance(percent, int):
+            progress.setRange(0, 100)
+            progress.setValue(percent)
+        else:
+            progress.setRange(0, 0)
+
+    def _voice_operation_completed(
+        self,
+        success: bool,
+        message: str,
+        result: object,
+    ) -> None:
+        if isinstance(result, dict) and "dependency_ok" in result:
+            success = bool(result["dependency_ok"] and result["model_ok"])
+            message = (
+                f"Runtime: {result['dependency_message']}\n"
+                f"Model: {result['model_message']}"
+            )
+        if not success:
+            logger.error(f"Voice setup check failed: {message}")
+        status, progress = self._voice_widgets(self._voice_operation_type)
+        status.setProperty("error", not success)
+        status.setText(message)
+        self._refresh_voice_status_style(status)
+        progress.setRange(0, 100)
+        progress.setValue(100 if success else 0)
+        self._set_voice_busy(False)
+
+    def _voice_operation_thread_finished(self) -> None:
+        worker = self._voice_worker
+        self._voice_worker = None
+        if worker is not None:
+            worker.deleteLater()
+        current = self.settings_pages.currentIndex()
+        if current == 2:
+            self._check_voice_page_when_needed("stt")
+        elif current == 3:
+            self._check_voice_page_when_needed("tts")
+
+    def _set_voice_busy(self, busy: bool) -> None:
+        for button in (
+            self.recording_check_button,
+            self.recording_install_button,
+            self.playing_check_button,
+            self.playing_install_button,
+            self.stt_download_button,
+            self.tts_download_button,
+            self.voice_record_button,
+            self.voice_play_button,
+            self.close_button,
+        ):
+            button.setEnabled(not busy)
+        self.recording_backend_combo.setEnabled(not busy)
+        self.playing_backend_combo.setEnabled(not busy)
+        self.stt_model_combo.setEnabled(not busy)
+        self.tts_model_combo.setEnabled(not busy)
+        self.tts_speaker_combo.setEnabled(
+            not busy and TTS_MODELS[self.tts_model()].speakers > 1
+        )
+        self.voice_test_text.setEnabled(not busy)
+        self.settings_buttons.setEnabled(not busy)
+
+    def _voice_test_running(self) -> bool:
+        return (
+            self._voice_record_thread is not None
+            or self._voice_play_thread is not None
+        )
+
+    def _toggle_voice_record_test(self) -> None:
+        if self._voice_record_thread is not None:
+            self.voice_record_button.setText("Transcribing…")
+            self.voice_record_button.setEnabled(False)
+            self._voice_record_thread.stop_recording()
+            return
+        if self._voice_worker is not None or self._voice_play_thread is not None:
+            return
+        self._set_voice_busy(True)
+        self.voice_record_button.setEnabled(True)
+        self.voice_record_button.setText("Starting microphone…")
+        self.stt_test_result.clear()
+        self.recording_status.setProperty("error", False)
+        self.recording_status.setText("Starting the microphone…")
+        self._refresh_voice_status_style(self.recording_status)
+        worker = _LocalDictationThread(
+            LocalDictationSession(self.voice_manager, self.stt_model())
+        )
+        self._voice_record_thread = worker
+        worker.listening.connect(self._voice_record_listening)
+        worker.partial_text.connect(self._voice_record_partial)
+        worker.completed.connect(self._voice_record_completed)
+        worker.finished.connect(self._voice_record_finished)
+        worker.start()
+
+    def _voice_record_listening(self) -> None:
+        streaming = STT_MODELS[self.stt_model()].mode == "Streaming"
+        self.voice_record_button.setText(
+            "Stop recording" if streaming else "Stop & transcribe"
+        )
+        self.recording_status.setText(
+            "Streaming transcription… text updates live."
+            if streaming
+            else "Recording… select Stop when finished."
+        )
+
+    def _voice_record_partial(self, text: str) -> None:
+        self.stt_test_result.setText(text)
+
+    def _voice_record_completed(
+        self, success: bool, text: str, message: str
+    ) -> None:
+        if success and text.strip():
+            self.stt_test_result.setText(text)
+            message = f"{message} · {text}"
+        if not success:
+            logger.error(f"Voice record test failed: {message}")
+        self.recording_status.setProperty("error", not success)
+        self.recording_status.setText(message)
+        self._refresh_voice_status_style(self.recording_status)
+        self._set_voice_busy(False)
+
+    def _voice_record_finished(self) -> None:
+        worker = self._voice_record_thread
+        self._voice_record_thread = None
+        self.voice_record_button.setText("Record microphone")
+        self._set_voice_busy(False)
+        if worker is not None:
+            worker.deleteLater()
+
+    def _start_voice_play_test(self) -> None:
+        if self._voice_worker is not None or self._voice_test_running():
+            return
+        text = self.voice_test_text.text().strip()
+        if not text:
+            text = TTS_MODELS[self.tts_model()].test_text
+            self.voice_test_text.setText(text)
+        self._set_voice_busy(True)
+        self.playing_progress.show()
+        self.playing_progress.setRange(0, 0)
+        self.playing_status.setProperty("error", False)
+        self.playing_status.setText("Generating speech…")
+        self._refresh_voice_status_style(self.playing_status)
+        worker = _LocalSpeechThread(
+            self.voice_manager, self.tts_model(), text, self.tts_speaker()
+        )
+        self._voice_play_thread = worker
+        worker.started.connect(self.playing_status.setText)
+        worker.completed.connect(self._voice_play_completed)
+        worker.finished.connect(self._voice_play_finished)
+        worker.start()
+
+    def _voice_play_completed(self, success: bool, message: str) -> None:
+        if not success:
+            logger.error(f"Voice playback test failed: {message}")
+        self.playing_status.setProperty("error", not success)
+        self.playing_status.setText(message)
+        self._refresh_voice_status_style(self.playing_status)
+        self.playing_progress.setRange(0, 100)
+        self.playing_progress.setValue(100 if success else 0)
+        self._set_voice_busy(False)
+
+    def _voice_play_finished(self) -> None:
+        worker = self._voice_play_thread
+        self._voice_play_thread = None
+        self._set_voice_busy(False)
+        if worker is not None:
+            worker.deleteLater()
+
+    @staticmethod
+    def _refresh_voice_status_style(status: QLabel) -> None:
+        status.style().unpolish(status)
+        status.style().polish(status)
 
     @staticmethod
     def _navigation_button(text: str, icon_path: Path) -> QPushButton:
@@ -550,6 +1290,26 @@ class HotkeyConfigDialog(QDialog):
     def language(self) -> str:
         return "zh" if self.language_combo.currentIndex() == 1 else "en"
 
+    def recording_backend(self) -> str:
+        return str(self.recording_backend_combo.currentData() or "web")
+
+    def playing_backend(self) -> str:
+        return str(self.playing_backend_combo.currentData() or "web")
+
+    def stt_model(self) -> str:
+        return str(
+            self.stt_model_combo.currentData()
+            or "zh_zipformer_ctc_int8_2025_07_03"
+        )
+
+    def tts_model(self) -> str:
+        return str(
+            self.tts_model_combo.currentData() or "kokoro_multilang_v1_0"
+        )
+
+    def tts_speaker(self) -> int:
+        return int(self.tts_speaker_combo.currentData() or 0)
+
     def bindings(self) -> dict[str, HotkeyBinding]:
         bindings = {
             name: HotkeyBinding.from_sequence(sequence)
@@ -561,12 +1321,29 @@ class HotkeyConfigDialog(QDialog):
         return bindings
 
     def accept(self) -> None:
+        if self._voice_worker is not None or self._voice_test_running():
+            QMessageBox.information(
+                self,
+                "Voice setup is running",
+                "Wait for the current voice setup operation to finish.",
+            )
+            return
         try:
             self.bindings()
         except ValueError as error:
             QMessageBox.warning(self, "Invalid hotkey", str(error))
             return
         super().accept()
+
+    def reject(self) -> None:
+        if self._voice_worker is not None:
+            QMessageBox.information(
+                self,
+                "Voice setup is running",
+                "Wait for the current voice setup operation to finish.",
+            )
+            return
+        super().reject()
 
 
 class TranscriptEditor(QPlainTextEdit):
@@ -2127,6 +2904,9 @@ class TrayController:
         self.application = application
         self.icon = QIcon(str(ICON_PATH))
         self.config = Config()
+        self.voice_manager = SherpaVoiceManager()
+        self._local_dictation_thread: _LocalDictationThread | None = None
+        self._local_speech_thread: _LocalSpeechThread | None = None
         self._migrate_legacy_hotkeys()
         self.window = OverlayWindow()
         self.window.set_preferred_capture_source(
@@ -2142,6 +2922,9 @@ class TrayController:
             bool(self.config["auto_hide"])
         )
         self.browser_monitor = BrowserMonitor()
+        self.browser_monitor.set_use_browser_voice(
+            self.config["playing_backend"] == "web"
+        )
         self.selected_chatgpt_tab_id: str | None = None
         self.dictation_tab_id: str | None = None
         self._dictation_state = "idle"
@@ -2201,6 +2984,9 @@ class TrayController:
         )
         self.browser_monitor.reading_finished.connect(
             self.window.finish_reading
+        )
+        self.browser_monitor.local_voice_requested.connect(
+            self._play_local_voice
         )
         self.browser_monitor.dictation_started.connect(
             self._on_dictation_started
@@ -2330,6 +3116,12 @@ class TrayController:
                 self._hotkey_sequences["send_without_screenshot"],
                 self.window,
                 language=str(self.config["language"]),
+                recording_backend=str(self.config["recording_backend"]),
+                playing_backend=str(self.config["playing_backend"]),
+                stt_model=str(self.config["stt_model"]),
+                tts_model=str(self.config["tts_model"]),
+                tts_speaker=int(self.config["tts_speaker"]),
+                voice_manager=self.voice_manager,
             )
             if dialog.exec() != QDialog.DialogCode.Accepted:
                 return
@@ -2344,7 +3136,17 @@ class TrayController:
                     )
                     for name, sequence in sequences.items()
                 }
-                | {"language": dialog.language()}
+                | {
+                    "language": dialog.language(),
+                    "recording_backend": dialog.recording_backend(),
+                    "playing_backend": dialog.playing_backend(),
+                    "stt_model": dialog.stt_model(),
+                    "tts_model": dialog.tts_model(),
+                    "tts_speaker": dialog.tts_speaker(),
+                }
+            )
+            self.browser_monitor.set_use_browser_voice(
+                dialog.playing_backend() == "web"
             )
             self.hotkey_monitor.update_bindings(
                 bindings["hold"],
@@ -2377,6 +3179,34 @@ class TrayController:
         self.window.raise_()
         self.window.activateWindow()
 
+    def _play_local_voice(self, text: str) -> None:
+        if self.config["playing_backend"] != "sherpa" or not text.strip():
+            return
+        if self._local_speech_thread is not None:
+            self.window.finish_reading(
+                False,
+                "Local voice is already playing another reply",
+            )
+            return
+        worker = _LocalSpeechThread(
+            self.voice_manager,
+            str(self.config["tts_model"]),
+            text,
+            int(self.config["tts_speaker"]),
+        )
+        self._local_speech_thread = worker
+        worker.started.connect(self.window.begin_reading)
+        worker.progress.connect(self.window.set_reading_subtitle)
+        worker.completed.connect(self.window.finish_reading)
+        worker.finished.connect(self._local_speech_finished)
+        worker.start()
+
+    def _local_speech_finished(self) -> None:
+        worker = self._local_speech_thread
+        self._local_speech_thread = None
+        if worker is not None:
+            worker.deleteLater()
+
     def start_dictation(self) -> None:
         self._dictation_input_held = True
         state = getattr(self, "_dictation_state", "idle")
@@ -2391,6 +3221,13 @@ class TrayController:
             and self.window.transcript_area.is_showing_response
         ):
             self.window.transcript_area.begin_composing()
+
+        if (
+            getattr(self, "config", {}).get("recording_backend", "web")
+            == "sherpa"
+        ):
+            self._start_local_dictation()
+            return
 
         tab_id = self.selected_chatgpt_tab_id
         if tab_id is None:
@@ -2413,6 +3250,38 @@ class TrayController:
         )
         self.browser_monitor.request_start_dictation(tab_id)
 
+    def _start_local_dictation(self) -> None:
+        if self._local_dictation_thread is not None:
+            return
+        stt_model = str(self.config["stt_model"])
+        logger.info(f"Starting local dictation model={stt_model!r}")
+        self.dictation_tab_id = "local"
+        self._dictation_state = "starting"
+        self._dictation_listening_since = None
+        self.window.begin_dictation_waiting()
+        self.window.set_microphone_state(
+            "recording",
+            "Starting the local microphone…",
+        )
+        session = LocalDictationSession(self.voice_manager, stt_model)
+        worker = _LocalDictationThread(session)
+        self._local_dictation_thread = worker
+        worker.listening.connect(
+            lambda: self._on_dictation_started(
+                True,
+                "Sherpa-ONNX is listening",
+            )
+        )
+        worker.completed.connect(self._on_dictation_finished)
+        worker.finished.connect(self._local_dictation_finished)
+        worker.start()
+
+    def _local_dictation_finished(self) -> None:
+        worker = self._local_dictation_thread
+        self._local_dictation_thread = None
+        if worker is not None:
+            worker.deleteLater()
+
     def finish_dictation(self) -> None:
         self._dictation_input_held = False
         state = getattr(self, "_dictation_state", "idle")
@@ -2422,6 +3291,10 @@ class TrayController:
 
         if state == "starting":
             self.window.set_dictation_cancelling()
+            local_thread = getattr(self, "_local_dictation_thread", None)
+            if local_thread is not None:
+                self._dictation_state = "cancelling"
+                local_thread.stop_recording(cancel=True)
             return
         if state != "listening":
             return
@@ -2433,13 +3306,20 @@ class TrayController:
 
         self._capture_dictation_screenshot_on_release()
         self._dictation_state = "finishing"
-        logger.info(f"Finishing ChatGPT dictation tab_id={tab_id!r}")
+        local = tab_id == "local"
+        logger.info(
+            f"Finishing {'local' if local else 'ChatGPT'} dictation "
+            f"tab_id={tab_id!r}"
+        )
         self.window.set_dictation_finishing()
         self.window.set_microphone_state(
             "recording",
-            "Finishing ChatGPT dictation…",
+            "Transcribing local audio…" if local else "Finishing ChatGPT dictation…",
         )
-        self.browser_monitor.request_finish_dictation(tab_id)
+        if local and self._local_dictation_thread is not None:
+            self._local_dictation_thread.stop_recording()
+        else:
+            self.browser_monitor.request_finish_dictation(tab_id)
 
     def _capture_dictation_screenshot_on_release(self) -> None:
         self._pending_dictation_capture = None
@@ -2486,7 +3366,10 @@ class TrayController:
             "recording",
             "Dictation was too short; cancelling…",
         )
-        self.browser_monitor.request_cancel_dictation(tab_id)
+        if tab_id == "local" and self._local_dictation_thread is not None:
+            self._local_dictation_thread.stop_recording(cancel=True)
+        else:
+            self.browser_monitor.request_cancel_dictation(tab_id)
 
     def _on_dictation_started(self, success: bool, message: str) -> None:
         if success:
@@ -2554,7 +3437,13 @@ class TrayController:
             self._pending_dictation_capture = None
             self.window.schedule_auto_hide()
         if restart and not auto_sent:
-            self.start_dictation()
+            if (
+                getattr(self, "config", {}).get("recording_backend", "web")
+                == "sherpa"
+            ):
+                QTimer.singleShot(0, self.start_dictation)
+            else:
+                self.start_dictation()
 
     def _handle_send_requested(
         self,
@@ -2724,6 +3613,17 @@ class TrayController:
         self._save_window_geometry()
         self.capture_refresh_timer.stop()
         self.hotkey_monitor.stop()
+        if self._local_dictation_thread is not None:
+            self._local_dictation_thread.stop_recording(cancel=True)
+            self._local_dictation_thread.wait(5_000)
+        if self._local_speech_thread is not None:
+            try:
+                import sounddevice as sd
+
+                sd.stop()
+            except Exception:
+                pass
+            self._local_speech_thread.wait(5_000)
         self.browser_monitor.request_stop()
         if not self.browser_monitor.wait(17_000):
             logger.warning("Browser monitor did not stop before application exit")
