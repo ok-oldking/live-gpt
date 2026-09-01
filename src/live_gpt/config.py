@@ -27,9 +27,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "window_locked": False,
     "recording_backend": "web",
     "playing_backend": "web",
+    "pypi_mirror": "default",
+    "qwen_model_source": "huggingface",
     "stt_model": "zh_zipformer_ctc_int8_2025_07_03",
-    "tts_model": "kokoro_multilang_v1_0",
-    "tts_speaker": 0,
+    "tts_model": "qwen3_tts_0_6b_custom_voice",
+    "tts_speaker": "Vivian",
 }
 
 
@@ -62,8 +64,14 @@ def _valid_value(key: str, value: Any, default: Any) -> bool:
         return value == DEFAULT_CONFIG["version"]
     if key == "language":
         return value in ("en", "zh")
-    if key in ("recording_backend", "playing_backend"):
+    if key == "recording_backend":
         return value in ("web", "sherpa")
+    if key == "playing_backend":
+        return value in ("web", "qwen")
+    if key == "pypi_mirror":
+        return value in ("default", "ali", "sjtug")
+    if key == "qwen_model_source":
+        return value in ("huggingface", "modelscope")
     if key == "stt_model":
         return value in (
             "zh_zipformer_ctc_int8_2025_07_03",
@@ -79,14 +87,21 @@ def _valid_value(key: str, value: Any, default: Any) -> bool:
         )
     if key == "tts_model":
         return value in (
-            "kokoro_multilang_v1_0",
-            "supertonic_3_int8",
-            "piper_libritts",
-            "melotts_zh_en",
-            "kitten_tts",
+            "qwen3_tts_0_6b_custom_voice",
+            "qwen3_tts_1_7b_custom_voice",
         )
     if key == "tts_speaker":
-        return value >= 0
+        return value in (
+            "Vivian",
+            "Serena",
+            "Uncle_Fu",
+            "Dylan",
+            "Eric",
+            "Ryan",
+            "Aiden",
+            "Ono_Anna",
+            "Sohee",
+        )
     if key.startswith("hotkey_"):
         return bool(value.strip())
     if key == "window_geometry":
@@ -116,7 +131,14 @@ class Config(dict[str, Any]):
             loaded = dict(loaded)
             legacy_backend = loaded.pop("voice_backend")
             loaded.setdefault("recording_backend", legacy_backend)
-            loaded.setdefault("playing_backend", legacy_backend)
+            loaded.setdefault(
+                "playing_backend",
+                "qwen" if legacy_backend == "sherpa" else "web",
+            )
+            migrated = True
+        if isinstance(loaded, dict) and loaded.get("playing_backend") == "sherpa":
+            loaded = dict(loaded)
+            loaded["playing_backend"] = "qwen"
             migrated = True
         verified, modified = self._verify(loaded)
         dict.__init__(self, verified)

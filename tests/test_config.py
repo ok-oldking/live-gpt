@@ -79,21 +79,27 @@ class ConfigTests(unittest.TestCase):
             config = Config(path)
 
             config["recording_backend"] = "sherpa"
-            config["playing_backend"] = "web"
+            config["playing_backend"] = "qwen"
+            config["pypi_mirror"] = "sjtug"
+            config["qwen_model_source"] = "modelscope"
             config["stt_model"] = "en_moonshine_tiny_int8"
-            config["tts_model"] = "kitten_tts"
-            config["tts_speaker"] = 3
+            config["tts_model"] = "qwen3_tts_1_7b_custom_voice"
+            config["tts_speaker"] = "Ryan"
             config["recording_backend"] = "unknown"
             config["playing_backend"] = "unknown"
+            config["pypi_mirror"] = "unknown"
+            config["qwen_model_source"] = "unknown"
             config["stt_model"] = "unknown"
             config["tts_model"] = "unknown"
-            config["tts_speaker"] = -1
+            config["tts_speaker"] = "unknown"
 
             self.assertEqual(config["recording_backend"], "sherpa")
-            self.assertEqual(config["playing_backend"], "web")
+            self.assertEqual(config["playing_backend"], "qwen")
+            self.assertEqual(config["pypi_mirror"], "sjtug")
+            self.assertEqual(config["qwen_model_source"], "modelscope")
             self.assertEqual(config["stt_model"], "en_moonshine_tiny_int8")
-            self.assertEqual(config["tts_model"], "kitten_tts")
-            self.assertEqual(config["tts_speaker"], 3)
+            self.assertEqual(config["tts_model"], "qwen3_tts_1_7b_custom_voice")
+            self.assertEqual(config["tts_speaker"], "Ryan")
 
     def test_legacy_voice_backend_migrates_to_both_independent_backends(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -107,11 +113,41 @@ class ConfigTests(unittest.TestCase):
             config = Config(path)
 
             self.assertEqual(config["recording_backend"], "sherpa")
-            self.assertEqual(config["playing_backend"], "sherpa")
+            self.assertEqual(config["playing_backend"], "qwen")
             self.assertNotIn("voice_backend", config)
             saved = json.loads(path.read_text(encoding="utf-8"))
             self.assertNotIn("voice_backend", saved)
             self.assertEqual(saved["recording_backend"], "sherpa")
+
+    def test_removed_sherpa_playback_migrates_to_qwen(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            old = dict(DEFAULT_CONFIG)
+            old["playing_backend"] = "sherpa"
+            path.write_text(json.dumps(old), encoding="utf-8")
+
+            config = Config(path)
+
+            self.assertEqual(config["playing_backend"], "qwen")
+            self.assertEqual(
+                json.loads(path.read_text(encoding="utf-8"))["playing_backend"],
+                "qwen",
+            )
+
+    def test_removed_pypi_mirror_migrates_to_default(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            old = dict(DEFAULT_CONFIG)
+            old["pypi_mirror"] = "tsinghua"
+            path.write_text(json.dumps(old), encoding="utf-8")
+
+            config = Config(path)
+
+            self.assertEqual(config["pypi_mirror"], "default")
+            self.assertEqual(
+                json.loads(path.read_text(encoding="utf-8"))["pypi_mirror"],
+                "default",
+            )
 
 
 if __name__ == "__main__":

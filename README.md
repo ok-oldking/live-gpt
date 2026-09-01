@@ -67,18 +67,46 @@ dictation processing time does not change the captured moment.
 The **Configure** button opens the application settings, organized into
 Shortcuts, Language, Recording, and Playing pages in the left navigation. English and
 Chinese can be selected as a preview, but the selection does not change the UI
-yet. Recording and Playing each independently choose ChatGPT's browser engine
-or local Sherpa-ONNX; local controls stay hidden when the corresponding web
-engine is selected. The STT catalog includes five Mandarin and five English options;
-the TTS catalog includes Kokoro, Supertonic 3, Piper LibriTTS, MeloTTS, and
-KittenTTS, with speaker selection where the model supports multiple voices. It
-installs a pinned
-Sherpa-ONNX, NumPy, and audio runtime (including their transitive dependencies)
-through the current Python interpreter only when requested, verifies installed
-wheel files and versions, and validates model
-downloads against their published size and SHA-256 checksum. **Record
+yet. Every valid change is saved immediately, so the styled title-bar close
+button is the only dismissal control and there is no separate Save Changes step.
+Recording independently chooses the browser or local Sherpa-ONNX, while
+Playing independently chooses the browser or local
+[Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS). Local controls
+stay hidden when the corresponding web engine is selected. The STT catalog
+includes five Mandarin and five English options. Playback offers Qwen3-TTS
+CustomVoice 0.6B and 1.7B models with nine named Chinese, English, Japanese,
+and Korean speakers. Local Qwen playback requires a detected NVIDIA GPU and is
+blocked when CUDA-enabled PyTorch is unavailable. Runtime repair installs a
+matched CUDA 12.6 PyTorch/Torchaudio build from PyTorch's NVIDIA wheel index;
+the selected PyPI mirror is added as the dependency index for that installation.
+If CPU PyTorch was already loaded by an earlier playback attempt, restart Live
+GPT after the repair. It installs each provider's pinned runtime and related
+dependencies through the current Python interpreter only when requested,
+verifies package versions and wheel integrity, and builds local SHA-256 model
+manifests. Qwen models can be downloaded from Hugging Face (the default) or
+ModelScope; the source selection is saved immediately. Models are stored under
+the working directory's `models` folder and loaded from that local path.
+If the selected hub client is missing, Download installs and verifies it through
+the selected PyPI mirror before fetching the model. Installer output is
+streamed into the app log, with its latest two lines visible beneath setup
+progress. Pip's progress stream is forced on for GUI installs and rendered as
+a download-description line followed by a live bar with downloaded size,
+transfer speed, and ETA. Repeated progress samples update that bottom line in
+place. The exact pip and
+model-download commands are logged before execution. Active
+dependency installs
+and model downloads can be cancelled from the settings row; this terminates the
+child process and removes temporary model staging files.
+The install rows can use official PyPI, Aliyun, or Shanghai Jiao Tong
+University's SJTUG mirror without changing the user's global pip configuration;
+the mirror choice is shared by Recording and Playing and saved in the app
+configuration. Aliyun and SJTUG modes also download CUDA PyTorch from their
+dedicated `pytorch-wheels/cu126` mirrors. Aliyun publishes these CUDA wheels
+under plain version labels, so the installer uses `2.11.0` there instead of the
+`2.11.0+cu126` label used by the official and SJTUG indexes.
+**Record
 microphone** tests the selected STT model, and **Play text** tests the selected
-TTS model and speaker. Offline and streaming models are labeled explicitly.
+Qwen model and speaker. Offline and streaming STT models are labeled explicitly.
 Streaming recording models decode microphone chunks continuously and update the
 test transcript in real time. Each test reports its inference or generation latency.
 Hotkey defaults are
@@ -92,7 +120,8 @@ Preferences are stored as JSON in `%APPDATA%\Live GPT\config.json`. The file is
 updated automatically when a preference changes and includes the language,
 hotkeys, auto-send and auto-hide states, selected screenshot source, selected
 ChatGPT conversation, independent recording/playback backends, local STT/TTS
-models and TTS speaker, overlay position and size, and position-lock state. A
+models, Qwen download source and TTS speaker, overlay position and size, and
+position-lock state. A
 missing, unreadable, or invalid configuration falls back to safe defaults and
 is repaired on disk. Existing registry-based hotkeys are migrated on the first
 JSON-configured launch.

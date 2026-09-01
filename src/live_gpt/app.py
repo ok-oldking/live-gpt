@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,7 +34,6 @@ from PySide6.QtWidgets import (
     QButtonGroup,
     QComboBox,
     QDialog,
-    QDialogButtonBox,
     QFormLayout,
     QFrame,
     QGraphicsOpacityEffect,
@@ -48,6 +48,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QProgressBar,
     QScrollArea,
+    QSizePolicy,
     QStackedWidget,
     QSystemTrayIcon,
     QVBoxLayout,
@@ -64,12 +65,10 @@ from .logger import Logger, config_logger, shutdown_logger
 from .hotkeys import GlobalHotkeyMonitor, HotkeyBinding
 from .screen_capture import CaptureSource, capture_webp, list_capture_sources
 from .window_focus import ForegroundWindowRestorer
-from .voice_models import (
-    LocalDictationSession,
-    STT_MODELS,
-    SherpaVoiceManager,
-    TTS_MODELS,
-)
+from .voice.base import ModelProvider, TextToSpeechProvider
+from .voice.dependencies import OperationCancelled, PYPI_MIRRORS
+from .voice.qwen_tts import MODEL_DOWNLOAD_SOURCES, QwenTtsProvider, TTS_MODELS
+from .voice.sherpa_stt import LocalDictationSession, SherpaSttProvider, STT_MODELS
 
 
 ASSET_DIRECTORY = Path(__file__).resolve().parent / "assets"
@@ -112,28 +111,44 @@ class _PendingDictationCapture:
 
 class _VoiceOperationThread(QThread):
     progress = Signal(str, object)
+    log_line = Signal(str)
     completed = Signal(bool, str, object)
 
     def __init__(
         self,
-        manager: SherpaVoiceManager,
+        manager: ModelProvider,
         action: str,
         model_type: str = "",
         model_key: str = "",
+        mirror: str = "default",
+        model_source: str = "huggingface",
     ) -> None:
         super().__init__()
         self.manager = manager
         self.action = action
         self.model_type = model_type
         self.model_key = model_key
+        self.mirror = mirror
+        self.model_source = model_source
+        self._cancel_event = threading.Event()
+
+    def cancel_operation(self) -> None:
+        self._cancel_event.set()
 
     def run(self) -> None:
         try:
             result: object = None
             if self.action == "status":
-                dependency_ok, dependency_message = (
-                    self.manager.dependency_status()
-                )
+                if self.model_type == "tts" and isinstance(
+                    self.manager, QwenTtsProvider
+                ):
+                    dependency_ok, dependency_message = (
+                        self.manager.dependency_status(self.model_source)
+                    )
+                else:
+                    dependency_ok, dependency_message = (
+                        self.manager.dependency_status()
+                    )
                 model_ok, model_message = self.manager.model_status(
                     self.model_type, self.model_key
                 )
@@ -145,20 +160,61 @@ class _VoiceOperationThread(QThread):
                 }
                 message = dependency_message
             elif self.action == "install":
-                message = self.manager.install_dependencies(
-                    self.progress.emit
-                )
+                if self.model_type == "tts" and isinstance(
+                    self.manager, QwenTtsProvider
+                ):
+                    message = self.manager.install_dependencies(
+                        self.progress.emit,
+                        self.log_line.emit,
+                        self.mirror,
+                        self._cancel_event,
+                        source=self.model_source,
+                    )
+                else:
+                    message = self.manager.install_dependencies(
+                        self.progress.emit,
+                        self.log_line.emit,
+                        self.mirror,
+                        self._cancel_event,
+                    )
             elif self.action == "download":
-                message = self.manager.download_model(
-                    self.model_type,
-                    self.model_key,
-                    self.progress.emit,
-                )
+                if self.model_type == "tts" and isinstance(
+                    self.manager, QwenTtsProvider
+                ):
+                    self.manager.ensure_download_client(
+                        self.progress.emit,
+                        self.log_line.emit,
+                        self.mirror,
+                        self._cancel_event,
+                        source=self.model_source,
+                    )
+                    message = self.manager.download_model(
+                        self.model_type,
+                        self.model_key,
+                        self.progress.emit,
+                        self.log_line.emit,
+                        self._cancel_event,
+                        source=self.model_source,
+                    )
+                else:
+                    message = self.manager.download_model(
+                        self.model_type,
+                        self.model_key,
+                        self.progress.emit,
+                        self.log_line.emit,
+                        self._cancel_event,
+                    )
             else:
                 raise RuntimeError(f"Unknown voice operation {self.action!r}")
             self.completed.emit(True, message, result)
+        except OperationCancelled as error:
+            logger.info(f"Voice operation {self.action!r} cancelled")
+            self.log_line.emit(str(error))
+            self.completed.emit(False, str(error), {"cancelled": True})
         except Exception as error:
             logger.error(f"Voice operation {self.action!r} failed", error)
+            if self.action in ("install", "download"):
+                self.log_line.emit(f"ERROR: {error}")
             self.completed.emit(False, str(error), None)
 
 
@@ -189,10 +245,10 @@ class _LocalSpeechThread(QThread):
 
     def __init__(
         self,
-        manager: SherpaVoiceManager,
+        manager: TextToSpeechProvider,
         tts_model: str,
         text: str,
-        speaker: int = 0,
+        speaker: str = "Vivian",
     ) -> None:
         super().__init__()
         self.manager = manager
@@ -210,7 +266,7 @@ class _LocalSpeechThread(QThread):
             )
             latency_ms = (time.perf_counter() - synthesis_started) * 1000
             audio_seconds = len(samples) / sample_rate
-            self.started.emit("Playing with Sherpa-ONNX…")
+            self.started.emit("Playing with Qwen3-TTS…")
             self.progress.emit({"text": self.text, "fraction": 0.0})
             sd.play(samples, sample_rate, blocking=True)
             self.progress.emit({"text": self.text, "fraction": 1.0})
@@ -237,18 +293,29 @@ class HotkeyConfigDialog(QDialog):
         recording_backend: str = "web",
         playing_backend: str = "web",
         stt_model: str = "zh_zipformer_ctc_int8_2025_07_03",
-        tts_model: str = "kokoro_multilang_v1_0",
-        tts_speaker: int = 0,
-        voice_manager: SherpaVoiceManager | None = None,
+        tts_model: str = "qwen3_tts_0_6b_custom_voice",
+        tts_speaker: str = "Vivian",
+        pypi_mirror: str = "default",
+        qwen_model_source: str = "huggingface",
+        config: Config | None = None,
+        stt_manager: SherpaSttProvider | None = None,
+        tts_manager: QwenTtsProvider | None = None,
     ) -> None:
         super().__init__(parent)
         self._title_drag_offset: QPoint | None = None
-        self.voice_manager = voice_manager or SherpaVoiceManager()
+        self.stt_manager = stt_manager or SherpaSttProvider()
+        self.tts_manager = tts_manager or QwenTtsProvider()
+        self.config = config
         self._voice_worker: _VoiceOperationThread | None = None
         self._voice_record_thread: _LocalDictationThread | None = None
         self._voice_play_thread: _LocalSpeechThread | None = None
         self._voice_status_checked = {"stt": False, "tts": False}
         self._voice_operation_type = "stt"
+        self._voice_operation_action = ""
+        self._voice_install_log_lines: dict[str, list[str]] = {
+            "stt": [],
+            "tts": [],
+        }
         self.setObjectName("settingsDialog")
         self.setWindowTitle("Live GPT settings")
         self.setWindowFlags(
@@ -293,7 +360,7 @@ class HotkeyConfigDialog(QDialog):
         self.close_button.setIconSize(QSize(16, 16))
         self.close_button.setFixedSize(36, 36)
         self.close_button.setAccessibleName("Close settings")
-        self.close_button.setToolTip("Close without saving")
+        self.close_button.setToolTip("Close settings; changes are saved automatically")
         self.close_button.clicked.connect(self.reject)
         title_layout.addWidget(self.close_button)
         shell_layout.addWidget(self.title_bar)
@@ -494,6 +561,29 @@ class HotkeyConfigDialog(QDialog):
         for button in (self.recording_check_button, self.recording_install_button):
             button.setObjectName("voiceActionButton")
             recording_runtime_row.addWidget(button)
+        self.recording_pypi_mirror_combo = QComboBox()
+        self.recording_pypi_mirror_combo.setObjectName("voiceCombo")
+        self.recording_pypi_mirror_combo.setToolTip(
+            "PyPI mirror used when installing or repairing dependencies"
+        )
+        for mirror in PYPI_MIRRORS.values():
+            self.recording_pypi_mirror_combo.addItem(
+                f"PyPI: {mirror.label}", mirror.key
+            )
+        recording_mirror_index = self.recording_pypi_mirror_combo.findData(
+            pypi_mirror
+        )
+        self.recording_pypi_mirror_combo.setCurrentIndex(
+            max(recording_mirror_index, 0)
+        )
+        recording_runtime_row.addWidget(self.recording_pypi_mirror_combo)
+        self.recording_cancel_button = QPushButton("Cancel install / download")
+        self.recording_cancel_button.setObjectName("voiceCancelButton")
+        self.recording_cancel_button.setToolTip(
+            "Stop the active dependency installation or model download"
+        )
+        self.recording_cancel_button.hide()
+        recording_runtime_row.addWidget(self.recording_cancel_button)
         recording_runtime_row.addStretch()
         recording_sherpa_layout.addLayout(recording_runtime_row)
 
@@ -539,6 +629,14 @@ class HotkeyConfigDialog(QDialog):
         self.recording_status.setObjectName("voiceStatus")
         self.recording_status.setWordWrap(True)
         recording_sherpa_layout.addWidget(self.recording_status)
+        self.recording_install_log = QLabel()
+        self.recording_install_log.setObjectName("voiceInstallLog")
+        self.recording_install_log.setWordWrap(False)
+        self.recording_install_log.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
+        self.recording_install_log.hide()
+        recording_sherpa_layout.addWidget(self.recording_install_log)
         recording_layout.addWidget(self.recording_sherpa_card)
         recording_layout.addStretch()
 
@@ -568,7 +666,9 @@ class HotkeyConfigDialog(QDialog):
         self.playing_backend_combo = QComboBox()
         self.playing_backend_combo.setObjectName("voiceCombo")
         self.playing_backend_combo.addItem("Web built-in (browser)", "web")
-        self.playing_backend_combo.addItem("Sherpa-ONNX (local)", "sherpa")
+        self.playing_backend_combo.addItem(
+            "Qwen3-TTS (local · NVIDIA GPU required)", "qwen"
+        )
         playing_backend_index = self.playing_backend_combo.findData(
             playing_backend
         )
@@ -576,14 +676,14 @@ class HotkeyConfigDialog(QDialog):
         playing_backend_layout.addWidget(self.playing_backend_combo)
         playing_layout.addWidget(playing_backend_card)
 
-        self.playing_sherpa_card = QFrame()
-        self.playing_sherpa_card.setObjectName("settingsCard")
-        playing_sherpa_layout = QVBoxLayout(self.playing_sherpa_card)
-        playing_sherpa_layout.setContentsMargins(18, 16, 18, 16)
-        playing_sherpa_layout.setSpacing(10)
-        playing_sherpa_title = QLabel("Local text to speech")
-        playing_sherpa_title.setObjectName("settingsCardTitle")
-        playing_sherpa_layout.addWidget(playing_sherpa_title)
+        self.playing_qwen_card = QFrame()
+        self.playing_qwen_card.setObjectName("settingsCard")
+        playing_qwen_layout = QVBoxLayout(self.playing_qwen_card)
+        playing_qwen_layout.setContentsMargins(18, 16, 18, 16)
+        playing_qwen_layout.setSpacing(10)
+        playing_qwen_title = QLabel("Local Qwen3 text to speech")
+        playing_qwen_title.setObjectName("settingsCardTitle")
+        playing_qwen_layout.addWidget(playing_qwen_title)
         playing_runtime_row = QHBoxLayout()
         playing_runtime_row.setSpacing(8)
         self.playing_check_button = QPushButton("Check")
@@ -591,24 +691,65 @@ class HotkeyConfigDialog(QDialog):
         for button in (self.playing_check_button, self.playing_install_button):
             button.setObjectName("voiceActionButton")
             playing_runtime_row.addWidget(button)
+        self.playing_pypi_mirror_combo = QComboBox()
+        self.playing_pypi_mirror_combo.setObjectName("voiceCombo")
+        self.playing_pypi_mirror_combo.setToolTip(
+            "PyPI mirror used when installing or repairing dependencies"
+        )
+        for mirror in PYPI_MIRRORS.values():
+            self.playing_pypi_mirror_combo.addItem(
+                f"PyPI: {mirror.label}", mirror.key
+            )
+        playing_mirror_index = self.playing_pypi_mirror_combo.findData(
+            pypi_mirror
+        )
+        self.playing_pypi_mirror_combo.setCurrentIndex(
+            max(playing_mirror_index, 0)
+        )
+        playing_runtime_row.addWidget(self.playing_pypi_mirror_combo)
+        self.playing_cancel_button = QPushButton("Cancel install / download")
+        self.playing_cancel_button.setObjectName("voiceCancelButton")
+        self.playing_cancel_button.setToolTip(
+            "Stop the active dependency installation or model download"
+        )
+        self.playing_cancel_button.hide()
+        playing_runtime_row.addWidget(self.playing_cancel_button)
         playing_runtime_row.addStretch()
-        playing_sherpa_layout.addLayout(playing_runtime_row)
+        playing_qwen_layout.addLayout(playing_runtime_row)
 
         self.tts_model_combo = QComboBox()
         self.tts_model_combo.setObjectName("voiceCombo")
         for model in TTS_MODELS.values():
-            size_mb = round(model.asset.size / 1024 / 1024)
             self.tts_model_combo.addItem(
-                f"[Offline] {model.label} · {model.languages} · {size_mb} MB",
+                f"[Local] {model.label} · {model.download_size / 1024**3:.2f} GB",
                 model.key,
             )
         tts_index = self.tts_model_combo.findData(tts_model)
         self.tts_model_combo.setCurrentIndex(max(tts_index, 0))
-        playing_sherpa_layout.addWidget(self.tts_model_combo)
+        playing_qwen_layout.addWidget(self.tts_model_combo)
+
+        tts_download_row = QHBoxLayout()
+        tts_download_row.setSpacing(8)
+        self.qwen_model_source_combo = QComboBox()
+        self.qwen_model_source_combo.setObjectName("voiceCombo")
+        self.qwen_model_source_combo.setToolTip(
+            "Service used to download the selected Qwen model"
+        )
+        for source_key, source_label in MODEL_DOWNLOAD_SOURCES.items():
+            self.qwen_model_source_combo.addItem(source_label, source_key)
+        source_index = self.qwen_model_source_combo.findData(qwen_model_source)
+        self.qwen_model_source_combo.setCurrentIndex(max(source_index, 0))
+        self.tts_download_button = QPushButton("Download TTS model")
+        self.tts_download_button.setObjectName("voiceActionButton")
+        tts_download_row.addWidget(self.qwen_model_source_combo)
+        tts_download_row.addWidget(self.tts_download_button)
+        tts_download_row.addStretch()
+        playing_qwen_layout.addLayout(tts_download_row)
+
         self.tts_model_description = QLabel()
         self.tts_model_description.setObjectName("settingsNote")
         self.tts_model_description.setWordWrap(True)
-        playing_sherpa_layout.addWidget(self.tts_model_description)
+        playing_qwen_layout.addWidget(self.tts_model_description)
 
         speaker_row = QHBoxLayout()
         speaker_row.setSpacing(8)
@@ -617,32 +758,39 @@ class HotkeyConfigDialog(QDialog):
         self.tts_speaker_combo.setObjectName("voiceCombo")
         speaker_row.addWidget(speaker_label)
         speaker_row.addWidget(self.tts_speaker_combo, 1)
-        playing_sherpa_layout.addLayout(speaker_row)
+        playing_qwen_layout.addLayout(speaker_row)
 
         self.voice_test_text = QLineEdit()
         self.voice_test_text.setObjectName("voiceTestText")
         self.voice_test_text.setPlaceholderText("Text to synthesize")
         tts_action_row = QHBoxLayout()
         tts_action_row.setSpacing(8)
-        self.tts_download_button = QPushButton("Download TTS model")
         self.voice_play_button = QPushButton("Play text")
-        for button in (self.tts_download_button, self.voice_play_button):
-            button.setObjectName("voiceActionButton")
-            tts_action_row.addWidget(button)
-        playing_sherpa_layout.addWidget(self.voice_test_text)
-        playing_sherpa_layout.addLayout(tts_action_row)
+        self.voice_play_button.setObjectName("voiceActionButton")
+        tts_action_row.addWidget(self.voice_play_button)
+        tts_action_row.addStretch()
+        playing_qwen_layout.addWidget(self.voice_test_text)
+        playing_qwen_layout.addLayout(tts_action_row)
         self.playing_progress = QProgressBar()
         self.playing_progress.setObjectName("voiceProgress")
         self.playing_progress.setRange(0, 100)
         self.playing_progress.hide()
-        playing_sherpa_layout.addWidget(self.playing_progress)
+        playing_qwen_layout.addWidget(self.playing_progress)
         self.playing_status = QLabel(
             "Select Check to validate the runtime and selected playback model."
         )
         self.playing_status.setObjectName("voiceStatus")
         self.playing_status.setWordWrap(True)
-        playing_sherpa_layout.addWidget(self.playing_status)
-        playing_layout.addWidget(self.playing_sherpa_card)
+        playing_qwen_layout.addWidget(self.playing_status)
+        self.playing_install_log = QLabel()
+        self.playing_install_log.setObjectName("voiceInstallLog")
+        self.playing_install_log.setWordWrap(False)
+        self.playing_install_log.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
+        self.playing_install_log.hide()
+        playing_qwen_layout.addWidget(self.playing_install_log)
+        playing_layout.addWidget(self.playing_qwen_card)
         playing_layout.addStretch()
 
         self.recording_scroll = QScrollArea()
@@ -679,8 +827,25 @@ class HotkeyConfigDialog(QDialog):
         self.playing_backend_combo.currentIndexChanged.connect(
             self._sync_playing_controls
         )
+        self.recording_pypi_mirror_combo.currentIndexChanged.connect(
+            lambda: self._sync_pypi_mirror(
+                self.recording_pypi_mirror_combo,
+                self.playing_pypi_mirror_combo,
+            )
+        )
+        self.playing_pypi_mirror_combo.currentIndexChanged.connect(
+            lambda: self._sync_pypi_mirror(
+                self.playing_pypi_mirror_combo,
+                self.recording_pypi_mirror_combo,
+            )
+        )
+        self.recording_cancel_button.clicked.connect(self._cancel_voice_operation)
+        self.playing_cancel_button.clicked.connect(self._cancel_voice_operation)
         self.stt_model_combo.currentIndexChanged.connect(self._stt_model_changed)
         self.tts_model_combo.currentIndexChanged.connect(self._tts_model_changed)
+        self.qwen_model_source_combo.currentIndexChanged.connect(
+            self._qwen_model_source_changed
+        )
         self.recording_check_button.clicked.connect(
             lambda: self._start_voice_operation("status", "stt")
         )
@@ -706,27 +871,8 @@ class HotkeyConfigDialog(QDialog):
         self._tts_model_changed()
         self._sync_recording_controls()
         self._sync_playing_controls()
+        self._connect_auto_save()
         content_layout.addWidget(self.settings_pages, 1)
-
-        self.settings_buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok
-            | QDialogButtonBox.StandardButton.Cancel
-        )
-        self.settings_buttons.setObjectName("settingsButtons")
-        self.settings_buttons.button(QDialogButtonBox.StandardButton.Ok).setText(
-            "Save changes"
-        )
-        self.settings_buttons.button(QDialogButtonBox.StandardButton.Ok).setToolTip(
-            "Save hotkey settings"
-        )
-        self.settings_buttons.button(
-            QDialogButtonBox.StandardButton.Cancel
-        ).setToolTip(
-            "Close without saving"
-        )
-        self.settings_buttons.accepted.connect(self.accept)
-        self.settings_buttons.rejected.connect(self.reject)
-        content_layout.addWidget(self.settings_buttons)
         body_layout.addWidget(content, 1)
         shell_layout.addWidget(body, 1)
 
@@ -913,6 +1059,22 @@ class HotkeyConfigDialog(QDialog):
                 background-color: rgba(40, 50, 80, 80);
                 border-color: rgba(100, 115, 150, 45);
             }
+            QPushButton#voiceCancelButton {
+                min-height: 32px;
+                padding: 0 12px;
+                color: #ffd8de;
+                background-color: rgba(135, 45, 65, 135);
+                border: 1px solid rgba(255, 120, 145, 105);
+                border-radius: 8px;
+            }
+            QPushButton#voiceCancelButton:hover {
+                background-color: rgba(175, 50, 75, 180);
+            }
+            QPushButton#voiceCancelButton:disabled {
+                color: #7f6670;
+                background-color: rgba(70, 38, 48, 80);
+                border-color: rgba(120, 75, 85, 45);
+            }
             QProgressBar#voiceProgress {
                 min-height: 8px;
                 max-height: 8px;
@@ -932,24 +1094,11 @@ class HotkeyConfigDialog(QDialog):
             QLabel#voiceStatus[error="true"] {
                 color: #ff8d9b;
             }
-            QDialogButtonBox#settingsButtons QPushButton {
-                min-height: 34px;
-                min-width: 96px;
-                padding: 0 14px;
-                color: #f5f7ff;
-                background-color: rgba(70, 88, 140, 150);
-                border: 1px solid rgba(170, 195, 255, 90);
-                border-radius: 8px;
-            }
-            QDialogButtonBox#settingsButtons QPushButton:hover {
-                background-color: rgba(76, 201, 240, 150);
-            }
-            QDialogButtonBox#settingsButtons QPushButton:default {
-                background-color: rgba(35, 155, 116, 210);
-                border-color: rgba(130, 255, 195, 150);
-            }
-            QDialogButtonBox#settingsButtons QPushButton:default:hover {
-                background-color: rgba(40, 190, 140, 230);
+            QLabel#voiceInstallLog {
+                min-height: 18px;
+                color: #7182aa;
+                font-size: 11px;
+                font-family: Consolas, "Courier New", monospace;
             }
             """
         )
@@ -966,7 +1115,7 @@ class HotkeyConfigDialog(QDialog):
 
     def _check_voice_page_when_needed(self, model_type: str) -> None:
         if (
-            self._voice_backend(model_type) == "sherpa"
+            self._voice_backend(model_type) == self._local_backend(model_type)
             and not self._voice_status_checked[model_type]
         ):
             self._voice_status_checked[model_type] = True
@@ -982,10 +1131,83 @@ class HotkeyConfigDialog(QDialog):
             self._check_voice_page_when_needed("stt")
 
     def _sync_playing_controls(self) -> None:
-        enabled = self.playing_backend() == "sherpa"
-        self.playing_sherpa_card.setVisible(enabled)
+        enabled = self.playing_backend() == "qwen"
+        self.playing_qwen_card.setVisible(enabled)
         if enabled and self.settings_pages.currentIndex() == 3:
             self._check_voice_page_when_needed("tts")
+
+    def _connect_auto_save(self) -> None:
+        self.language_combo.currentIndexChanged.connect(
+            lambda: self._save_setting("language", self.language())
+        )
+        self.recording_backend_combo.currentIndexChanged.connect(
+            lambda: self._save_setting(
+                "recording_backend", self.recording_backend()
+            )
+        )
+        self.playing_backend_combo.currentIndexChanged.connect(
+            lambda: self._save_setting("playing_backend", self.playing_backend())
+        )
+        self.recording_pypi_mirror_combo.currentIndexChanged.connect(
+            lambda: self._save_setting("pypi_mirror", self.pypi_mirror())
+        )
+        self.playing_pypi_mirror_combo.currentIndexChanged.connect(
+            lambda: self._save_setting("pypi_mirror", self.pypi_mirror())
+        )
+        self.stt_model_combo.currentIndexChanged.connect(
+            lambda: self._save_setting("stt_model", self.stt_model())
+        )
+        self.tts_model_combo.currentIndexChanged.connect(
+            lambda: self._save_setting("tts_model", self.tts_model())
+        )
+        self.tts_speaker_combo.currentIndexChanged.connect(
+            lambda: self._save_setting("tts_speaker", self.tts_speaker())
+        )
+        self.qwen_model_source_combo.currentIndexChanged.connect(
+            lambda: self._save_setting(
+                "qwen_model_source", self.qwen_model_source()
+            )
+        )
+        for editor in (
+            self.hold_microphone_edit,
+            self.send_edit,
+            self.send_without_screenshot_edit,
+        ):
+            editor.keySequenceChanged.connect(
+                lambda _sequence: self._save_hotkeys()
+            )
+
+    def _save_setting(self, key: str, value: object) -> None:
+        if self.config is not None:
+            self.config[key] = value
+
+    def _save_hotkeys(self) -> None:
+        if self.config is None:
+            return
+        try:
+            self.bindings()
+        except ValueError:
+            return
+        updates = {
+            HOTKEY_CONFIG_KEYS[name]: sequence.toString(
+                QKeySequence.SequenceFormat.PortableText
+            )
+            for name, sequence in self.sequences().items()
+        }
+        if not all(updates.values()):
+            return
+        self.config.update(updates)
+
+    @staticmethod
+    def _sync_pypi_mirror(source: QComboBox, target: QComboBox) -> None:
+        index = target.findData(source.currentData())
+        if index < 0 or index == target.currentIndex():
+            return
+        target.blockSignals(True)
+        try:
+            target.setCurrentIndex(index)
+        finally:
+            target.blockSignals(False)
 
     def _stt_model_changed(self) -> None:
         model = STT_MODELS[self.stt_model()]
@@ -995,19 +1217,30 @@ class HotkeyConfigDialog(QDialog):
 
     def _tts_model_changed(self) -> None:
         model = TTS_MODELS[self.tts_model()]
-        self.tts_model_description.setText(model.description)
-        selected_speaker = getattr(self, "_pending_tts_speaker", 0)
-        self.tts_speaker_combo.clear()
-        for speaker in range(model.speakers):
-            self.tts_speaker_combo.addItem(f"Speaker {speaker + 1}", speaker)
-        speaker_index = self.tts_speaker_combo.findData(
-            min(selected_speaker, model.speakers - 1)
+        self.tts_model_description.setText(
+            f"{model.description}\nStored in {self.tts_manager.model_root.resolve()}"
         )
+        selected_speaker = getattr(self, "_pending_tts_speaker", "Vivian")
+        self.tts_speaker_combo.clear()
+        for speaker in model.speakers:
+            self.tts_speaker_combo.addItem(
+                f"{speaker.label} · {speaker.description}", speaker.key
+            )
+        speaker_index = self.tts_speaker_combo.findData(selected_speaker)
         self.tts_speaker_combo.setCurrentIndex(max(speaker_index, 0))
-        self._pending_tts_speaker = 0
-        self.tts_speaker_combo.setEnabled(model.speakers > 1)
+        self._pending_tts_speaker = "Vivian"
+        self.tts_speaker_combo.setEnabled(len(model.speakers) > 1)
         self.voice_test_text.setText(model.test_text)
         self._voice_status_checked["tts"] = False
+
+    def _qwen_model_source_changed(self) -> None:
+        self._voice_status_checked["tts"] = False
+        self.playing_status.setProperty("error", False)
+        self.playing_status.setText(
+            f"{MODEL_DOWNLOAD_SOURCES[self.qwen_model_source()]} selected for "
+            "Qwen model downloads. Select Check to validate its client."
+        )
+        self._refresh_voice_status_style(self.playing_status)
 
     def _voice_backend(self, model_type: str) -> str:
         return (
@@ -1016,25 +1249,59 @@ class HotkeyConfigDialog(QDialog):
             else self.playing_backend()
         )
 
+    @staticmethod
+    def _local_backend(model_type: str) -> str:
+        return "sherpa" if model_type == "stt" else "qwen"
+
+    def _voice_provider(self, model_type: str) -> ModelProvider:
+        return self.stt_manager if model_type == "stt" else self.tts_manager
+
     def _voice_widgets(self, model_type: str) -> tuple[QLabel, QProgressBar]:
         if model_type == "stt":
             return self.recording_status, self.recording_progress
         return self.playing_status, self.playing_progress
+
+    def _voice_install_log_widget(self, model_type: str) -> QLabel:
+        return (
+            self.recording_install_log
+            if model_type == "stt"
+            else self.playing_install_log
+        )
+
+    def _voice_cancel_button(self, model_type: str) -> QPushButton:
+        return (
+            self.recording_cancel_button
+            if model_type == "stt"
+            else self.playing_cancel_button
+        )
 
     def _start_voice_operation(
         self, action: str, model_type: str = ""
     ) -> None:
         if self._voice_worker is not None or self._voice_test_running():
             return
-        if self._voice_backend(model_type) != "sherpa":
+        if self._voice_backend(model_type) != self._local_backend(model_type):
             return
         if action == "status":
             self._voice_status_checked[model_type] = True
         self._set_voice_busy(True)
         self._voice_operation_type = model_type
+        self._voice_operation_action = action
         status, progress = self._voice_widgets(model_type)
+        install_log = self._voice_install_log_widget(model_type)
+        cancel_button = self._voice_cancel_button(model_type)
+        for button in (self.recording_cancel_button, self.playing_cancel_button):
+            button.hide()
+            button.setEnabled(False)
+        cancel_button.setVisible(action in ("install", "download"))
+        cancel_button.setEnabled(cancel_button.isVisible())
         progress.show()
         progress.setRange(0, 0)
+        install_log.setVisible(action in ("install", "download"))
+        if install_log.isVisible():
+            self._voice_install_log_lines[model_type].clear()
+            install_log.setText("Waiting for installer output…")
+            install_log.setToolTip("")
         status.setProperty("error", False)
         status.setText(
             {
@@ -1045,16 +1312,34 @@ class HotkeyConfigDialog(QDialog):
         )
         self._refresh_voice_status_style(status)
         worker = _VoiceOperationThread(
-            self.voice_manager,
+            self._voice_provider(model_type),
             action,
             model_type,
             self.stt_model() if model_type == "stt" else self.tts_model(),
+            self.pypi_mirror(),
+            self.qwen_model_source(),
         )
         self._voice_worker = worker
         worker.progress.connect(self._voice_operation_progress)
+        worker.log_line.connect(self._voice_operation_log)
         worker.completed.connect(self._voice_operation_completed)
         worker.finished.connect(self._voice_operation_thread_finished)
         worker.start()
+
+    def _cancel_voice_operation(self) -> None:
+        worker = self._voice_worker
+        if worker is None or self._voice_operation_action not in (
+            "install",
+            "download",
+        ):
+            return
+        button = self._voice_cancel_button(self._voice_operation_type)
+        button.setEnabled(False)
+        status, progress = self._voice_widgets(self._voice_operation_type)
+        status.setText("Cancelling the active install or download…")
+        progress.setRange(0, 0)
+        self._voice_operation_log("Cancellation requested…")
+        worker.cancel_operation()
 
     def _voice_operation_progress(
         self,
@@ -1069,31 +1354,58 @@ class HotkeyConfigDialog(QDialog):
         else:
             progress.setRange(0, 0)
 
+    def _voice_operation_log(self, line: str) -> None:
+        compact = " ".join(str(line).split())
+        if not compact:
+            return
+        lines = self._voice_install_log_lines[self._voice_operation_type]
+        is_progress = compact.startswith(("━", "─"))
+        previous_is_progress = bool(lines) and lines[-1].startswith(("━", "─"))
+        if is_progress and previous_is_progress:
+            lines[-1] = compact
+        else:
+            lines.append(compact)
+            del lines[:-2]
+        label = self._voice_install_log_widget(self._voice_operation_type)
+        visible_lines = [
+            item if len(item) <= 160 else f"{item[:157]}…"
+            for item in lines
+        ]
+        label.setText("\n".join(visible_lines))
+        label.setToolTip("\n".join(lines))
+        label.show()
+
     def _voice_operation_completed(
         self,
         success: bool,
         message: str,
         result: object,
     ) -> None:
+        cancelled = isinstance(result, dict) and bool(result.get("cancelled"))
         if isinstance(result, dict) and "dependency_ok" in result:
             success = bool(result["dependency_ok"] and result["model_ok"])
             message = (
                 f"Runtime: {result['dependency_message']}\n"
                 f"Model: {result['model_message']}"
             )
-        if not success:
+        if not success and not cancelled:
             logger.error(f"Voice setup check failed: {message}")
         status, progress = self._voice_widgets(self._voice_operation_type)
-        status.setProperty("error", not success)
+        status.setProperty("error", not success and not cancelled)
         status.setText(message)
         self._refresh_voice_status_style(status)
         progress.setRange(0, 100)
         progress.setValue(100 if success else 0)
+        self._voice_cancel_button(self._voice_operation_type).setEnabled(False)
         self._set_voice_busy(False)
 
     def _voice_operation_thread_finished(self) -> None:
         worker = self._voice_worker
         self._voice_worker = None
+        self._voice_operation_action = ""
+        for button in (self.recording_cancel_button, self.playing_cancel_button):
+            button.hide()
+            button.setEnabled(False)
         if worker is not None:
             worker.deleteLater()
         current = self.settings_pages.currentIndex()
@@ -1117,13 +1429,15 @@ class HotkeyConfigDialog(QDialog):
             button.setEnabled(not busy)
         self.recording_backend_combo.setEnabled(not busy)
         self.playing_backend_combo.setEnabled(not busy)
+        self.recording_pypi_mirror_combo.setEnabled(not busy)
+        self.playing_pypi_mirror_combo.setEnabled(not busy)
         self.stt_model_combo.setEnabled(not busy)
         self.tts_model_combo.setEnabled(not busy)
+        self.qwen_model_source_combo.setEnabled(not busy)
         self.tts_speaker_combo.setEnabled(
-            not busy and TTS_MODELS[self.tts_model()].speakers > 1
+            not busy and len(TTS_MODELS[self.tts_model()].speakers) > 1
         )
         self.voice_test_text.setEnabled(not busy)
-        self.settings_buttons.setEnabled(not busy)
 
     def _voice_test_running(self) -> bool:
         return (
@@ -1147,7 +1461,7 @@ class HotkeyConfigDialog(QDialog):
         self.recording_status.setText("Starting the microphone…")
         self._refresh_voice_status_style(self.recording_status)
         worker = _LocalDictationThread(
-            LocalDictationSession(self.voice_manager, self.stt_model())
+            LocalDictationSession(self.stt_manager, self.stt_model())
         )
         self._voice_record_thread = worker
         worker.listening.connect(self._voice_record_listening)
@@ -1205,7 +1519,7 @@ class HotkeyConfigDialog(QDialog):
         self.playing_status.setText("Generating speech…")
         self._refresh_voice_status_style(self.playing_status)
         worker = _LocalSpeechThread(
-            self.voice_manager, self.tts_model(), text, self.tts_speaker()
+            self.tts_manager, self.tts_model(), text, self.tts_speaker()
         )
         self._voice_play_thread = worker
         worker.started.connect(self.playing_status.setText)
@@ -1296,6 +1610,16 @@ class HotkeyConfigDialog(QDialog):
     def playing_backend(self) -> str:
         return str(self.playing_backend_combo.currentData() or "web")
 
+    def pypi_mirror(self) -> str:
+        return str(
+            self.recording_pypi_mirror_combo.currentData() or "default"
+        )
+
+    def qwen_model_source(self) -> str:
+        return str(
+            self.qwen_model_source_combo.currentData() or "huggingface"
+        )
+
     def stt_model(self) -> str:
         return str(
             self.stt_model_combo.currentData()
@@ -1304,11 +1628,11 @@ class HotkeyConfigDialog(QDialog):
 
     def tts_model(self) -> str:
         return str(
-            self.tts_model_combo.currentData() or "kokoro_multilang_v1_0"
+            self.tts_model_combo.currentData() or "qwen3_tts_0_6b_custom_voice"
         )
 
-    def tts_speaker(self) -> int:
-        return int(self.tts_speaker_combo.currentData() or 0)
+    def tts_speaker(self) -> str:
+        return str(self.tts_speaker_combo.currentData() or "Vivian")
 
     def bindings(self) -> dict[str, HotkeyBinding]:
         bindings = {
@@ -2904,7 +3228,8 @@ class TrayController:
         self.application = application
         self.icon = QIcon(str(ICON_PATH))
         self.config = Config()
-        self.voice_manager = SherpaVoiceManager()
+        self.stt_manager = SherpaSttProvider()
+        self.tts_manager = QwenTtsProvider()
         self._local_dictation_thread: _LocalDictationThread | None = None
         self._local_speech_thread: _LocalSpeechThread | None = None
         self._migrate_legacy_hotkeys()
@@ -3120,33 +3445,20 @@ class TrayController:
                 playing_backend=str(self.config["playing_backend"]),
                 stt_model=str(self.config["stt_model"]),
                 tts_model=str(self.config["tts_model"]),
-                tts_speaker=int(self.config["tts_speaker"]),
-                voice_manager=self.voice_manager,
+                tts_speaker=str(self.config["tts_speaker"]),
+                pypi_mirror=str(self.config["pypi_mirror"]),
+                qwen_model_source=str(self.config["qwen_model_source"]),
+                config=self.config,
+                stt_manager=self.stt_manager,
+                tts_manager=self.tts_manager,
             )
-            if dialog.exec() != QDialog.DialogCode.Accepted:
-                return
+            dialog.exec()
 
-            sequences = dialog.sequences()
-            bindings = dialog.bindings()
+            sequences = self._load_hotkey_sequences()
+            bindings = self._bindings_for_sequences(sequences)
             self._hotkey_sequences = sequences
-            self.config.update(
-                {
-                    HOTKEY_CONFIG_KEYS[name]: sequence.toString(
-                        QKeySequence.SequenceFormat.PortableText
-                    )
-                    for name, sequence in sequences.items()
-                }
-                | {
-                    "language": dialog.language(),
-                    "recording_backend": dialog.recording_backend(),
-                    "playing_backend": dialog.playing_backend(),
-                    "stt_model": dialog.stt_model(),
-                    "tts_model": dialog.tts_model(),
-                    "tts_speaker": dialog.tts_speaker(),
-                }
-            )
             self.browser_monitor.set_use_browser_voice(
-                dialog.playing_backend() == "web"
+                self.config["playing_backend"] == "web"
             )
             self.hotkey_monitor.update_bindings(
                 bindings["hold"],
@@ -3180,7 +3492,7 @@ class TrayController:
         self.window.activateWindow()
 
     def _play_local_voice(self, text: str) -> None:
-        if self.config["playing_backend"] != "sherpa" or not text.strip():
+        if self.config["playing_backend"] != "qwen" or not text.strip():
             return
         if self._local_speech_thread is not None:
             self.window.finish_reading(
@@ -3189,10 +3501,10 @@ class TrayController:
             )
             return
         worker = _LocalSpeechThread(
-            self.voice_manager,
+            self.tts_manager,
             str(self.config["tts_model"]),
             text,
-            int(self.config["tts_speaker"]),
+            str(self.config["tts_speaker"]),
         )
         self._local_speech_thread = worker
         worker.started.connect(self.window.begin_reading)
@@ -3263,7 +3575,7 @@ class TrayController:
             "recording",
             "Starting the local microphone…",
         )
-        session = LocalDictationSession(self.voice_manager, stt_model)
+        session = LocalDictationSession(self.stt_manager, stt_model)
         worker = _LocalDictationThread(session)
         self._local_dictation_thread = worker
         worker.listening.connect(

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
 import os
+import tempfile
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 
@@ -23,6 +26,7 @@ from live_gpt.app import (  # noqa: E402
     TranscriptEditor,
     TrayController,
 )
+from live_gpt.config import Config  # noqa: E402
 from live_gpt.screen_capture import CaptureSource  # noqa: E402
 
 
@@ -155,10 +159,66 @@ class SettingsDialogTests(unittest.TestCase):
             dialog.playing_nav_button.click()
             self.assertEqual(dialog.settings_pages.currentIndex(), 3)
             self.assertEqual(dialog.playing_backend(), "web")
-            self.assertEqual(dialog.tts_model_combo.count(), 5)
+            self.assertEqual(dialog.tts_model_combo.count(), 2)
+            self.assertEqual(dialog.qwen_model_source_combo.count(), 2)
+            self.assertEqual(dialog.qwen_model_source(), "huggingface")
+            qwen_layout = dialog.playing_qwen_card.layout()
+            model_index = qwen_layout.indexOf(dialog.tts_model_combo)
+            download_row = qwen_layout.itemAt(model_index + 1).layout()
+            self.assertIs(
+                download_row.itemAt(0).widget(),
+                dialog.qwen_model_source_combo,
+            )
+            self.assertIs(
+                download_row.itemAt(1).widget(),
+                dialog.tts_download_button,
+            )
             self.assertEqual(dialog.voice_record_button.text(), "Record microphone")
             self.assertEqual(dialog.voice_play_button.text(), "Play text")
-            self.assertTrue(dialog.playing_sherpa_card.isHidden())
+            self.assertTrue(dialog.playing_qwen_card.isHidden())
+            self.assertTrue(dialog.recording_install_log.isHidden())
+            self.assertTrue(dialog.playing_install_log.isHidden())
+            self.assertEqual(dialog.recording_pypi_mirror_combo.count(), 3)
+            self.assertEqual(dialog.playing_pypi_mirror_combo.count(), 3)
+            aliyun = dialog.recording_pypi_mirror_combo.findData("ali")
+            dialog.recording_pypi_mirror_combo.setCurrentIndex(aliyun)
+            self.assertEqual(dialog.pypi_mirror(), "ali")
+            self.assertEqual(
+                dialog.playing_pypi_mirror_combo.currentData(), "ali"
+            )
+
+            dialog._voice_operation_type = "tts"
+            dialog._voice_operation_log("Downloading package  12%\n")
+            self.assertFalse(dialog.playing_install_log.isHidden())
+            self.assertEqual(
+                dialog.playing_install_log.text(),
+                "Downloading package 12%",
+            )
+            dialog._voice_operation_log(
+                "Downloading torch-2.11.0-cp312-cp312-win_amd64.whl (2.6 GB)"
+            )
+            first_progress = "━━━━━━━━━━━━━━━━━━━━──────────────────── 1.0/2.6 GB"
+            latest_progress = (
+                "━━━━━━━━━━━━━━━━━━━━──────────────────── "
+                "1.3/2.6 GB 28.5 MB/s eta 0:00:46"
+            )
+            dialog._voice_operation_log(first_progress)
+            dialog._voice_operation_log(latest_progress)
+            self.assertEqual(
+                dialog.playing_install_log.text(),
+                "Downloading torch-2.11.0-cp312-cp312-win_amd64.whl (2.6 GB)\n"
+                + latest_progress,
+            )
+            worker = Mock()
+            dialog._voice_worker = worker
+            dialog._voice_operation_type = "tts"
+            dialog._voice_operation_action = "install"
+            dialog.playing_cancel_button.show()
+            dialog.playing_cancel_button.setEnabled(True)
+            dialog._cancel_voice_operation()
+            worker.cancel_operation.assert_called_once_with()
+            self.assertFalse(dialog.playing_cancel_button.isEnabled())
+            dialog._voice_worker = None
         finally:
             dialog.close()
 
@@ -182,21 +242,84 @@ class SettingsDialogTests(unittest.TestCase):
             QKeySequence("Ctrl+S"),
             QKeySequence("Ctrl+D"),
             recording_backend="sherpa",
-            playing_backend="web",
+            playing_backend="qwen",
             stt_model="en_moonshine_tiny_int8",
-            tts_model="kitten_tts",
-            tts_speaker=3,
+            tts_model="qwen3_tts_1_7b_custom_voice",
+            tts_speaker="Ryan",
+            pypi_mirror="ali",
+            qwen_model_source="modelscope",
         )
         try:
             self.assertEqual(local_dialog.recording_backend(), "sherpa")
-            self.assertEqual(local_dialog.playing_backend(), "web")
+            self.assertEqual(local_dialog.playing_backend(), "qwen")
             self.assertEqual(local_dialog.stt_model(), "en_moonshine_tiny_int8")
-            self.assertEqual(local_dialog.tts_model(), "kitten_tts")
-            self.assertEqual(local_dialog.tts_speaker(), 3)
+            self.assertEqual(
+                local_dialog.tts_model(), "qwen3_tts_1_7b_custom_voice"
+            )
+            self.assertEqual(local_dialog.tts_speaker(), "Ryan")
+            self.assertEqual(local_dialog.pypi_mirror(), "ali")
+            self.assertEqual(local_dialog.qwen_model_source(), "modelscope")
             self.assertFalse(local_dialog.recording_sherpa_card.isHidden())
-            self.assertTrue(local_dialog.playing_sherpa_card.isHidden())
+            self.assertFalse(local_dialog.playing_qwen_card.isHidden())
         finally:
             local_dialog.close()
+
+    def test_settings_save_every_valid_change_without_save_button(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            config = Config(path)
+            dialog = HotkeyConfigDialog(
+                QKeySequence("CapsLock"),
+                QKeySequence("Ctrl+S"),
+                QKeySequence("Ctrl+D"),
+                config=config,
+            )
+            try:
+                self.assertFalse(hasattr(dialog, "settings_buttons"))
+                dialog.language_combo.setCurrentIndex(1)
+                dialog.recording_backend_combo.setCurrentIndex(
+                    dialog.recording_backend_combo.findData("sherpa")
+                )
+                dialog.playing_backend_combo.setCurrentIndex(
+                    dialog.playing_backend_combo.findData("qwen")
+                )
+                dialog.playing_pypi_mirror_combo.setCurrentIndex(
+                    dialog.playing_pypi_mirror_combo.findData("ali")
+                )
+                self.assertEqual(
+                    dialog.recording_pypi_mirror_combo.currentData(),
+                    "ali",
+                )
+                dialog.stt_model_combo.setCurrentIndex(
+                    dialog.stt_model_combo.findData("en_moonshine_tiny_int8")
+                )
+                dialog.tts_model_combo.setCurrentIndex(
+                    dialog.tts_model_combo.findData(
+                        "qwen3_tts_1_7b_custom_voice"
+                    )
+                )
+                dialog.tts_speaker_combo.setCurrentIndex(
+                    dialog.tts_speaker_combo.findData("Ryan")
+                )
+                dialog.qwen_model_source_combo.setCurrentIndex(
+                    dialog.qwen_model_source_combo.findData("modelscope")
+                )
+                dialog.send_edit.setKeySequence(QKeySequence("Ctrl+Shift+S"))
+
+                saved = json.loads(path.read_text(encoding="utf-8"))
+                self.assertEqual(saved["language"], "zh")
+                self.assertEqual(saved["recording_backend"], "sherpa")
+                self.assertEqual(saved["playing_backend"], "qwen")
+                self.assertEqual(saved["pypi_mirror"], "ali")
+                self.assertEqual(saved["stt_model"], "en_moonshine_tiny_int8")
+                self.assertEqual(
+                    saved["tts_model"], "qwen3_tts_1_7b_custom_voice"
+                )
+                self.assertEqual(saved["tts_speaker"], "Ryan")
+                self.assertEqual(saved["qwen_model_source"], "modelscope")
+                self.assertEqual(saved["hotkey_send"], "Ctrl+Shift+S")
+            finally:
+                dialog.close()
 
 
 class TrayControllerBrowserTests(unittest.TestCase):

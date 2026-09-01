@@ -134,7 +134,7 @@ celerybeat.pid
 # Runtime microphone captures
 recordings/
 
-# Downloaded sherpa-onnx speech-recognition models
+# Downloaded local speech-recognition and text-to-speech models
 models/
 env/
 venv/
