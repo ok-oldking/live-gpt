@@ -91,6 +91,12 @@ class ConfigTests(unittest.TestCase):
             config["cosyvoice_model"] = "fun_cosyvoice3_0_5b_2512"
             config["cosyvoice_prompt_audio"] = "E:/voices/reference.wav"
             config["cosyvoice_prompt_text"] = "Reference speech"
+            config["playing_backend"] = "sovits"
+            config["sovits_installation"] = "E:/tts/GPT-SoVITS"
+            config["sovits_text_lang"] = "zh"
+            config["sovits_ref_audio_path"] = "E:/voices/sovits.wav"
+            config["sovits_prompt_text"] = "参考文本"
+            config["sovits_prompt_lang"] = "all_zh"
             config["recording_backend"] = "unknown"
             config["playing_backend"] = "unknown"
             config["pypi_mirror"] = "unknown"
@@ -101,7 +107,7 @@ class ConfigTests(unittest.TestCase):
             config["tts_language"] = "unknown"
 
             self.assertEqual(config["recording_backend"], "sherpa")
-            self.assertEqual(config["playing_backend"], "cosyvoice")
+            self.assertEqual(config["playing_backend"], "sovits")
             self.assertEqual(config["pypi_mirror"], "sjtug")
             self.assertEqual(config["qwen_model_source"], "modelscope")
             self.assertEqual(config["stt_model"], "en_moonshine_tiny_int8")
@@ -118,6 +124,11 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(
                 config["cosyvoice_prompt_text"], "Reference speech"
             )
+            self.assertEqual(config["sovits_installation"], "E:/tts/GPT-SoVITS")
+            self.assertEqual(config["sovits_text_lang"], "zh")
+            self.assertEqual(config["sovits_ref_audio_path"], "E:/voices/sovits.wav")
+            self.assertEqual(config["sovits_prompt_text"], "参考文本")
+            self.assertEqual(config["sovits_prompt_lang"], "all_zh")
 
     def test_legacy_voice_backend_migrates_to_both_independent_backends(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

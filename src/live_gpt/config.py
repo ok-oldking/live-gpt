@@ -37,6 +37,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "cosyvoice_model": "fun_cosyvoice3_0_5b_2512",
     "cosyvoice_prompt_audio": "",
     "cosyvoice_prompt_text": "",
+    "sovits_installation": "",
+    "sovits_text_lang": "auto",
+    "sovits_ref_audio_path": "",
+    "sovits_prompt_text": "",
+    "sovits_prompt_lang": "auto",
 }
 
 
@@ -72,7 +77,7 @@ def _valid_value(key: str, value: Any, default: Any) -> bool:
     if key == "recording_backend":
         return value in ("web", "sherpa")
     if key == "playing_backend":
-        return value in ("web", "qwen", "cosyvoice")
+        return value in ("web", "qwen", "cosyvoice", "sovits")
     if key == "pypi_mirror":
         return value in ("default", "ali", "sjtug")
     if key == "qwen_model_source":
@@ -125,6 +130,11 @@ def _valid_value(key: str, value: Any, default: Any) -> bool:
         )
     if key == "cosyvoice_model":
         return value == "fun_cosyvoice3_0_5b_2512"
+    if key in ("sovits_text_lang", "sovits_prompt_lang"):
+        return value in (
+            "auto", "auto_yue", "zh", "en", "ja", "yue", "ko",
+            "all_zh", "all_ja", "all_yue", "all_ko",
+        )
     if key.startswith("hotkey_"):
         return bool(value.strip())
     if key == "window_geometry":

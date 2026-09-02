@@ -72,7 +72,9 @@ button is the only dismissal control and there is no separate Save Changes step.
 Recording independently chooses the browser or local Sherpa-ONNX, while
 Playing independently chooses the browser or local
 [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS), or local
-[CosyVoice 3](https://github.com/FunAudioLLM/CosyVoice). Local controls
+[CosyVoice 3](https://github.com/FunAudioLLM/CosyVoice), or an existing
+[GPT-SoVITS](https://github.com/RVC-Boss/GPT-SoVITS) installation with its
+embedded Python runtime. Local controls
 stay hidden when the corresponding web engine is selected. The STT catalog
 includes five Mandarin and five English options. Playback offers Qwen3-TTS
 CustomVoice 0.6B and 1.7B models with nine named Chinese, English, Japanese,
@@ -86,6 +88,13 @@ the selected PyPI mirror is added as the dependency index for that installation.
 Repair preserves matching PyTorch files so Windows never needs to overwrite a
 CUDA extension currently loaded by the running app; only missing or mismatched
 packages are changed.
+GPT-SoVITS is not installed or modified by Live GPT apart from copying
+`sovits_server.py` into the selected installation. Live GPT launches that file
+with `runtime/python.exe`, warms the configured model once, reuses GPT-SoVITS's
+reference-audio feature cache, and consumes native streaming audio. Its text
+language is configurable; reference audio, reference transcript, and prompt
+language are saved as optional settings (reference audio is required when
+synthesis is requested).
 Qwen playback generates a first natural text chunk immediately, then uses a
 two-chunk lookahead buffer while later chunks are generated concurrently with
 current audio playback. Deterministic decoding keeps the speaker timbre steadier;
@@ -153,7 +162,8 @@ updated automatically when a preference changes and includes the language,
 hotkeys, auto-send and auto-hide states, selected screenshot source, selected
 ChatGPT conversation, independent recording/playback backends, local STT/TTS
 models, Qwen/CosyVoice download sources, Qwen speaker and playback language,
-CosyVoice reference-audio path and transcript, overlay position
+CosyVoice reference-audio path and transcript, GPT-SoVITS installation,
+languages, reference-audio path and transcript, overlay position
 and size, and
 position-lock state. A
 missing, unreadable, or invalid configuration falls back to safe defaults and

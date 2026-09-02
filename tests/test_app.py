@@ -281,7 +281,7 @@ class SettingsDialogTests(unittest.TestCase):
             dialog.playing_nav_button.click()
             self.assertEqual(dialog.settings_pages.currentIndex(), 3)
             self.assertEqual(dialog.playing_backend(), "web")
-            self.assertEqual(dialog.playing_backend_combo.count(), 3)
+            self.assertEqual(dialog.playing_backend_combo.count(), 4)
             self.assertEqual(dialog.tts_model_combo.count(), 2)
             self.assertEqual(dialog.tts_language_combo.count(), 11)
             self.assertEqual(dialog.tts_language(), "Auto")
