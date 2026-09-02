@@ -3,17 +3,23 @@ from __future__ import annotations
 import contextlib
 import gc
 import hashlib
+import importlib.metadata
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import sysconfig
+import tarfile
 import tempfile
 import threading
 import time
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
+from collections.abc import Iterator
 from typing import Any
 
 from ..logger import Logger
@@ -28,6 +34,7 @@ from .dependencies import (
 
 
 QWEN_TTS_VERSION = "0.1.1"
+FLASH_ATTN_VERSION = "2.8.3"
 TRANSFORMERS_VERSION = "4.57.3"
 ACCELERATE_VERSION = "1.12.0"
 SOUNDDEVICE_VERSION = "0.5.6"
@@ -35,6 +42,9 @@ HUGGINGFACE_HUB_VERSION = "0.36.2"
 MODELSCOPE_VERSION = "1.39.1"
 PYTORCH_VERSION = "2.11.0+cu126"
 TORCHAUDIO_VERSION = "2.11.0+cu126"
+NVIDIA_CUDA_NVCC_VERSION = "12.6.85"
+NVIDIA_CUDA_RUNTIME_VERSION = "12.6.77"
+NVIDIA_CUDA_CCCL_VERSION = "12.6.77"
 PYTORCH_CUDA_INDEX_URL = "https://download.pytorch.org/whl/cu126"
 ALIYUN_PYTORCH_CUDA_INDEX_URL = (
     "https://mirrors.aliyun.com/pytorch-wheels/cu126/"
@@ -46,6 +56,19 @@ MODEL_DOWNLOAD_SOURCES = {
     "huggingface": "Hugging Face",
     "modelscope": "ModelScope",
 }
+TTS_LANGUAGES = (
+    "Auto",
+    "Chinese",
+    "English",
+    "Japanese",
+    "Korean",
+    "German",
+    "French",
+    "Russian",
+    "Portuguese",
+    "Spanish",
+    "Italian",
+)
 logger = Logger.get_logger(__name__)
 
 
@@ -83,7 +106,8 @@ class QwenTtsModel:
     @property
     def description(self) -> str:
         return (
-            f"Local · NVIDIA GPU required · Qwen3-TTS CustomVoice · {self.parameters} · "
+            f"Local streaming playback · NVIDIA GPU required · "
+            f"Qwen3-TTS CustomVoice · {self.parameters} · "
             f"10 languages · {len(self.speakers)} selectable speakers · "
             f"{self.download_size / 1024**3:.2f} GB download"
         )
@@ -124,6 +148,8 @@ def _sha256(path: Path) -> str:
 class QwenTtsProvider:
     """Install, verify, download, and run Qwen3-TTS CustomVoice models."""
 
+    display_name = "Qwen3-TTS"
+
     def __init__(self, model_root: str | Path | None = None) -> None:
         self.model_root = (
             Path(model_root) if model_root is not None else Path.cwd() / "models"
@@ -161,6 +187,244 @@ class QwenTtsProvider:
             return True, output.splitlines()[0]
         except Exception as error:
             return False, f"Unable to query the NVIDIA GPU: {error}"
+
+    @staticmethod
+    def flash_attention_status() -> tuple[bool, str]:
+        return dependency_status(
+            (
+                PackageRequirement(
+                    "flash-attn",
+                    FLASH_ATTN_VERSION,
+                    import_name="flash_attn",
+                ),
+            )
+        )
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _short_build_temporary_directory() -> Iterator[str]:
+        """Create a pip build directory short enough for FlashAttention sources."""
+        drive_root = Path(Path.cwd().anchor)
+        if sys.platform == "win32":
+            probe = drive_root / f".lgt-{os.getpid()}-{time.time_ns()}"
+            root_writable = False
+            try:
+                probe.touch(exist_ok=False)
+                probe.unlink()
+                root_writable = True
+            except OSError:
+                try:
+                    probe.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            if root_writable:
+                yield str(drive_root)
+                return
+
+            backing = Path.cwd() / ".flash-build-temp"
+            backing.mkdir(exist_ok=True)
+            mapped_drive = ""
+            creationflags = subprocess.CREATE_NO_WINDOW
+            for letter in "ZYXWVUT":
+                drive = f"{letter}:"
+                if Path(f"{drive}\\").exists():
+                    continue
+                completed = subprocess.run(
+                    ["subst", drive, str(backing)],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    check=False,
+                    creationflags=creationflags,
+                )
+                if completed.returncode == 0:
+                    mapped_drive = drive
+                    break
+            if mapped_drive:
+                try:
+                    yield f"{mapped_drive}\\"
+                    return
+                finally:
+                    subprocess.run(
+                        ["subst", mapped_drive, "/D"],
+                        capture_output=True,
+                        check=False,
+                        creationflags=creationflags,
+                    )
+                    try:
+                        backing.rmdir()
+                    except OSError:
+                        pass
+
+        fallback = Path.cwd() / ".t"
+        fallback.mkdir(exist_ok=True)
+        try:
+            yield str(fallback)
+        finally:
+            try:
+                fallback.rmdir()
+            except OSError:
+                pass
+
+    @staticmethod
+    def _cleanup_invalid_pip_remnants(log: LogCallback) -> None:
+        """Remove pip backup names left by the interrupted forced reinstall."""
+        package_root = Path(sysconfig.get_path("purelib"))
+        prefixes = (
+            "~arkupsafe",
+            "~ilelock",
+            "~inja2",
+            "~etworkx",
+            "~orch",
+            "~orchaudio",
+            "~pmath",
+            "~sspec",
+            "~unctorch",
+            "~ympy",
+            "~yping_extensions",
+            "~etuptools",
+        )
+        for path in package_root.iterdir():
+            if not path.name.casefold().startswith(prefixes):
+                continue
+            try:
+                if path.is_dir():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink()
+                log(f"Removed stale pip backup: {path.name}")
+            except OSError as error:
+                log(f"WARNING: Unable to remove stale pip backup {path.name}: {error}")
+
+    @staticmethod
+    def _nvidia_pip_cuda_environment() -> dict[str, str]:
+        """Locate NVIDIA's pip-installed CUDA compiler and development files."""
+        nvcc_distribution = importlib.metadata.distribution(
+            "nvidia-cuda-nvcc-cu12"
+        )
+        runtime_distribution = importlib.metadata.distribution(
+            "nvidia-cuda-runtime-cu12"
+        )
+        cccl_distribution = importlib.metadata.distribution("nvidia-cuda-cccl-cu12")
+
+        def located_file(distribution: object, suffix: str) -> Path:
+            normalized = suffix.replace("\\", "/").casefold()
+            for item in distribution.files or ():
+                if str(item).replace("\\", "/").casefold().endswith(normalized):
+                    path = Path(distribution.locate_file(item))
+                    if path.is_file():
+                        return path
+            raise RuntimeError(f"NVIDIA CUDA package is missing {suffix}")
+
+        nvcc = located_file(nvcc_distribution, "bin/nvcc.exe")
+        runtime_header = located_file(
+            runtime_distribution,
+            "include/cuda_runtime_api.h",
+        )
+        runtime_library = located_file(
+            runtime_distribution,
+            "lib/x64/cudart.lib",
+        )
+        cccl_header = located_file(cccl_distribution, "include/cub/cub.cuh")
+        cuda_home = nvcc.parent.parent
+        include_paths = (
+            cuda_home / "include",
+            runtime_header.parent,
+            cccl_header.parents[1],
+        )
+        return {
+            "CUDA_HOME": str(cuda_home),
+            "CUDA_PATH": str(cuda_home),
+            "PATH": f"{nvcc.parent}{os.pathsep}{os.environ.get('PATH', '')}",
+            "INCLUDE": os.pathsep.join(
+                str(path) for path in include_paths if path.is_dir()
+            )
+            + os.pathsep
+            + os.environ.get("INCLUDE", ""),
+            "LIB": f"{runtime_library.parent}{os.pathsep}{os.environ.get('LIB', '')}",
+        }
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _verified_nvidia_flash_source(
+        build_root: str,
+        log: LogCallback,
+        cancel_event: threading.Event | None,
+    ) -> Iterator[Path]:
+        """Download the verified sdist while omitting its unused AMD CK tree."""
+        metadata_url = (
+            f"https://pypi.org/pypi/flash-attn/{FLASH_ATTN_VERSION}/json"
+        )
+        log(f"Resolving verified FlashAttention source: {metadata_url}")
+        with urllib.request.urlopen(metadata_url, timeout=60) as response:
+            metadata = json.load(response)
+        candidates = [
+            item
+            for item in metadata.get("urls", ())
+            if item.get("packagetype") == "sdist"
+            and str(item.get("filename", "")).endswith(".tar.gz")
+        ]
+        if len(candidates) != 1:
+            raise RuntimeError("PyPI did not return one FlashAttention source archive")
+        source = candidates[0]
+        expected_hash = str(source.get("digests", {}).get("sha256", ""))
+        if len(expected_hash) != 64:
+            raise RuntimeError("FlashAttention source archive has no SHA-256 digest")
+        nonce = f"{os.getpid()}-{time.time_ns()}"
+        archive_path = Path(build_root) / f"fa-{nonce}.tar.gz"
+        source_root = Path(build_root) / f"fa-{nonce}"
+        try:
+            source_url = str(source["url"])
+            log(f"Downloading verified FlashAttention source: {source_url}")
+            digest = hashlib.sha256()
+            downloaded = 0
+            with (
+                urllib.request.urlopen(source_url, timeout=120) as response,
+                archive_path.open("wb") as output,
+            ):
+                total = int(response.headers.get("Content-Length", "0") or 0)
+                while True:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise OperationCancelled("Dependency installation cancelled")
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    output.write(chunk)
+                    digest.update(chunk)
+                    downloaded += len(chunk)
+                    if total:
+                        log(
+                            "Downloading FlashAttention source "
+                            f"{downloaded / 1024**2:.1f}/{total / 1024**2:.1f} MB"
+                        )
+            if digest.hexdigest() != expected_hash:
+                raise RuntimeError("FlashAttention source failed its SHA-256 check")
+            source_root.mkdir()
+            skipped = 0
+            with tarfile.open(archive_path, "r:gz") as archive:
+                selected: list[tarfile.TarInfo] = []
+                for member in archive.getmembers():
+                    parts = Path(member.name.replace("\\", "/")).parts
+                    if len(parts) < 2:
+                        continue
+                    relative_parts = parts[1:]
+                    if relative_parts[:2] == ("csrc", "composable_kernel"):
+                        skipped += 1
+                        continue
+                    member.name = "/".join(relative_parts)
+                    selected.append(member)
+                archive.extractall(source_root, members=selected, filter="data")
+            if not (source_root / "setup.py").is_file():
+                raise RuntimeError("FlashAttention source archive is incomplete")
+            log(
+                "Verified FlashAttention source and omitted "
+                f"{skipped} AMD Composable Kernel files not used by NVIDIA CUDA"
+            )
+            yield source_root
+        finally:
+            archive_path.unlink(missing_ok=True)
+            shutil.rmtree(source_root, ignore_errors=True)
 
     @staticmethod
     def dependency_status(source: str = "huggingface") -> tuple[bool, str]:
@@ -224,10 +488,17 @@ class QwenTtsProvider:
         )
         if not ok:
             return False, detail
+        flash_ok, _flash_detail = QwenTtsProvider.flash_attention_status()
+        attention = (
+            f"FlashAttention {FLASH_ATTN_VERSION}"
+            if flash_ok
+            else "optimized PyTorch SDPA fallback"
+        )
         return (
             True,
             f"Qwen3-TTS 0.1.1, {MODEL_DOWNLOAD_SOURCES[source]}, NVIDIA CUDA "
-            f"PyTorch, and the audio runtime passed checks on {gpu_message}",
+            f"PyTorch, {attention}, and the audio runtime passed checks on "
+            f"{gpu_message}",
         )
 
     @staticmethod
@@ -279,6 +550,10 @@ class QwenTtsProvider:
             if mirror == "ali"
             else TORCHAUDIO_VERSION
         )
+        write_log(
+            "Preserving matching PyTorch files; only missing or mismatched "
+            "CUDA packages will be changed"
+        )
         install_packages(
             (
                 f"torch=={pytorch_version}",
@@ -287,7 +562,6 @@ class QwenTtsProvider:
             mirror=mirror,
             log=write_log,
             timeout=7200,
-            options=("--force-reinstall",),
             cancel_event=cancel_event,
             index_url=pytorch_index_url,
             index_label=pytorch_index_label,
@@ -298,6 +572,10 @@ class QwenTtsProvider:
             f"qwen-tts=={QWEN_TTS_VERSION}",
             f"sounddevice=={SOUNDDEVICE_VERSION}",
             f"huggingface-hub=={HUGGINGFACE_HUB_VERSION}",
+            "packaging>=24.0",
+            "psutil>=5.9",
+            "ninja>=1.11",
+            "einops>=0.8",
         ]
         if source == "modelscope":
             packages.append(f"modelscope=={MODELSCOPE_VERSION}")
@@ -308,6 +586,123 @@ class QwenTtsProvider:
             timeout=3600,
             cancel_event=cancel_event,
         )
+        write_log("Validating the core Qwen CUDA runtime before optional tools")
+        core_ok, core_message = QwenTtsProvider.dependency_status(source)
+        if not core_ok:
+            raise RuntimeError(core_message)
+        QwenTtsProvider._cleanup_invalid_pip_remnants(write_log)
+        notify("Installing and verifying FlashAttention 2…", None)
+        write_log(
+            "Attempting the official FlashAttention 2 installation; "
+            "Windows source builds are experimental"
+        )
+        try:
+            with QwenTtsProvider._short_build_temporary_directory() as build_temp:
+                write_log(f"Using short FlashAttention build path: {build_temp}")
+                build_environment = {
+                    "MAX_JOBS": "4",
+                    "TEMP": build_temp,
+                    "TMP": build_temp,
+                    "TMPDIR": build_temp,
+                }
+                if sys.platform == "win32":
+                    notify("Installing NVIDIA CUDA 12.6 build tools…", None)
+                    cuda_build_packages = (
+                        f"nvidia-cuda-nvcc-cu12=={NVIDIA_CUDA_NVCC_VERSION}",
+                        "nvidia-cuda-runtime-cu12=="
+                        f"{NVIDIA_CUDA_RUNTIME_VERSION}",
+                        f"nvidia-cuda-cccl-cu12=={NVIDIA_CUDA_CCCL_VERSION}",
+                    )
+                    try:
+                        install_packages(
+                            cuda_build_packages,
+                            mirror=mirror,
+                            log=write_log,
+                            timeout=1800,
+                            cancel_event=cancel_event,
+                        )
+                    except OperationCancelled:
+                        raise
+                    except Exception:
+                        if mirror == "default":
+                            raise
+                        write_log(
+                            "Selected mirror could not provide NVIDIA CUDA "
+                            "build tools; retrying from official PyPI"
+                        )
+                        install_packages(
+                            cuda_build_packages,
+                            mirror="default",
+                            log=write_log,
+                            timeout=1800,
+                            cancel_event=cancel_event,
+                        )
+                    build_environment.update(
+                        QwenTtsProvider._nvidia_pip_cuda_environment()
+                    )
+                    write_log(
+                        "Using pip-installed NVIDIA CUDA compiler: "
+                        f"{Path(build_environment['CUDA_HOME']) / 'bin' / 'nvcc.exe'}"
+                    )
+                    with QwenTtsProvider._verified_nvidia_flash_source(
+                        build_temp,
+                        write_log,
+                        cancel_event,
+                    ) as source_directory:
+                        install_packages(
+                            (str(source_directory),),
+                            mirror=mirror,
+                            log=write_log,
+                            timeout=7200,
+                            options=("--no-build-isolation",),
+                            cancel_event=cancel_event,
+                            environment=build_environment,
+                        )
+                else:
+                    try:
+                        install_packages(
+                            (f"flash-attn=={FLASH_ATTN_VERSION}",),
+                            mirror=mirror,
+                            log=write_log,
+                            timeout=7200,
+                            options=("--no-build-isolation",),
+                            cancel_event=cancel_event,
+                            environment=build_environment,
+                        )
+                    except OperationCancelled:
+                        raise
+                    except Exception:
+                        if mirror == "default":
+                            raise
+                        write_log(
+                            "Selected mirror could not provide FlashAttention; "
+                            "retrying from official PyPI"
+                        )
+                        install_packages(
+                            (f"flash-attn=={FLASH_ATTN_VERSION}",),
+                            mirror="default",
+                            log=write_log,
+                            timeout=7200,
+                            options=("--no-build-isolation",),
+                            cancel_event=cancel_event,
+                            environment=build_environment,
+                        )
+            flash_ok, flash_message = QwenTtsProvider.flash_attention_status()
+            if not flash_ok:
+                raise RuntimeError(flash_message)
+            write_log(f"FlashAttention {FLASH_ATTN_VERSION} passed integrity checks")
+        except OperationCancelled:
+            raise
+        except Exception as error:
+            logger.error(
+                "FlashAttention installation or verification failed; "
+                "Qwen will use optimized PyTorch SDPA",
+                error,
+            )
+            write_log(
+                "WARNING: FlashAttention 2 is unavailable; continuing with "
+                f"optimized PyTorch SDPA: {error}"
+            )
         if cancel_event is not None and cancel_event.is_set():
             raise OperationCancelled("Dependency installation cancelled")
         notify("Checking installed versions and package integrity…", None)
@@ -614,15 +1009,37 @@ class QwenTtsProvider:
             )
             dtype = torch.bfloat16 if supports_bfloat16 else torch.float16
             device_map = "cuda:0"
+            torch.set_float32_matmul_precision("high")
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            for function_name in (
+                "enable_flash_sdp",
+                "enable_mem_efficient_sdp",
+                "enable_math_sdp",
+            ):
+                function = getattr(torch.backends.cuda, function_name, None)
+                if callable(function):
+                    function(True)
+            attention = "sdpa"
+            try:
+                import flash_attn  # noqa: F401
+
+                attention = "flash_attention_2"
+            except Exception as error:
+                logger.info(f"FlashAttention unavailable; using SDPA: {error}")
             self._loaded_model = Qwen3TTSModel.from_pretrained(
                 str(self.model_directory("tts", model_key)),
                 device_map=device_map,
                 dtype=dtype,
-                attn_implementation="sdpa",
+                attn_implementation=attention,
             )
+            runtime_model = getattr(self._loaded_model, "model", None)
+            if runtime_model is not None:
+                runtime_model.eval()
             self._loaded_key = model_key
             logger.info(
-                f"Loaded {TTS_MODELS[model_key].label} on {device_name} ({device_map})"
+                f"Loaded {TTS_MODELS[model_key].label} on {device_name} "
+                f"({device_map}, {dtype}, {attention})"
             )
             return self._loaded_model
 
@@ -639,26 +1056,120 @@ class QwenTtsProvider:
             except ImportError:
                 pass
 
+    def preload(self, model_key: str) -> str:
+        """Load and retain a verified model before playback is requested."""
+        started = time.perf_counter()
+        self._load(model_key)
+        elapsed = time.perf_counter() - started
+        message = f"{TTS_MODELS[model_key].label} preloaded in {elapsed:.1f} s"
+        logger.info(message)
+        return message
+
     def synthesize(
-        self, model_key: str, text: str, speaker: str = "Vivian"
+        self,
+        model_key: str,
+        text: str,
+        speaker: str = "Vivian",
+        language: str = "Auto",
     ) -> tuple[Any, int]:
         selected = TTS_MODELS[model_key]
         valid_speakers = {item.key for item in selected.speakers}
         if speaker not in valid_speakers:
             raise ValueError(f"{speaker!r} is not supported by {selected.label}")
+        if language not in TTS_LANGUAGES:
+            raise ValueError(f"Unsupported Qwen3-TTS language {language!r}")
         model = self._load(model_key)
         wavs, sample_rate = model.generate_custom_voice(
             text=text,
-            language="Auto",
+            language=language,
             speaker=speaker,
+            non_streaming_mode=False,
+            do_sample=False,
+            subtalker_dosample=False,
         )
         if not wavs or len(wavs[0]) == 0:
             raise RuntimeError("Qwen3-TTS generated no audio")
         return wavs[0], int(sample_rate)
 
+    @staticmethod
+    def stream_text_chunks(
+        text: str,
+        max_characters: int = 220,
+    ) -> tuple[str, ...]:
+        """Split prose at natural pauses for low-latency sequential synthesis."""
+        normalized = " ".join(text.split())
+        if not normalized:
+            return ()
+        sentences = re.split(r"(?<=[.!?。！？;；:：])\s+", normalized)
+        pieces: list[str] = []
+        for sentence in sentences:
+            remaining = sentence.strip()
+            while len(remaining) > max_characters:
+                search_start = max(80, max_characters // 2)
+                split_at = max(
+                    remaining.rfind(mark, search_start, max_characters + 1)
+                    for mark in (", ", "; ", ": ", " ")
+                )
+                if split_at < search_start:
+                    split_at = max_characters
+                elif remaining[split_at] in ",;:":
+                    split_at += 1
+                pieces.append(remaining[:split_at].strip())
+                remaining = remaining[split_at:].strip()
+            if remaining:
+                pieces.append(remaining)
+        chunks: list[str] = []
+        for piece in pieces:
+            if chunks and len(chunks[-1]) + 1 + len(piece) <= max_characters:
+                chunks[-1] = f"{chunks[-1]} {piece}"
+            else:
+                chunks.append(piece)
+        return tuple(chunks)
+
+    def synthesize_stream(
+        self,
+        model_key: str,
+        text: str,
+        speaker: str = "Vivian",
+        language: str = "Auto",
+    ) -> Iterator[tuple[Any, int, str]]:
+        selected = TTS_MODELS[model_key]
+        valid_speakers = {item.key for item in selected.speakers}
+        if speaker not in valid_speakers:
+            raise ValueError(f"{speaker!r} is not supported by {selected.label}")
+        if language not in TTS_LANGUAGES:
+            raise ValueError(f"Unsupported Qwen3-TTS language {language!r}")
+        chunks = self.stream_text_chunks(text)
+        if not chunks:
+            raise ValueError("Text is required for Qwen3-TTS playback")
+        model = self._load(model_key)
+        offset = 0
+        while offset < len(chunks):
+            batch_size = 1 if offset == 0 else 2
+            batch = chunks[offset : offset + batch_size]
+            # The local Qwen wrapper simulates streaming text but returns a
+            # complete waveform. Generate the first chunk alone for earlier
+            # playback, then batch two at a time to keep playback buffered.
+            wavs, sample_rate = model.generate_custom_voice(
+                text=list(batch),
+                language=[language] * len(batch),
+                speaker=[speaker] * len(batch),
+                non_streaming_mode=False,
+                do_sample=False,
+                subtalker_dosample=False,
+            )
+            if len(wavs) != len(batch):
+                raise RuntimeError("Qwen3-TTS generated no audio")
+            for waveform, chunk in zip(wavs, batch):
+                if len(waveform) == 0:
+                    raise RuntimeError("Qwen3-TTS generated no audio")
+                yield waveform, int(sample_rate), chunk
+            offset += len(batch)
+
 
 __all__ = [
     "ALIYUN_PYTORCH_CUDA_INDEX_URL",
+    "FLASH_ATTN_VERSION",
     "MODEL_DOWNLOAD_SOURCES",
     "QWEN_SPEAKERS",
     "QWEN_TTS_VERSION",
@@ -669,4 +1180,5 @@ __all__ = [
     "QwenTtsModel",
     "QwenTtsProvider",
     "TTS_MODELS",
+    "TTS_LANGUAGES",
 ]

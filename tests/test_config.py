@@ -85,6 +85,12 @@ class ConfigTests(unittest.TestCase):
             config["stt_model"] = "en_moonshine_tiny_int8"
             config["tts_model"] = "qwen3_tts_1_7b_custom_voice"
             config["tts_speaker"] = "Ryan"
+            config["tts_language"] = "English"
+            config["playing_backend"] = "cosyvoice"
+            config["cosyvoice_model_source"] = "modelscope"
+            config["cosyvoice_model"] = "fun_cosyvoice3_0_5b_2512"
+            config["cosyvoice_prompt_audio"] = "E:/voices/reference.wav"
+            config["cosyvoice_prompt_text"] = "Reference speech"
             config["recording_backend"] = "unknown"
             config["playing_backend"] = "unknown"
             config["pypi_mirror"] = "unknown"
@@ -92,14 +98,26 @@ class ConfigTests(unittest.TestCase):
             config["stt_model"] = "unknown"
             config["tts_model"] = "unknown"
             config["tts_speaker"] = "unknown"
+            config["tts_language"] = "unknown"
 
             self.assertEqual(config["recording_backend"], "sherpa")
-            self.assertEqual(config["playing_backend"], "qwen")
+            self.assertEqual(config["playing_backend"], "cosyvoice")
             self.assertEqual(config["pypi_mirror"], "sjtug")
             self.assertEqual(config["qwen_model_source"], "modelscope")
             self.assertEqual(config["stt_model"], "en_moonshine_tiny_int8")
             self.assertEqual(config["tts_model"], "qwen3_tts_1_7b_custom_voice")
             self.assertEqual(config["tts_speaker"], "Ryan")
+            self.assertEqual(config["tts_language"], "English")
+            self.assertEqual(config["cosyvoice_model_source"], "modelscope")
+            self.assertEqual(
+                config["cosyvoice_model"], "fun_cosyvoice3_0_5b_2512"
+            )
+            self.assertEqual(
+                config["cosyvoice_prompt_audio"], "E:/voices/reference.wav"
+            )
+            self.assertEqual(
+                config["cosyvoice_prompt_text"], "Reference speech"
+            )
 
     def test_legacy_voice_backend_migrates_to_both_independent_backends(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

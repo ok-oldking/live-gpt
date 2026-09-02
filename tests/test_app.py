@@ -6,6 +6,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 
@@ -25,9 +26,130 @@ from live_gpt.app import (  # noqa: E402
     OverlayWindow,
     TranscriptEditor,
     TrayController,
+    _LocalSpeechThread,
 )
 from live_gpt.config import Config  # noqa: E402
 from live_gpt.screen_capture import CaptureSource  # noqa: E402
+
+
+class LocalSpeechThreadTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.application = QApplication.instance() or QApplication([])
+
+    def test_streaming_generation_overlaps_chunked_output_stream(self) -> None:
+        writes: list[object] = []
+
+        class FakeOutputStream:
+            def __init__(self, **kwargs: object) -> None:
+                self.kwargs = kwargs
+
+            def __enter__(self) -> "FakeOutputStream":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def write(self, samples: object) -> None:
+                writes.append(samples)
+
+        manager = Mock()
+        manager.synthesize_stream.return_value = (
+            ([0.1, -0.1], 24_000, "First."),
+            ([0.2, -0.2], 24_000, "Second."),
+        )
+        worker = _LocalSpeechThread(
+            manager,
+            "qwen3_tts_0_6b_custom_voice",
+            "First. Second.",
+            "Ryan",
+        )
+        started: list[str] = []
+        progress: list[object] = []
+        completed: list[tuple[bool, str]] = []
+        worker.started.connect(started.append)
+        worker.progress.connect(progress.append)
+        worker.completed.connect(lambda ok, message: completed.append((ok, message)))
+
+        with patch.dict(
+            "sys.modules",
+            {"sounddevice": SimpleNamespace(OutputStream=FakeOutputStream)},
+        ):
+            worker.run()
+
+        manager.synthesize_stream.assert_called_once_with(
+            "qwen3_tts_0_6b_custom_voice",
+            "First. Second.",
+            "Ryan",
+            "Auto",
+        )
+        manager.synthesize.assert_not_called()
+        self.assertEqual(len(writes), 2)
+        self.assertEqual(started, ["Playing with streaming Qwen3-TTS…"])
+        self.assertEqual(progress[-1], {"text": "First. Second.", "fraction": 1.0})
+        self.assertTrue(completed[0][0])
+        self.assertIn("First audio in", completed[0][1])
+
+    def test_streaming_audio_trims_silence_and_fades_chunk_edges(self) -> None:
+        import numpy as np
+
+        samples = np.concatenate(
+            (
+                np.zeros(1000, dtype=np.float32),
+                np.ones(2000, dtype=np.float32),
+                np.zeros(1000, dtype=np.float32),
+            )
+        )
+
+        prepared = _LocalSpeechThread._prepare_streaming_waveform(
+            np,
+            samples,
+            1000,
+        )
+
+        self.assertEqual(prepared.shape[1], 1)
+        self.assertLess(len(prepared), len(samples))
+        self.assertEqual(float(prepared[0, 0]), 0.0)
+        self.assertEqual(float(prepared[-1, 0]), 0.0)
+
+    def test_continuous_native_stream_preserves_chunk_boundaries(self) -> None:
+        import numpy as np
+
+        writes: list[object] = []
+
+        class FakeOutputStream:
+            def __init__(self, **_kwargs: object) -> None:
+                pass
+
+            def __enter__(self) -> "FakeOutputStream":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def write(self, samples: object) -> None:
+                writes.append(samples)
+
+        manager = Mock()
+        manager.continuous_audio_stream = True
+        manager.stream_prebuffer_seconds = 0.0
+        manager.synthesize_stream.return_value = (
+            ([0.0, 1.0, 0.0], 1, ""),
+            ([], 1, "test"),
+        )
+        worker = _LocalSpeechThread(manager, "cosy", "test")
+
+        with patch.dict(
+            "sys.modules",
+            {"sounddevice": SimpleNamespace(OutputStream=FakeOutputStream)},
+        ):
+            worker.run()
+
+        np.testing.assert_array_equal(
+            writes[0],
+            np.asarray([[0.0], [1.0], [0.0]], dtype=np.float32),
+        )
+        self.assertEqual(len(writes), 1)
 
 
 class TranscriptEditorTests(unittest.TestCase):
@@ -159,7 +281,10 @@ class SettingsDialogTests(unittest.TestCase):
             dialog.playing_nav_button.click()
             self.assertEqual(dialog.settings_pages.currentIndex(), 3)
             self.assertEqual(dialog.playing_backend(), "web")
+            self.assertEqual(dialog.playing_backend_combo.count(), 3)
             self.assertEqual(dialog.tts_model_combo.count(), 2)
+            self.assertEqual(dialog.tts_language_combo.count(), 11)
+            self.assertEqual(dialog.tts_language(), "Auto")
             self.assertEqual(dialog.qwen_model_source_combo.count(), 2)
             self.assertEqual(dialog.qwen_model_source(), "huggingface")
             qwen_layout = dialog.playing_qwen_card.layout()
@@ -246,6 +371,7 @@ class SettingsDialogTests(unittest.TestCase):
             stt_model="en_moonshine_tiny_int8",
             tts_model="qwen3_tts_1_7b_custom_voice",
             tts_speaker="Ryan",
+            tts_language="English",
             pypi_mirror="ali",
             qwen_model_source="modelscope",
         )
@@ -257,12 +383,42 @@ class SettingsDialogTests(unittest.TestCase):
                 local_dialog.tts_model(), "qwen3_tts_1_7b_custom_voice"
             )
             self.assertEqual(local_dialog.tts_speaker(), "Ryan")
+            self.assertEqual(local_dialog.tts_language(), "English")
             self.assertEqual(local_dialog.pypi_mirror(), "ali")
             self.assertEqual(local_dialog.qwen_model_source(), "modelscope")
             self.assertFalse(local_dialog.recording_sherpa_card.isHidden())
             self.assertFalse(local_dialog.playing_qwen_card.isHidden())
         finally:
             local_dialog.close()
+
+        cosy_dialog = HotkeyConfigDialog(
+            QKeySequence("CapsLock"),
+            QKeySequence("Ctrl+S"),
+            QKeySequence("Ctrl+D"),
+            playing_backend="cosyvoice",
+            cosyvoice_model_source="modelscope",
+            cosyvoice_prompt_audio="E:/voices/reference.wav",
+            cosyvoice_prompt_text="My reference transcript",
+        )
+        try:
+            self.assertEqual(cosy_dialog.playing_backend(), "cosyvoice")
+            self.assertFalse(cosy_dialog.playing_qwen_card.isHidden())
+            self.assertFalse(cosy_dialog.cosyvoice_model_combo.isHidden())
+            self.assertTrue(cosy_dialog.tts_model_combo.isHidden())
+            self.assertEqual(
+                cosy_dialog.cosyvoice_model(), "fun_cosyvoice3_0_5b_2512"
+            )
+            self.assertEqual(cosy_dialog.cosyvoice_model_source(), "modelscope")
+            self.assertEqual(
+                cosy_dialog.cosyvoice_prompt_audio(),
+                "E:/voices/reference.wav",
+            )
+            self.assertEqual(
+                cosy_dialog.cosyvoice_prompt_text(),
+                "My reference transcript",
+            )
+        finally:
+            cosy_dialog.close()
 
     def test_settings_save_every_valid_change_without_save_button(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -301,9 +457,19 @@ class SettingsDialogTests(unittest.TestCase):
                 dialog.tts_speaker_combo.setCurrentIndex(
                     dialog.tts_speaker_combo.findData("Ryan")
                 )
+                dialog.tts_language_combo.setCurrentIndex(
+                    dialog.tts_language_combo.findData("English")
+                )
                 dialog.qwen_model_source_combo.setCurrentIndex(
                     dialog.qwen_model_source_combo.findData("modelscope")
                 )
+                dialog.cosyvoice_model_source_combo.setCurrentIndex(
+                    dialog.cosyvoice_model_source_combo.findData("modelscope")
+                )
+                dialog.cosyvoice_prompt_audio_edit.setText(
+                    "E:/voices/reference.wav"
+                )
+                dialog.cosyvoice_prompt_text_edit.setText("Reference transcript")
                 dialog.send_edit.setKeySequence(QKeySequence("Ctrl+Shift+S"))
 
                 saved = json.loads(path.read_text(encoding="utf-8"))
@@ -316,13 +482,64 @@ class SettingsDialogTests(unittest.TestCase):
                     saved["tts_model"], "qwen3_tts_1_7b_custom_voice"
                 )
                 self.assertEqual(saved["tts_speaker"], "Ryan")
+                self.assertEqual(saved["tts_language"], "English")
                 self.assertEqual(saved["qwen_model_source"], "modelscope")
+                self.assertEqual(
+                    saved["cosyvoice_model_source"], "modelscope"
+                )
+                self.assertEqual(
+                    saved["cosyvoice_prompt_audio"],
+                    "E:/voices/reference.wav",
+                )
+                self.assertEqual(
+                    saved["cosyvoice_prompt_text"], "Reference transcript"
+                )
                 self.assertEqual(saved["hotkey_send"], "Ctrl+Shift+S")
             finally:
                 dialog.close()
 
 
 class TrayControllerBrowserTests(unittest.TestCase):
+    def test_qwen_model_preloads_in_background_when_selected(self) -> None:
+        controller = TrayController.__new__(TrayController)
+        controller.config = {
+            "playing_backend": "qwen",
+            "tts_model": "qwen3_tts_0_6b_custom_voice",
+            "qwen_model_source": "huggingface",
+        }
+        controller.tts_manager = Mock()
+        controller.tts_manager.dependency_status.return_value = (
+            True,
+            "runtime verified",
+        )
+        controller._qwen_preload_thread = None
+
+        controller._start_qwen_preload()
+        controller._qwen_preload_thread.join(timeout=2)
+
+        controller.tts_manager.preload.assert_called_once_with(
+            "qwen3_tts_0_6b_custom_voice"
+        )
+
+    def test_invalid_qwen_runtime_is_not_preloaded_or_locked(self) -> None:
+        controller = TrayController.__new__(TrayController)
+        controller.config = {
+            "playing_backend": "qwen",
+            "tts_model": "qwen3_tts_0_6b_custom_voice",
+            "qwen_model_source": "huggingface",
+        }
+        controller.tts_manager = Mock()
+        controller.tts_manager.dependency_status.return_value = (
+            False,
+            "torch is not installed",
+        )
+        controller._qwen_preload_thread = None
+
+        controller._start_qwen_preload()
+        controller._qwen_preload_thread.join(timeout=2)
+
+        controller.tts_manager.preload.assert_not_called()
+
     def test_overlay_is_fifty_percent_wider(self) -> None:
         window = OverlayWindow()
         try:

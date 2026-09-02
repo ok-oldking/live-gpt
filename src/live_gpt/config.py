@@ -29,9 +29,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "playing_backend": "web",
     "pypi_mirror": "default",
     "qwen_model_source": "huggingface",
+    "cosyvoice_model_source": "huggingface",
     "stt_model": "zh_zipformer_ctc_int8_2025_07_03",
     "tts_model": "qwen3_tts_0_6b_custom_voice",
     "tts_speaker": "Vivian",
+    "tts_language": "Auto",
+    "cosyvoice_model": "fun_cosyvoice3_0_5b_2512",
+    "cosyvoice_prompt_audio": "",
+    "cosyvoice_prompt_text": "",
 }
 
 
@@ -67,10 +72,12 @@ def _valid_value(key: str, value: Any, default: Any) -> bool:
     if key == "recording_backend":
         return value in ("web", "sherpa")
     if key == "playing_backend":
-        return value in ("web", "qwen")
+        return value in ("web", "qwen", "cosyvoice")
     if key == "pypi_mirror":
         return value in ("default", "ali", "sjtug")
     if key == "qwen_model_source":
+        return value in ("huggingface", "modelscope")
+    if key == "cosyvoice_model_source":
         return value in ("huggingface", "modelscope")
     if key == "stt_model":
         return value in (
@@ -102,6 +109,22 @@ def _valid_value(key: str, value: Any, default: Any) -> bool:
             "Ono_Anna",
             "Sohee",
         )
+    if key == "tts_language":
+        return value in (
+            "Auto",
+            "Chinese",
+            "English",
+            "Japanese",
+            "Korean",
+            "German",
+            "French",
+            "Russian",
+            "Portuguese",
+            "Spanish",
+            "Italian",
+        )
+    if key == "cosyvoice_model":
+        return value == "fun_cosyvoice3_0_5b_2512"
     if key.startswith("hotkey_"):
         return bool(value.strip())
     if key == "window_geometry":

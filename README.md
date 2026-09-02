@@ -71,20 +71,52 @@ yet. Every valid change is saved immediately, so the styled title-bar close
 button is the only dismissal control and there is no separate Save Changes step.
 Recording independently chooses the browser or local Sherpa-ONNX, while
 Playing independently chooses the browser or local
-[Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS). Local controls
+[Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS), or local
+[CosyVoice 3](https://github.com/FunAudioLLM/CosyVoice). Local controls
 stay hidden when the corresponding web engine is selected. The STT catalog
 includes five Mandarin and five English options. Playback offers Qwen3-TTS
 CustomVoice 0.6B and 1.7B models with nine named Chinese, English, Japanese,
-and Korean speakers. Local Qwen playback requires a detected NVIDIA GPU and is
+and Korean speakers. CosyVoice offers the Fun-CosyVoice3 0.5B 2512 streaming
+model with zero-shot voice cloning: choose a reference WAV and enter its exact
+transcript, or leave both blank to use the official example voice. Local Qwen
+and CosyVoice playback require a detected NVIDIA GPU and are
 blocked when CUDA-enabled PyTorch is unavailable. Runtime repair installs a
 matched CUDA 12.6 PyTorch/Torchaudio build from PyTorch's NVIDIA wheel index;
 the selected PyPI mirror is added as the dependency index for that installation.
+Repair preserves matching PyTorch files so Windows never needs to overwrite a
+CUDA extension currently loaded by the running app; only missing or mismatched
+packages are changed.
+Qwen playback generates a first natural text chunk immediately, then uses a
+two-chunk lookahead buffer while later chunks are generated concurrently with
+current audio playback. Deterministic decoding keeps the speaker timbre steadier;
+generated edge silence is trimmed and short fades soften chunk joins. Playback
+language can be selected explicitly from Qwen's ten languages or left on the
+saved Auto default. The selected local model is preloaded in a background thread
+at startup so model initialization is normally complete before the first reply
+is played. Invalid or incomplete runtimes are never preloaded, leaving their
+binary files unlocked so Install / Repair can recover them. CUDA loading enables BF16/FP16, optimized SDPA
+kernels, and TF32 where applicable. Install / Repair also installs the official
+FlashAttention build prerequisites, attempts `flash-attn --no-build-isolation`
+with four build jobs, retries official PyPI when the selected mirror cannot
+provide the source package, extracts the unusually deep source tree through a
+temporary drive-root or mapped-drive path to avoid the Windows 260-character
+limit, verifies the PyPI archive's SHA-256 digest, and omits the AMD-only
+Composable Kernel subtree before the NVIDIA build. On Windows it installs and
+locates NVIDIA's CUDA 12.6 NVCC, runtime, and CCCL wheels for the build. The
+selected PyPI mirror is used first, with official PyPI as fallback. Successful
+repair also removes known
+invalid `~orch`-style pip backups left by an interrupted reinstall. If the experimental
+Windows build is unavailable, the logged error identifies the cause and Qwen
+continues with optimized SDPA.
 If CPU PyTorch was already loaded by an earlier playback attempt, restart Live
 GPT after the repair. It installs each provider's pinned runtime and related
 dependencies through the current Python interpreter only when requested,
 verifies package versions and wheel integrity, and builds local SHA-256 model
-manifests. Qwen models can be downloaded from Hugging Face (the default) or
-ModelScope; the source selection is saved immediately. Models are stored under
+manifests. Qwen and CosyVoice models can be downloaded from Hugging Face (the
+default) or ModelScope; each source selection is saved immediately. CosyVoice
+repair installs and integrity-checks the official recursive Git checkout,
+reuses a valid checkout on later repairs, and safely removes Windows read-only
+Git objects from old runtime backups. Models and the CosyVoice runtime are stored under
 the working directory's `models` folder and loaded from that local path.
 If the selected hub client is missing, Download installs and verifies it through
 the selected PyPI mirror before fetching the model. Installer output is
@@ -120,7 +152,9 @@ Preferences are stored as JSON in `%APPDATA%\Live GPT\config.json`. The file is
 updated automatically when a preference changes and includes the language,
 hotkeys, auto-send and auto-hide states, selected screenshot source, selected
 ChatGPT conversation, independent recording/playback backends, local STT/TTS
-models, Qwen download source and TTS speaker, overlay position and size, and
+models, Qwen/CosyVoice download sources, Qwen speaker and playback language,
+CosyVoice reference-audio path and transcript, overlay position
+and size, and
 position-lock state. A
 missing, unreadable, or invalid configuration falls back to safe defaults and
 is repaired on disk. Existing registry-based hotkeys are migrated on the first

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Iterable
 from typing import Any, Callable, Protocol
 
 
@@ -35,8 +36,12 @@ class ModelProvider(Protocol):
 
 class TextToSpeechProvider(ModelProvider, Protocol):
     def synthesize(
-        self, model_key: str, text: str, speaker: str
+        self, model_key: str, text: str, speaker: str, language: str = "Auto"
     ) -> tuple[Any, int]: ...
+
+    def synthesize_stream(
+        self, model_key: str, text: str, speaker: str, language: str = "Auto"
+    ) -> Iterable[tuple[Any, int, str]]: ...
 
 
 __all__ = [

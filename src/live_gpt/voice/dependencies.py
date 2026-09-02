@@ -5,6 +5,7 @@ import hashlib
 import importlib
 import importlib.metadata
 import json
+import os
 import re
 import subprocess
 import sys
@@ -12,7 +13,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import asdict, dataclass
-from typing import Sequence
+from typing import Mapping, Sequence
 
 from .base import LogCallback
 
@@ -125,6 +126,7 @@ def run_logged_process(
     timeout: float,
     cancel_event: threading.Event | None = None,
     pip_progress: bool = False,
+    environment: Mapping[str, str] | None = None,
 ) -> tuple[int, str]:
     """Run a child process while forwarding its merged output line by line."""
     creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
@@ -137,6 +139,7 @@ def run_logged_process(
         errors="replace",
         bufsize=1,
         creationflags=creationflags,
+        env={**os.environ, **environment} if environment else None,
     )
     timed_out = threading.Event()
     cancelled = threading.Event()
@@ -210,6 +213,7 @@ def install_packages(
     cancel_event: threading.Event | None = None,
     index_url: str = "",
     index_label: str = "",
+    environment: Mapping[str, str] | None = None,
 ) -> None:
     """Install packages with a selected index without changing pip config."""
     selected = PYPI_MIRRORS.get(mirror)
@@ -240,12 +244,18 @@ def install_packages(
         ]
         log(f"Using {selected.label} for dependencies: {selected.index_url}")
     log(f"Command: {subprocess.list2cmdline(command)}")
+    if environment:
+        log(
+            "Environment: "
+            + " ".join(f"{key}={value}" for key, value in environment.items())
+        )
     return_code, detail = run_logged_process(
         command,
         log,
         timeout=timeout,
         cancel_event=cancel_event,
         pip_progress=True,
+        environment=environment,
     )
     if return_code != 0:
         raise RuntimeError(f"pip install failed with exit code {return_code}: {detail}")
