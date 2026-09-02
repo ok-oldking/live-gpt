@@ -3434,6 +3434,16 @@ class OverlayWindow(QMainWindow):
     def set_dictation_listening(self) -> None:
         self.dictation_state_label.setText("Listening…")
 
+    def set_dictation_partial(
+        self,
+        text: str,
+        *,
+        finishing: bool = False,
+    ) -> None:
+        if text.strip():
+            state = "Finishing dictation…" if finishing else "Listening…"
+            self.dictation_state_label.setText(f"{state}\n\n{text}")
+
     def set_dictation_finishing(self) -> None:
         self.dictation_state_label.setText("Finishing dictation…")
 
@@ -3878,6 +3888,7 @@ class TrayController:
         self.sovits_manager = SovitsTtsProvider()
         self._local_dictation_thread: _LocalDictationThread | None = None
         self._local_speech_thread: _LocalSpeechThread | None = None
+        self._stt_preload_thread: threading.Thread | None = None
         self._qwen_preload_thread: threading.Thread | None = None
         self._migrate_legacy_hotkeys()
         self.window = OverlayWindow()
@@ -4021,6 +4032,7 @@ class TrayController:
         self.tray_icon.show()
         logger.info("System tray icon is ready")
         self.show_window()
+        self._start_stt_preload()
         self._start_qwen_preload()
 
     @staticmethod
@@ -4126,6 +4138,7 @@ class TrayController:
             self.browser_monitor.set_use_browser_voice(
                 self.config["playing_backend"] == "web"
             )
+            self._start_stt_preload()
             self._start_qwen_preload()
             self.hotkey_monitor.update_bindings(
                 bindings["hold"],
@@ -4263,6 +4276,32 @@ class TrayController:
         self._qwen_preload_thread = worker
         worker.start()
 
+    def _start_stt_preload(self) -> None:
+        """Warm local transcription before the first microphone press."""
+        if str(self.config["recording_backend"]) != "sherpa":
+            return
+        existing = getattr(self, "_stt_preload_thread", None)
+        if existing is not None and existing.is_alive():
+            return
+        model_key = str(self.config["stt_model"])
+
+        def preload() -> None:
+            try:
+                message = self.stt_manager.preload(model_key)
+                logger.info(f"Sherpa background preload complete: {message}")
+            except Exception as error:
+                logger.warning(
+                    f"Sherpa background preload skipped: {error}"
+                )
+
+        worker = threading.Thread(
+            target=preload,
+            name="local-stt-background-preload",
+            daemon=True,
+        )
+        self._stt_preload_thread = worker
+        worker.start()
+
     def _local_speech_finished(self) -> None:
         worker = self._local_speech_thread
         self._local_speech_thread = None
@@ -4334,6 +4373,7 @@ class TrayController:
                 "Sherpa-ONNX is listening",
             )
         )
+        worker.partial_text.connect(self._on_local_dictation_partial)
         worker.completed.connect(self._on_dictation_finished)
         worker.finished.connect(self._local_dictation_finished)
         worker.start()
@@ -4343,6 +4383,17 @@ class TrayController:
         self._local_dictation_thread = None
         if worker is not None:
             worker.deleteLater()
+
+    def _on_local_dictation_partial(self, text: str) -> None:
+        state = getattr(self, "_dictation_state", "idle")
+        if state in (
+            "listening",
+            "finishing",
+        ):
+            self.window.set_dictation_partial(
+                text,
+                finishing=state == "finishing",
+            )
 
     def finish_dictation(self) -> None:
         self._dictation_input_held = False

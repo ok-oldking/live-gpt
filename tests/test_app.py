@@ -500,6 +500,22 @@ class SettingsDialogTests(unittest.TestCase):
 
 
 class TrayControllerBrowserTests(unittest.TestCase):
+    def test_stt_model_preloads_in_background_when_selected(self) -> None:
+        controller = TrayController.__new__(TrayController)
+        controller.config = {
+            "recording_backend": "sherpa",
+            "stt_model": "en_moonshine_tiny_int8",
+        }
+        controller.stt_manager = Mock()
+        controller._stt_preload_thread = None
+
+        controller._start_stt_preload()
+        controller._stt_preload_thread.join(timeout=2)
+
+        controller.stt_manager.preload.assert_called_once_with(
+            "en_moonshine_tiny_int8"
+        )
+
     def test_qwen_model_preloads_in_background_when_selected(self) -> None:
         controller = TrayController.__new__(TrayController)
         controller.config = {
@@ -1375,6 +1391,12 @@ class TrayControllerBrowserTests(unittest.TestCase):
             window.set_dictation_listening()
             self.assertEqual(window.dictation_state_label.text(), "Listening…")
 
+            window.set_dictation_partial("实时转写")
+            self.assertEqual(
+                window.dictation_state_label.text(),
+                "Listening…\n\n实时转写",
+            )
+
             window.end_dictation_display()
             self.assertFalse(window.transcript_area.isHidden())
             self.assertTrue(window.dictation_panel.isHidden())
@@ -1408,6 +1430,18 @@ class TrayControllerBrowserTests(unittest.TestCase):
         controller.window.set_dictation_listening.assert_called_once_with()
         controller.window.set_dictation_finishing.assert_called_once_with()
         self.assertEqual(controller._dictation_state, "finishing")
+
+    def test_local_streaming_partial_updates_visible_dictation_text(self) -> None:
+        controller = TrayController.__new__(TrayController)
+        controller.window = Mock()
+        controller._dictation_state = "listening"
+
+        controller._on_local_dictation_partial("live words")
+
+        controller.window.set_dictation_partial.assert_called_once_with(
+            "live words",
+            finishing=False,
+        )
 
     @patch("live_gpt.app.capture_webp", return_value=b"release-screenshot")
     def test_auto_send_screenshot_is_frozen_on_microphone_release(

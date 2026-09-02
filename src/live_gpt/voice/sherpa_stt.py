@@ -27,6 +27,8 @@ SHERPA_ONNX_VERSION = "1.13.6"
 SOUNDDEVICE_VERSION = "0.5.6"
 NUMPY_VERSION = "2.5.2"
 logger = Logger.get_logger(__name__)
+_STREAM_POLL_SECONDS = 0.02
+_RELEASE_TAIL_SECONDS = 0.25
 
 
 @dataclass(frozen=True)
@@ -174,6 +176,9 @@ class SherpaSttProvider:
         self.model_root = Path(model_root) if model_root is not None else (
             default_config_path().parent / "models" / "sherpa-onnx"
         )
+        self._recognizer_lock = threading.RLock()
+        self._recognizers: dict[str, Any] = {}
+        self._verified_models: set[str] = set()
 
     @staticmethod
     def dependency_status() -> tuple[bool, str]:
@@ -356,6 +361,7 @@ class SherpaSttProvider:
             )
             destination = self.model_directory(model_type, model.key)
             backup = parent / f".{model.key}-backup-{time.time_ns()}"
+            self._invalidate_model(model.key)
             if destination.exists():
                 os.replace(destination, backup)
             try:
@@ -416,20 +422,40 @@ class SherpaSttProvider:
                          np.arange(len(source)), source).astype(np.float32)
 
     def transcribe(self, model_key: str, samples: Any, sample_rate: int) -> str:
-        import sherpa_onnx
-
         selected = STT_MODELS[model_key]
-        root = self.model_directory("stt", model_key)
         samples = self._resample(samples, sample_rate)
-        threads = max(min(os.cpu_count() or 1, 4), 1)
         if selected.kind == "online_zipformer_ctc":
-            recognizer = self.create_streaming_recognizer(model_key)
+            recognizer = self._get_recognizer(model_key, verify=False)
             stream = recognizer.create_stream()
             stream.accept_waveform(16_000, samples)
             stream.input_finished()
             while recognizer.is_ready(stream):
                 recognizer.decode_stream(stream)
             return str(recognizer.get_result(stream)).strip()
+
+        recognizer = self._get_recognizer(model_key, verify=False)
+        stream = recognizer.create_stream()
+        stream.accept_waveform(16_000, samples)
+        recognizer.decode_stream(stream)
+        return str(stream.result.text).strip()
+
+    def _create_recognizer(self, model_key: str) -> Any:
+        """Construct a recognizer. Callers must hold ``_recognizer_lock``."""
+        import sherpa_onnx
+
+        selected = STT_MODELS[model_key]
+        root = self.model_directory("stt", model_key)
+        threads = max(min(os.cpu_count() or 1, 4), 1)
+        if selected.kind == "online_zipformer_ctc":
+            return sherpa_onnx.OnlineRecognizer.from_zipformer2_ctc(
+                tokens=str(root / "tokens.txt"),
+                model=str(root / "model.int8.onnx"),
+                num_threads=threads,
+                enable_endpoint_detection=False,
+                decoding_method="greedy_search",
+                provider="cpu",
+                debug=False,
+            )
 
         common = {
             "tokens": str(root / "tokens.txt"),
@@ -466,30 +492,54 @@ class SherpaSttProvider:
                 cached_decoder=str(root / "cached_decode.int8.onnx"),
                 **common,
             )
-        stream = recognizer.create_stream()
-        stream.accept_waveform(16_000, samples)
-        recognizer.decode_stream(stream)
-        return str(stream.result.text).strip()
+        return recognizer
+
+    def _get_recognizer(self, model_key: str, *, verify: bool) -> Any:
+        if model_key not in STT_MODELS:
+            raise ValueError(f"Unknown STT model {model_key!r}")
+        with self._recognizer_lock:
+            if verify and model_key not in self._verified_models:
+                ok, message = self.model_status("stt", model_key)
+                if not ok:
+                    raise RuntimeError(message)
+                self._verified_models.add(model_key)
+            cached = self._recognizers.get(model_key)
+            if cached is not None:
+                return cached
+
+            recognizer = self._create_recognizer(model_key)
+            self._recognizers[model_key] = recognizer
+            return recognizer
+
+    def _invalidate_model(self, model_key: str) -> None:
+        with self._recognizer_lock:
+            self._recognizers.pop(model_key, None)
+            self._verified_models.discard(model_key)
+
+    def prepare(self, model_key: str) -> Any:
+        """Verify and load a model once, then reuse its recognizer."""
+        # Import PortAudio during background preload, but do not open the input
+        # device until recording actually starts.
+        import sounddevice  # noqa: F401
+
+        return self._get_recognizer(model_key, verify=True)
+
+    def preload(self, model_key: str) -> str:
+        started = time.perf_counter()
+        with self._recognizer_lock:
+            already_loaded = model_key in self._recognizers
+            self.prepare(model_key)
+        label = STT_MODELS[model_key].label
+        if already_loaded:
+            return f"{label} is already preloaded"
+        return f"{label} preloaded in {time.perf_counter() - started:.1f} s"
 
     def create_streaming_recognizer(self, model_key: str) -> Any:
-        """Create the public Sherpa online recognizer for a streaming model."""
-        import sherpa_onnx
-
+        """Return the reusable Sherpa online recognizer for a streaming model."""
         selected = STT_MODELS[model_key]
         if selected.kind != "online_zipformer_ctc":
             raise ValueError(f"{selected.label} is not a streaming model")
-        root = self.model_directory("stt", model_key)
-        # Online configuration classes are internal in the Python binding;
-        # the public factory builds the version-compatible native config.
-        return sherpa_onnx.OnlineRecognizer.from_zipformer2_ctc(
-            tokens=str(root / "tokens.txt"),
-            model=str(root / "model.int8.onnx"),
-            num_threads=max(min(os.cpu_count() or 1, 4), 1),
-            enable_endpoint_detection=False,
-            decoding_method="greedy_search",
-            provider="cpu",
-            debug=False,
-        )
+        return self._get_recognizer(model_key, verify=False)
 
 
 class LocalDictationSession:
@@ -498,6 +548,7 @@ class LocalDictationSession:
     def __init__(self, manager: SherpaSttProvider, stt_model: str) -> None:
         self.manager = manager
         self.stt_model = stt_model
+        self._created_at = time.perf_counter()
         self._stop = threading.Event()
         self._cancelled = False
 
@@ -511,9 +562,6 @@ class LocalDictationSession:
         partial: Callable[[str], None] | None = None,
     ) -> tuple[bool, str, str]:
         try:
-            ok, message = self.manager.model_status("stt", self.stt_model)
-            if not ok:
-                raise RuntimeError(message)
             import numpy as np
             import sounddevice as sd
 
@@ -537,32 +585,58 @@ class LocalDictationSession:
                     return pending
 
             streaming = STT_MODELS[self.stt_model].mode == "Streaming"
-            recognizer = (
-                self.manager.create_streaming_recognizer(self.stt_model)
-                if streaming
-                else None
-            )
+            prepared_recognizer = self.manager.prepare(self.stt_model)
+            recognizer = prepared_recognizer if streaming else None
             stream = recognizer.create_stream() if recognizer is not None else None
-            with sd.InputStream(samplerate=16_000, channels=1, dtype="float32", callback=receive):
+            with sd.InputStream(
+                samplerate=16_000,
+                channels=1,
+                dtype="float32",
+                latency="low",
+                callback=receive,
+            ):
                 started_at = time.perf_counter()
+                logger.info(
+                    "Local microphone ready "
+                    f"startup_ms={(started_at - self._created_at) * 1000:.0f} "
+                    f"model={self.stt_model!r}"
+                )
                 started()
                 if recognizer is None or stream is None:
                     self._stop.wait()
+                    if not self._cancelled:
+                        time.sleep(_RELEASE_TAIL_SECONDS)
                 else:
                     last_partial = ""
-                    while not self._stop.wait(0.05):
+                    release_deadline: float | None = None
+                    while True:
+                        if self._stop.is_set():
+                            if self._cancelled:
+                                break
+                            if release_deadline is None:
+                                release_deadline = (
+                                    time.perf_counter()
+                                    + _RELEASE_TAIL_SECONDS
+                                )
+                            if time.perf_counter() >= release_deadline:
+                                break
+                            time.sleep(_STREAM_POLL_SECONDS)
+                        else:
+                            self._stop.wait(_STREAM_POLL_SECONDS)
                         pending = take_chunks()
                         if pending:
                             stream.accept_waveform(
                                 16_000, np.concatenate(pending)
                             )
-                        while recognizer.is_ready(stream):
-                            recognizer.decode_stream(stream)
-                        current = str(recognizer.get_result(stream)).strip()
-                        if current != last_partial:
-                            last_partial = current
-                            if partial is not None:
-                                partial(current)
+                            while recognizer.is_ready(stream):
+                                recognizer.decode_stream(stream)
+                            current = str(
+                                recognizer.get_result(stream)
+                            ).strip()
+                            if current != last_partial:
+                                last_partial = current
+                                if partial is not None:
+                                    partial(current)
             if self._cancelled:
                 return True, "", "Short local dictation cancelled"
             if captured_samples == 0:

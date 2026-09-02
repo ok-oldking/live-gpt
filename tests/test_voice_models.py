@@ -924,26 +924,52 @@ class VoiceModelManagerTests(unittest.TestCase):
         recognizer.decode_stream.assert_called_once_with(stream)
         recognizer.get_result.assert_called_once_with(stream)
 
+    def test_sherpa_prepare_verifies_and_loads_selected_model_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = SherpaSttProvider(directory)
+            recognizer = object()
+            manager.model_status = Mock(return_value=(True, "ready"))
+            manager._create_recognizer = Mock(return_value=recognizer)
+
+            with patch.dict(sys.modules, {"sounddevice": SimpleNamespace()}):
+                first = manager.prepare("en_moonshine_tiny_int8")
+                second = manager.prepare("en_moonshine_tiny_int8")
+
+        self.assertIs(first, recognizer)
+        self.assertIs(second, recognizer)
+        manager.model_status.assert_called_once_with(
+            "stt", "en_moonshine_tiny_int8"
+        )
+        manager._create_recognizer.assert_called_once_with(
+            "en_moonshine_tiny_int8"
+        )
+
     def test_streaming_session_emits_partial_text_before_final_result(self) -> None:
         manager = Mock()
-        manager.model_status.return_value = (True, "ready")
         stream = Mock()
         recognizer = Mock()
         recognizer.create_stream.return_value = stream
-        manager.create_streaming_recognizer.return_value = recognizer
+        manager.prepare.return_value = recognizer
         session = LocalDictationSession(
             manager,
             "zh_streaming_zipformer_small_ctc_int8_2025_04_01",
         )
 
-        results = iter(("实时", "实时完成"))
+        results = iter(("实时", "实时结尾", "实时完成"))
 
         def decode(_stream: object) -> None:
             if recognizer.decode_stream.call_count == 1:
                 session.stop()
 
         recognizer.decode_stream.side_effect = decode
-        recognizer.is_ready.side_effect = [True, False, True, False]
+        recognizer.is_ready.side_effect = [
+            True,
+            False,
+            True,
+            False,
+            True,
+            False,
+        ]
         recognizer.get_result.side_effect = lambda _stream: next(results)
 
         class FakeAudio:
@@ -953,12 +979,23 @@ class VoiceModelManagerTests(unittest.TestCase):
             def copy(self) -> list[float]:
                 return [0.1, 0.2]
 
+        input_options: dict[str, object] = {}
+
+        timers: list[threading.Timer] = []
+
         class FakeInputStream:
             def __init__(self, **kwargs: object) -> None:
+                input_options.update(kwargs)
                 self.callback = kwargs["callback"]
 
             def __enter__(self) -> FakeInputStream:
                 self.callback(FakeAudio(), 2, None, None)
+                timer = threading.Timer(
+                    0.05,
+                    lambda: self.callback(FakeAudio(), 2, None, None),
+                )
+                timers.append(timer)
+                timer.start()
                 return self
 
             def __exit__(self, *_args: object) -> None:
@@ -972,13 +1009,17 @@ class VoiceModelManagerTests(unittest.TestCase):
             {"numpy": fake_numpy, "sounddevice": fake_sounddevice},
         ):
             success, text, message = session.run(lambda: None, partials.append)
+        for timer in timers:
+            timer.join(timeout=1)
 
         self.assertTrue(success)
         self.assertEqual(text, "实时完成")
-        self.assertEqual(partials, ["实时", "实时完成"])
+        self.assertEqual(partials, ["实时", "实时结尾", "实时完成"])
         self.assertTrue(message.startswith("Finalized in "))
         manager.transcribe.assert_not_called()
-        self.assertEqual(recognizer.get_result.call_count, 2)
+        self.assertEqual(stream.accept_waveform.call_count, 2)
+        self.assertEqual(recognizer.get_result.call_count, 3)
+        self.assertEqual(input_options["latency"], "low")
 
     def test_cosyvoice_bundle_status_checks_every_downloaded_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
