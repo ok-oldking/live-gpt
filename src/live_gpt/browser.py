@@ -120,6 +120,14 @@ class _SendRequest:
     tab_id: str
     text: str
     screenshot_webp: bytes | None = None
+    preserve_attachments: bool = False
+
+
+@dataclass(frozen=True)
+class _AttachmentRequest:
+    action: str
+    tab_id: str
+    screenshot_webp: bytes | None = None
 
 
 @dataclass(frozen=True)
@@ -179,6 +187,7 @@ class BrowserMonitor(QThread):
     reading_changed = Signal(object)
     reading_finished = Signal(bool, str)
     local_voice_requested = Signal(str)
+    local_voice_updated = Signal(str, bool)
     dictation_started = Signal(bool, str)
     dictation_finished = Signal(bool, str, str)
     clear_finished = Signal(bool, str)
@@ -188,6 +197,7 @@ class BrowserMonitor(QThread):
         self._stop_requested = False
         self._retry_connection_requested = False
         self._send_requests: Queue[_SendRequest] = Queue()
+        self._attachment_requests: Queue[_AttachmentRequest] = Queue()
         self._dictation_requests: Queue[_DictationRequest] = Queue()
         self._clear_requests: Queue[_ClearRequest] = Queue()
         self._wake_event = threading.Event()
@@ -211,6 +221,8 @@ class BrowserMonitor(QThread):
         tab_id: str,
         text: str,
         screenshot_webp: bytes | None = None,
+        *,
+        preserve_attachments: bool = False,
     ) -> None:
         """Queue text for the selected ChatGPT page on the worker thread."""
         self._send_requests.put(
@@ -218,8 +230,23 @@ class BrowserMonitor(QThread):
                 tab_id=tab_id,
                 text=text,
                 screenshot_webp=screenshot_webp,
+                preserve_attachments=preserve_attachments,
             )
         )
+        self._wake_event.set()
+
+    def request_replace_attachment(
+        self,
+        tab_id: str,
+        screenshot_webp: bytes,
+    ) -> None:
+        self._attachment_requests.put(
+            _AttachmentRequest("replace", tab_id, screenshot_webp)
+        )
+        self._wake_event.set()
+
+    def request_clear_attachments(self, tab_id: str) -> None:
+        self._attachment_requests.put(_AttachmentRequest("clear", tab_id))
         self._wake_event.set()
 
     def request_start_dictation(self, tab_id: str) -> None:
@@ -280,6 +307,10 @@ class BrowserMonitor(QThread):
                     else None
                 )
                 self._process_dictation_requests(
+                    connected_browser,
+                    PlaywrightError,
+                )
+                self._process_attachment_requests(
                     connected_browser,
                     PlaywrightError,
                 )
@@ -511,6 +542,50 @@ class BrowserMonitor(QThread):
         else:
             self.dictation_finished.emit(False, "", message)
 
+    def _process_attachment_requests(
+        self,
+        browser: Any | None,
+        playwright_error: type[Exception],
+    ) -> None:
+        while True:
+            try:
+                request = self._attachment_requests.get_nowait()
+            except Empty:
+                return
+
+            if browser is None:
+                logger.warning(
+                    "Unable to update dictation screenshot: browser is not connected"
+                )
+                continue
+            page = self._find_chatgpt_page(
+                browser,
+                request.tab_id,
+                playwright_error,
+            )
+            if page is None:
+                logger.warning(
+                    "Unable to update dictation screenshot: ChatGPT tab is gone"
+                )
+                continue
+            try:
+                self._clear_chatgpt_attachments(page)
+                if request.action == "replace":
+                    if request.screenshot_webp is None:
+                        raise RuntimeError("The screenshot data is empty")
+                    self._paste_screenshot(page, request.screenshot_webp)
+                    logger.info(
+                        "Pasted dictation screenshot into ChatGPT "
+                        f"tab_id={request.tab_id!r}"
+                    )
+                else:
+                    logger.info(
+                        "Removed pending dictation screenshot from ChatGPT "
+                        f"tab_id={request.tab_id!r}"
+                    )
+            except Exception as error:
+                logger.error("Unable to update dictation screenshot", error)
+
     def _process_clear_requests(
         self,
         browser: Any | None,
@@ -600,6 +675,7 @@ class BrowserMonitor(QThread):
                     page,
                     request.text,
                     request.screenshot_webp,
+                    preserve_attachments=request.preserve_attachments,
                 )
             except Exception as error:
                 logger.error("Unable to send text to ChatGPT", error)
@@ -632,6 +708,8 @@ class BrowserMonitor(QThread):
             )
         except Exception as error:
             logger.error("Unable to read the ChatGPT response", error)
+            if not self._use_browser_voice and response.last_text:
+                self.local_voice_updated.emit(response.last_text, True)
             self.response_finished.emit(
                 False,
                 f"Could not read ChatGPT's reply: {error}",
@@ -658,6 +736,8 @@ class BrowserMonitor(QThread):
         ):
             response.last_status = snapshot.status
             self.response_changed.emit(snapshot.status, snapshot.text)
+        if text_changed and not self._use_browser_voice and snapshot.text:
+            self.local_voice_updated.emit(snapshot.text, False)
         completion_candidate = (
             snapshot.has_new_turn
             and bool(snapshot.text)
@@ -689,6 +769,8 @@ class BrowserMonitor(QThread):
         )
         if not is_complete:
             if response_age >= 600:
+                if not self._use_browser_voice and response.last_text:
+                    self.local_voice_updated.emit(response.last_text, True)
                 self.response_finished.emit(
                     False,
                     "Timed out while waiting for ChatGPT's reply",
@@ -703,8 +785,9 @@ class BrowserMonitor(QThread):
             )
             self.response_finished.emit(
                 True,
-                "Reply complete · Starting local voice",
+                "Reply complete · Local voice queued",
             )
+            self.local_voice_updated.emit(snapshot.text, True)
             self.local_voice_requested.emit(snapshot.text)
             state.active_response = None
             return
@@ -861,10 +944,13 @@ class BrowserMonitor(QThread):
         page: Any,
         text: str,
         screenshot_webp: bytes | None = None,
+        *,
+        preserve_attachments: bool = False,
     ) -> None:
         composer = page.locator(CHATGPT_COMPOSER_SELECTOR).first
         composer.wait_for(state="visible", timeout=5_000)
-        cls._clear_chatgpt_attachments(page)
+        if not preserve_attachments:
+            cls._clear_chatgpt_attachments(page)
         composer.fill(text)
         if screenshot_webp is not None:
             cls._paste_screenshot(page, screenshot_webp)

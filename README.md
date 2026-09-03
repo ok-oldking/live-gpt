@@ -37,7 +37,7 @@ While the button is held, the input area is replaced by a waiting state until
 ChatGPT's dictation-end control appears, followed by a listening state. Closing
 the app cancels these browser waits promptly. Before a new session, Live GPT
 cancels any stale browser dictation. A mouse dictation must remain held for at
-least 0.5 seconds after ChatGPT starts listening or it is cancelled. The global
+least 0.5 seconds after it is pressed or it is cancelled. The global
 hold hotkey waits 0.3 seconds before starting, so a quick tap has no effect.
 
 The recognized text remains editable. Its paper-plane button sends the current
@@ -60,9 +60,11 @@ BitBlt/PrintWindow approach with full-content rendering enabled.
 When a screenshot source is selected, the **With Screenshot** action remains
 available even with an empty prompt. If the editor also contains text, a
 paper-plane **No Screenshot** action appears so the prompt can be sent without
-changing the selector. For dictated prompts using **Auto Send**, the screenshot
-is captured when the microphone key or button is released, so browser
-dictation processing time does not change the captured moment.
+changing the selector. For dictated prompts using **Auto Send**, Live GPT
+captures and pastes the selected screenshot into ChatGPT after the microphone
+has remained pressed for 0.5 seconds. A cancelled short press uploads nothing.
+Starting another recording before the pending prompt is sent removes the
+previously uploaded screenshot before preparing the new one.
 
 The **Configure** button opens the application settings, organized into
 Shortcuts, Language, Recording, and Playing pages in the left navigation. English and
@@ -105,6 +107,13 @@ at startup so model initialization is normally complete before the first reply
 is played. Invalid or incomplete runtimes are never preloaded, leaving their
 binary files unlocked so Install / Repair can recover them. CUDA loading enables BF16/FP16, optimized SDPA
 kernels, and TF32 where applicable. Install / Repair also installs the official
+
+For every local TTS backend, Live GPT sends the first complete sentence to the
+model while ChatGPT is still generating. Later complete sentences are added to
+the same synthesis queue, generated ahead of playback, and written through one
+persistent audio stream until the final response remainder has played.
+
+Install / Repair also installs the official
 FlashAttention build prerequisites, attempts `flash-attn --no-build-isolation`
 with four build jobs, retries official PyPI when the selected mirror cannot
 provide the source package, extracts the unusually deep source tree through a

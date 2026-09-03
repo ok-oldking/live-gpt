@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -90,6 +91,7 @@ MICROPHONE_ICON_PATH = ASSET_DIRECTORY / "microphone.svg"
 AUTO_HIDE_ICON_PATH = ASSET_DIRECTORY / "auto-hide.svg"
 EXIT_ICON_PATH = ASSET_DIRECTORY / "exit.svg"
 SEND_ICON_PATH = ASSET_DIRECTORY / "send.svg"
+SPEAKER_ICON_PATH = ASSET_DIRECTORY / "speaker.svg"
 CHECK_ICON_PATH = ASSET_DIRECTORY / "check.svg"
 SETTINGS_ICON_PATH = ASSET_DIRECTORY / "settings.svg"
 SHORTCUTS_ICON_PATH = ASSET_DIRECTORY / "shortcuts.svg"
@@ -120,6 +122,7 @@ class _PendingDictationCapture:
     source: CaptureSource | None
     screenshot: bytes | None
     error: str | None = None
+    preuploaded: bool = False
 
 
 class _VoiceOperationThread(QThread):
@@ -495,6 +498,203 @@ class _LocalSpeechThread(QThread):
         return waveform.reshape(-1, 1)
 
 
+class _QueuedLocalSpeechThread(QThread):
+    """Synthesize growing response sentences through one audio output stream."""
+
+    started = Signal(str)
+    progress = Signal(object)
+    completed = Signal(bool, str)
+
+    _FINISHED = object()
+    _SENTENCE_DONE = object()
+
+    def __init__(
+        self,
+        manager: TextToSpeechProvider,
+        tts_model: str,
+        speaker: str,
+        language: str,
+    ) -> None:
+        super().__init__()
+        self.manager = manager
+        self.tts_model = tts_model
+        self.speaker = speaker
+        self.language = language
+        self._sentences: queue.Queue[object] = queue.Queue()
+        self._full_text = ""
+
+    def enqueue(self, sentence: str, full_text: str) -> None:
+        self._full_text = full_text
+        if sentence.strip():
+            self._sentences.put(sentence.strip())
+
+    def update_full_text(self, full_text: str) -> None:
+        self._full_text = full_text
+
+    def finish_queue(self) -> None:
+        self._sentences.put(self._FINISHED)
+
+    def run(self) -> None:
+        output = None
+        sample_rate = 0
+        audio_seconds = 0.0
+        spoken_characters = 0
+        started_at = time.perf_counter()
+        first_audio_at: float | None = None
+        try:
+            import numpy as np
+            import sounddevice as sd
+
+            continuous = (
+                getattr(self.manager, "continuous_audio_stream", False) is True
+            )
+            generated: queue.Queue[object] = queue.Queue(maxsize=16)
+
+            def produce() -> None:
+                sentence_index = 0
+                try:
+                    while True:
+                        item = self._sentences.get()
+                        if item is self._FINISHED:
+                            logger.debug(
+                                "Local TTS sentence queue complete "
+                                f"sentences={sentence_index}"
+                            )
+                            generated.put(self._FINISHED)
+                            return
+                        sentence = str(item)
+                        sentence_index += 1
+                        logger.debug(
+                            "Sending sentence to local TTS "
+                            f"index={sentence_index} "
+                            f"characters={len(sentence)} "
+                            f"text={sentence!r}"
+                        )
+                        produced = False
+                        for chunk in self.manager.synthesize_stream(
+                            self.tts_model,
+                            sentence,
+                            self.speaker,
+                            self.language,
+                        ):
+                            generated.put((chunk, sentence))
+                            produced = True
+                        if not produced:
+                            raise RuntimeError(
+                                "The local TTS model generated no audio"
+                            )
+                        generated.put((self._SENTENCE_DONE, sentence))
+                except Exception as error:
+                    generated.put(error)
+                    generated.put(self._FINISHED)
+
+            producer = threading.Thread(
+                target=produce,
+                name="queued-local-tts-generator",
+                daemon=True,
+            )
+            producer.start()
+            progress_sentence = ""
+            sentence_characters_reported = 0
+            while True:
+                item = generated.get()
+                if item is self._FINISHED:
+                    break
+                if isinstance(item, Exception):
+                    raise item
+                if item[0] is self._SENTENCE_DONE:
+                    sentence = item[1]
+                    already_reported = (
+                        sentence_characters_reported
+                        if sentence == progress_sentence
+                        else 0
+                    )
+                    spoken_characters += max(0, len(sentence) - already_reported)
+                    progress_sentence = ""
+                    sentence_characters_reported = 0
+                    self.progress.emit(
+                        {
+                            "text": self._full_text,
+                            "spoken_characters": spoken_characters,
+                            "fraction": min(
+                                spoken_characters / max(1, len(self._full_text)),
+                                0.99,
+                            ),
+                        }
+                    )
+                    continue
+                chunk, sentence = item
+                samples, chunk_rate, chunk_text = chunk
+                if output is None:
+                    sample_rate = chunk_rate
+                    output = sd.OutputStream(
+                        samplerate=sample_rate,
+                        channels=1,
+                        dtype="float32",
+                    )
+                    output.start()
+                    first_audio_at = time.perf_counter()
+                    provider = getattr(self.manager, "display_name", "local TTS")
+                    self.started.emit(f"Playing with streaming {provider}…")
+                elif chunk_rate != sample_rate:
+                    raise RuntimeError(
+                        "The local TTS model changed sample rate while queued"
+                    )
+                if continuous:
+                    waveform = np.asarray(samples, dtype=np.float32).reshape(-1, 1)
+                else:
+                    waveform = _LocalSpeechThread._prepare_streaming_waveform(
+                        np, samples, sample_rate
+                    )
+                if len(waveform):
+                    output.write(waveform)
+                    audio_seconds += len(waveform) / sample_rate
+                if chunk_text:
+                    if sentence != progress_sentence:
+                        progress_sentence = sentence
+                        sentence_characters_reported = 0
+                    added = min(
+                        len(str(chunk_text)),
+                        len(sentence) - sentence_characters_reported,
+                    )
+                    sentence_characters_reported += max(0, added)
+                    spoken_characters += max(0, added)
+                    self.progress.emit(
+                        {
+                            "text": self._full_text,
+                            "spoken_characters": spoken_characters,
+                            "fraction": min(
+                                spoken_characters / max(1, len(self._full_text)),
+                                0.99,
+                            ),
+                        }
+                    )
+            producer.join(timeout=1)
+            if output is None or first_audio_at is None:
+                raise RuntimeError("The local TTS queue received no speech")
+            self.progress.emit(
+                {
+                    "text": self._full_text,
+                    "spoken_characters": len(self._full_text),
+                    "fraction": 1.0,
+                }
+            )
+            self.completed.emit(
+                True,
+                f"First audio in {(first_audio_at - started_at) * 1000:.0f} ms · "
+                f"audio {audio_seconds:.1f} s",
+            )
+        except Exception as error:
+            logger.error("Queued local voice playback failed", error)
+            self.completed.emit(False, f"Local voice playback failed: {error}")
+        finally:
+            if output is not None:
+                try:
+                    output.stop()
+                finally:
+                    output.close()
+
+
 class HotkeyConfigDialog(QDialog):
     """Edit Live GPT settings, including pass-through global shortcuts."""
 
@@ -626,7 +826,7 @@ class HotkeyConfigDialog(QDialog):
         )
         self.playing_nav_button = self._navigation_button(
             "Playing",
-            SEND_ICON_PATH,
+            SPEAKER_ICON_PATH,
         )
         self.navigation_group = QButtonGroup(self)
         self.navigation_group.setExclusive(True)
@@ -1089,12 +1289,28 @@ class HotkeyConfigDialog(QDialog):
         sovits_installation_row.addWidget(self.sovits_installation_browse_button)
         playing_qwen_layout.addLayout(sovits_installation_row)
 
-        self.sovits_text_lang_label = QLabel("Text language")
+        self.sovits_reference_title = QLabel("Reference voice")
+        self.sovits_reference_title.setObjectName("voiceFieldGroupTitle")
+        self.sovits_reference_description = QLabel(
+            "These settings describe the voice sample GPT-SoVITS should imitate."
+        )
+        self.sovits_reference_description.setObjectName("settingsNote")
+        self.sovits_reference_description.setWordWrap(True)
+        playing_qwen_layout.addWidget(self.sovits_reference_title)
+        playing_qwen_layout.addWidget(self.sovits_reference_description)
+
+        self.sovits_text_lang_label = QLabel("Output language")
         self.sovits_text_lang_combo = QComboBox()
         self.sovits_text_lang_combo.setObjectName("voiceCombo")
-        self.sovits_prompt_lang_label = QLabel("Prompt language")
+        self.sovits_text_lang_combo.setToolTip(
+            "Language of the text that GPT-SoVITS will generate"
+        )
+        self.sovits_prompt_lang_label = QLabel("Reference language")
         self.sovits_prompt_lang_combo = QComboBox()
         self.sovits_prompt_lang_combo.setObjectName("voiceCombo")
+        self.sovits_prompt_lang_combo.setToolTip(
+            "Language spoken in the reference audio and transcript"
+        )
         for language_code in SOVITS_LANGUAGES:
             label = language_code.replace("all_", "all ").replace("_", " ")
             self.sovits_text_lang_combo.addItem(label, language_code)
@@ -1105,14 +1321,6 @@ class HotkeyConfigDialog(QDialog):
         self.sovits_prompt_lang_combo.setCurrentIndex(
             max(self.sovits_prompt_lang_combo.findData(sovits_prompt_lang), 0)
         )
-        sovits_language_row = QHBoxLayout()
-        sovits_language_row.setSpacing(8)
-        sovits_language_row.addWidget(self.sovits_text_lang_label)
-        sovits_language_row.addWidget(self.sovits_text_lang_combo, 1)
-        sovits_language_row.addWidget(self.sovits_prompt_lang_label)
-        sovits_language_row.addWidget(self.sovits_prompt_lang_combo, 1)
-        playing_qwen_layout.addLayout(sovits_language_row)
-
         self.sovits_ref_audio_label = QLabel("Reference audio")
         self.sovits_ref_audio_edit = QLineEdit(sovits_ref_audio_path)
         self.sovits_ref_audio_edit.setObjectName("voiceTestText")
@@ -1137,6 +1345,27 @@ class HotkeyConfigDialog(QDialog):
         sovits_prompt_row.addWidget(self.sovits_prompt_text_label)
         sovits_prompt_row.addWidget(self.sovits_prompt_text_edit, 1)
         playing_qwen_layout.addLayout(sovits_prompt_row)
+
+        sovits_reference_language_row = QHBoxLayout()
+        sovits_reference_language_row.setSpacing(8)
+        sovits_reference_language_row.addWidget(self.sovits_prompt_lang_label)
+        sovits_reference_language_row.addWidget(self.sovits_prompt_lang_combo, 1)
+        playing_qwen_layout.addLayout(sovits_reference_language_row)
+
+        self.sovits_output_title = QLabel("Generated speech")
+        self.sovits_output_title.setObjectName("voiceFieldGroupTitle")
+        self.sovits_output_description = QLabel(
+            "Choose the language of ChatGPT replies sent to speech synthesis."
+        )
+        self.sovits_output_description.setObjectName("settingsNote")
+        self.sovits_output_description.setWordWrap(True)
+        playing_qwen_layout.addWidget(self.sovits_output_title)
+        playing_qwen_layout.addWidget(self.sovits_output_description)
+        sovits_output_language_row = QHBoxLayout()
+        sovits_output_language_row.setSpacing(8)
+        sovits_output_language_row.addWidget(self.sovits_text_lang_label)
+        sovits_output_language_row.addWidget(self.sovits_text_lang_combo, 1)
+        playing_qwen_layout.addLayout(sovits_output_language_row)
 
         self.voice_test_text = QLineEdit()
         self.voice_test_text.setObjectName("voiceTestText")
@@ -1397,6 +1626,12 @@ class HotkeyConfigDialog(QDialog):
                 color: #8795b8;
                 font-size: 12px;
             }
+            QLabel#voiceFieldGroupTitle {
+                color: #dce7ff;
+                font-size: 13px;
+                font-weight: 600;
+                padding-top: 7px;
+            }
             QKeySequenceEdit {
                 min-width: 230px;
                 background: transparent;
@@ -1569,6 +1804,8 @@ class HotkeyConfigDialog(QDialog):
             self.sovits_installation_label,
             self.sovits_installation_edit,
             self.sovits_installation_browse_button,
+            self.sovits_reference_title,
+            self.sovits_reference_description,
             self.sovits_text_lang_label,
             self.sovits_text_lang_combo,
             self.sovits_prompt_lang_label,
@@ -1578,6 +1815,8 @@ class HotkeyConfigDialog(QDialog):
             self.sovits_ref_audio_browse_button,
             self.sovits_prompt_text_label,
             self.sovits_prompt_text_edit,
+            self.sovits_output_title,
+            self.sovits_output_description,
         ):
             widget.setVisible(sovits_enabled)
         if qwen_enabled:
@@ -2723,6 +2962,7 @@ class OverlayWindow(QMainWindow):
         self.subtitle_full_text.hide()
         self._reading_full_text = ""
         self._reading_fraction = 0.0
+        self._reading_spoken_characters = 0
         self._subtitle_line_index = -1
         self._subtitle_mode_active = False
         self._subtitle_dismissed = False
@@ -3157,6 +3397,7 @@ class OverlayWindow(QMainWindow):
         self._sent_message_text = " ".join(sent_text.split())
         self._reading_full_text = ""
         self._reading_fraction = 0.0
+        self._reading_spoken_characters = 0
         self._subtitle_line_index = -1
         self.transcript_area.begin_response()
         self.transcript_area.hide()
@@ -3168,13 +3409,22 @@ class OverlayWindow(QMainWindow):
 
     def set_response_update(self, status: str, text: str) -> None:
         self.show_for_auto_hide()
-        self.set_status(status)
         if self._subtitle_dismissed:
+            self.set_status(status)
             return
         self.transcript_area.update_response(text)
         if not self._subtitle_mode_active:
             self.begin_response_display(message=status)
         self._reading_full_text = text
+        if self._subtitle_reading_active:
+            self._reading_fraction = min(
+                self._reading_spoken_characters / max(1, len(text)), 0.99
+            )
+            self._render_reading_subtitle(resized=True)
+            self._update_expanded_subtitle()
+            self.set_status("Reading aloud…")
+            return
+        self.set_status(status)
         self._reading_fraction = 0.0
         self._set_subtitle_status(status)
         if text:
@@ -3186,6 +3436,9 @@ class OverlayWindow(QMainWindow):
         self.show_for_auto_hide()
         self.transcript_area.finish_response()
         self.microphone_button.setVisible(True)
+        if self._subtitle_reading_active:
+            self.set_status("Reading aloud…")
+            return
         self.set_status(message, error=not success)
         if self._subtitle_mode_active:
             self._set_subtitle_status(message)
@@ -3200,6 +3453,7 @@ class OverlayWindow(QMainWindow):
         self._subtitle_reading_started = True
         self._subtitle_hover_origin = None
         self._reading_fraction = 0.0
+        self._reading_spoken_characters = 0
         self._subtitle_line_index = -1
         self._subtitle_mode_active = True
         self.transcript_area.hide()
@@ -3214,6 +3468,9 @@ class OverlayWindow(QMainWindow):
     def set_reading_subtitle(self, update: object) -> None:
         if isinstance(update, dict):
             self._reading_full_text = str(update.get("text") or "")
+            spoken_characters = update.get("spoken_characters")
+            if isinstance(spoken_characters, int):
+                self._reading_spoken_characters = max(0, spoken_characters)
             try:
                 self._reading_fraction = min(
                     max(float(update.get("fraction") or 0.0), 0.0),
@@ -3224,6 +3481,7 @@ class OverlayWindow(QMainWindow):
         else:
             self._reading_full_text = str(update or "")
             self._reading_fraction = 0.0
+            self._reading_spoken_characters = 0
         if self._subtitle_dismissed:
             return
         self._render_reading_subtitle()
@@ -3231,23 +3489,48 @@ class OverlayWindow(QMainWindow):
         self.set_status("Reading aloud…")
 
     def _subtitle_lines(self) -> list[str]:
-        words = self._reading_full_text.split()
-        if not words:
+        text = self._reading_full_text.strip()
+        if not text:
             return []
 
         available_width = max(self.subtitle_panel.width() - 32, 1)
         metrics = self.subtitle_line_one.fontMetrics()
         lines: list[str] = []
-        current = ""
-        for word in words:
-            candidate = f"{current} {word}".strip()
-            if current and metrics.horizontalAdvance(candidate) > available_width:
+        for raw_paragraph in text.splitlines() or [text]:
+            paragraph = " ".join(raw_paragraph.split())
+            if not paragraph:
+                continue
+            current = ""
+            for word in paragraph.split(" "):
+                prefix = f"{current} " if current else ""
+                candidate = prefix
+                whole_word_fits = True
+                for character in word:
+                    if (
+                        metrics.horizontalAdvance(candidate + character)
+                        > available_width
+                    ):
+                        whole_word_fits = False
+                        break
+                    candidate += character
+                if whole_word_fits:
+                    current = candidate
+                    continue
+                if current:
+                    lines.append(current)
+                    current = ""
+                for character in word:
+                    if (
+                        current
+                        and metrics.horizontalAdvance(current + character)
+                        > available_width
+                    ):
+                        lines.append(current)
+                        current = character
+                    else:
+                        current += character
+            if current:
                 lines.append(current)
-                current = word
-            else:
-                current = candidate
-        if current:
-            lines.append(current)
         return lines
 
     def _subtitle_index_at_progress(self, lines: list[str]) -> int:
@@ -3887,7 +4170,11 @@ class TrayController:
         self.cosyvoice_manager = CosyVoiceTtsProvider()
         self.sovits_manager = SovitsTtsProvider()
         self._local_dictation_thread: _LocalDictationThread | None = None
-        self._local_speech_thread: _LocalSpeechThread | None = None
+        self._local_speech_thread: (
+            _LocalSpeechThread | _QueuedLocalSpeechThread | None
+        ) = None
+        self._local_voice_longest_text = ""
+        self._local_voice_queued_sentences: list[str] = []
         self._stt_preload_thread: threading.Thread | None = None
         self._qwen_preload_thread: threading.Thread | None = None
         self._migrate_legacy_hotkeys()
@@ -3912,7 +4199,10 @@ class TrayController:
         self.dictation_tab_id: str | None = None
         self._dictation_state = "idle"
         self._dictation_input_held = False
+        self._dictation_pressed_since: float | None = None
         self._dictation_listening_since: float | None = None
+        self._dictation_press_generation = 0
+        self._dictation_attachment_tab_id: str | None = None
         self._pending_dictation_capture: _PendingDictationCapture | None = None
         self._hotkey_sequences = self._load_hotkey_sequences()
         bindings = self._bindings_for_sequences(self._hotkey_sequences)
@@ -3968,8 +4258,8 @@ class TrayController:
         self.browser_monitor.reading_finished.connect(
             self.window.finish_reading
         )
-        self.browser_monitor.local_voice_requested.connect(
-            self._play_local_voice
+        self.browser_monitor.local_voice_updated.connect(
+            self._update_local_voice
         )
         self.browser_monitor.dictation_started.connect(
             self._on_dictation_started
@@ -4171,16 +4461,12 @@ class TrayController:
         self.window.raise_()
         self.window.activateWindow()
 
-    def _play_local_voice(self, text: str) -> None:
+    def _local_tts_configuration(
+        self,
+    ) -> tuple[TextToSpeechProvider, str, str, str] | None:
         backend = str(self.config["playing_backend"])
-        if backend not in ("qwen", "cosyvoice", "sovits") or not text.strip():
-            return
-        if self._local_speech_thread is not None:
-            self.window.finish_reading(
-                False,
-                "Local voice is already playing another reply",
-            )
-            return
+        if backend not in ("qwen", "cosyvoice", "sovits"):
+            return None
         if backend == "cosyvoice":
             manager: TextToSpeechProvider = self.cosyvoice_manager
             model_key = str(self.config["cosyvoice_model"])
@@ -4200,19 +4486,89 @@ class TrayController:
             model_key = str(self.config["tts_model"])
             speaker = str(self.config["tts_speaker"])
             language = str(self.config["tts_language"])
-        worker = _LocalSpeechThread(
-            manager,
-            model_key,
-            text,
-            speaker,
-            language,
+        return manager, model_key, speaker, language
+
+    @staticmethod
+    def _completed_response_sentences(
+        text: str,
+        *,
+        final: bool,
+    ) -> tuple[list[str], int]:
+        sentences: list[str] = []
+        start = 0
+        consumed = 0
+        for match in re.finditer(r'[.!?。！？]+["\'”’）)\]]*', text):
+            punctuation_start = match.start()
+            if (
+                text[punctuation_start] == "."
+                and punctuation_start > 0
+                and match.end() < len(text)
+                and text[punctuation_start - 1].isdigit()
+                and text[match.end()].isdigit()
+            ):
+                continue
+            if match.end() < len(text) and not text[match.end()].isspace():
+                continue
+            end = match.end()
+            sentence = text[start:end].strip()
+            if sentence:
+                sentences.append(sentence)
+            while end < len(text) and text[end].isspace():
+                end += 1
+            start = end
+            consumed = end
+        if final:
+            remainder = text[start:].strip()
+            if remainder:
+                sentences.append(remainder)
+            consumed = len(text)
+        return sentences, consumed
+
+    def _update_local_voice(self, text: str, final: bool) -> None:
+        text = text.strip()
+        if not text:
+            return
+        if not final and len(text) < len(self._local_voice_longest_text):
+            logger.debug(
+                "Ignoring a temporary shorter ChatGPT response snapshot "
+                f"characters={len(text)} "
+                f"longest={len(self._local_voice_longest_text)}"
+            )
+            return
+        if len(text) >= len(self._local_voice_longest_text) or final:
+            self._local_voice_longest_text = text
+        sentences, _consumed = self._completed_response_sentences(
+            text, final=final
         )
-        self._local_speech_thread = worker
-        worker.started.connect(self.window.begin_reading)
-        worker.progress.connect(self.window.set_reading_subtitle)
-        worker.completed.connect(self.window.finish_reading)
-        worker.finished.connect(self._local_speech_finished)
-        worker.start()
+        queued_count = len(self._local_voice_queued_sentences)
+        new_sentences = sentences[queued_count:]
+        if new_sentences and self._local_speech_thread is None:
+            configuration = self._local_tts_configuration()
+            if configuration is None:
+                return
+            manager, model_key, speaker, language = configuration
+            worker = _QueuedLocalSpeechThread(
+                manager, model_key, speaker, language
+            )
+            self._local_speech_thread = worker
+            worker.started.connect(self.window.begin_reading)
+            worker.progress.connect(self.window.set_reading_subtitle)
+            worker.completed.connect(self.window.finish_reading)
+            worker.finished.connect(self._local_speech_finished)
+            worker.start()
+
+        worker = self._local_speech_thread
+        if isinstance(worker, _QueuedLocalSpeechThread):
+            worker.update_full_text(text)
+            for sentence in new_sentences:
+                worker.enqueue(sentence, text)
+            self._local_voice_queued_sentences.extend(new_sentences)
+            if final:
+                worker.finish_queue()
+
+    def _play_local_voice(self, text: str) -> None:
+        """Compatibility entry point for a complete local-voice response."""
+        self._update_local_voice(text, True)
 
     def _start_qwen_preload(self) -> None:
         """Warm the selected local model without delaying the settings or UI."""
@@ -4305,11 +4661,18 @@ class TrayController:
     def _local_speech_finished(self) -> None:
         worker = self._local_speech_thread
         self._local_speech_thread = None
+        self._local_voice_longest_text = ""
+        self._local_voice_queued_sentences = []
         if worker is not None:
             worker.deleteLater()
 
     def start_dictation(self) -> None:
         self._dictation_input_held = True
+        self._dictation_pressed_since = time.monotonic()
+        self._dictation_press_generation = (
+            getattr(self, "_dictation_press_generation", 0) + 1
+        )
+        self._discard_preuploaded_dictation_screenshot()
         state = getattr(self, "_dictation_state", "idle")
         if state != "idle":
             return
@@ -4327,6 +4690,7 @@ class TrayController:
             getattr(self, "config", {}).get("recording_backend", "web")
             == "sherpa"
         ):
+            self._schedule_dictation_screenshot_upload()
             self._start_local_dictation()
             return
 
@@ -4349,7 +4713,71 @@ class TrayController:
             "recording",
             "Waiting for the browser to start listening…",
         )
+        self._schedule_dictation_screenshot_upload()
         self.browser_monitor.request_start_dictation(tab_id)
+
+    def _schedule_dictation_screenshot_upload(self) -> None:
+        generation = self._dictation_press_generation
+        QTimer.singleShot(
+            500,
+            lambda: self._upload_dictation_screenshot_after_hold(generation),
+        )
+
+    def _upload_dictation_screenshot_after_hold(self, generation: int) -> None:
+        if (
+            generation != getattr(self, "_dictation_press_generation", 0)
+            or not getattr(self, "_dictation_input_held", False)
+            or getattr(self, "_dictation_state", "idle")
+            not in ("starting", "listening")
+            or self.window.auto_send_enabled is not True
+        ):
+            return
+
+        selected = self.window.capture_source_combo.currentData()
+        source = selected if isinstance(selected, CaptureSource) else None
+        if source is None:
+            self._pending_dictation_capture = _PendingDictationCapture(
+                source=None,
+                screenshot=None,
+            )
+            return
+
+        tab_id = self.selected_chatgpt_tab_id
+        if tab_id is None:
+            return
+        try:
+            screenshot = capture_webp(source)
+        except Exception as error:
+            logger.error("Unable to capture dictation screenshot", error)
+            self._pending_dictation_capture = _PendingDictationCapture(
+                source=source,
+                screenshot=None,
+                error=str(error),
+            )
+            return
+
+        self._pending_dictation_capture = _PendingDictationCapture(
+            source=source,
+            screenshot=None,
+            preuploaded=True,
+        )
+        self._dictation_attachment_tab_id = tab_id
+        logger.info(
+            "Captured and queued dictation screenshot after 0.5-second hold "
+            f"source={source.key!r} tab_id={tab_id!r}"
+        )
+        self.browser_monitor.request_replace_attachment(tab_id, screenshot)
+
+    def _discard_preuploaded_dictation_screenshot(self) -> None:
+        tab_id = getattr(self, "_dictation_attachment_tab_id", None)
+        if tab_id is not None:
+            logger.info(
+                "Removing the previous pending dictation screenshot "
+                f"tab_id={tab_id!r}"
+            )
+            self.browser_monitor.request_clear_attachments(tab_id)
+        self._dictation_attachment_tab_id = None
+        self._pending_dictation_capture = None
 
     def _start_local_dictation(self) -> None:
         if self._local_dictation_thread is not None:
@@ -4403,6 +4831,7 @@ class TrayController:
             return
 
         if state == "starting":
+            self._discard_preuploaded_dictation_screenshot()
             self.window.set_dictation_cancelling()
             local_thread = getattr(self, "_local_dictation_thread", None)
             if local_thread is not None:
@@ -4412,12 +4841,16 @@ class TrayController:
         if state != "listening":
             return
 
-        listening_since = self._dictation_listening_since or time.monotonic()
-        if time.monotonic() - listening_since < 0.5:
+        pressed_since = getattr(self, "_dictation_pressed_since", None)
+        pressed_since = (
+            pressed_since
+            or self._dictation_listening_since
+            or time.monotonic()
+        )
+        if time.monotonic() - pressed_since < 0.5:
             self._cancel_dictation(tab_id)
             return
 
-        self._capture_dictation_screenshot_on_release()
         self._dictation_state = "finishing"
         local = tab_id == "local"
         logger.info(
@@ -4434,45 +4867,9 @@ class TrayController:
         else:
             self.browser_monitor.request_finish_dictation(tab_id)
 
-    def _capture_dictation_screenshot_on_release(self) -> None:
-        self._pending_dictation_capture = None
-        if self.window.auto_send_enabled is not True:
-            return
-
-        selected = self.window.capture_source_combo.currentData()
-        source = selected if isinstance(selected, CaptureSource) else None
-        if source is None:
-            self._pending_dictation_capture = _PendingDictationCapture(
-                source=None,
-                screenshot=None,
-            )
-            return
-
-        try:
-            screenshot = capture_webp(source)
-        except Exception as error:
-            logger.error(
-                "Unable to capture screenshot on microphone release",
-                error,
-            )
-            self._pending_dictation_capture = _PendingDictationCapture(
-                source=source,
-                screenshot=None,
-                error=str(error),
-            )
-            return
-
-        self._pending_dictation_capture = _PendingDictationCapture(
-            source=source,
-            screenshot=screenshot,
-        )
-        logger.info(
-            "Captured auto-send screenshot on microphone release "
-            f"source={source.key!r}"
-        )
-
     def _cancel_dictation(self, tab_id: str) -> None:
         self._dictation_state = "cancelling"
+        self._discard_preuploaded_dictation_screenshot()
         logger.info(f"Cancelling short ChatGPT dictation tab_id={tab_id!r}")
         self.window.set_dictation_cancelling()
         self.window.set_microphone_state(
@@ -4502,9 +4899,10 @@ class TrayController:
 
         self._dictation_state = "idle"
         self._dictation_input_held = False
+        self._dictation_pressed_since = None
         self._dictation_listening_since = None
         self.dictation_tab_id = None
-        self._pending_dictation_capture = None
+        self._discard_preuploaded_dictation_screenshot()
         self.window.end_dictation_display()
         self.window.set_microphone_state("error", message)
         self.window.schedule_auto_hide(5_000)
@@ -4518,24 +4916,26 @@ class TrayController:
         was_cancelled = getattr(self, "_dictation_state", "idle") == "cancelling"
         restart = getattr(self, "_dictation_input_held", False)
         self._dictation_state = "idle"
+        self._dictation_pressed_since = None
         self._dictation_listening_since = None
         self.dictation_tab_id = None
         self.window.end_dictation_display()
         if not success:
             self._dictation_input_held = False
-            self._pending_dictation_capture = None
+            self._discard_preuploaded_dictation_screenshot()
             self.window.set_microphone_state("error", message)
             self.window.schedule_auto_hide(5_000)
             return
 
         if was_cancelled:
-            self._pending_dictation_capture = None
+            self._discard_preuploaded_dictation_screenshot()
             self.window.set_microphone_state("idle", message)
         else:
             self.window.set_transcript(text)
             self.window.set_microphone_state("saved", message)
         auto_sent = bool(
             not was_cancelled
+            and not restart
             and text.strip()
             and self.window.auto_send_enabled
         )
@@ -4544,10 +4944,10 @@ class TrayController:
             self.window.request_auto_send()
             self._pending_dictation_capture = None
         elif text.strip():
-            self._pending_dictation_capture = None
+            self._discard_preuploaded_dictation_screenshot()
             self.window.show_for_auto_hide()
         else:
-            self._pending_dictation_capture = None
+            self._discard_preuploaded_dictation_screenshot()
             self.window.schedule_auto_hide()
         if restart and not auto_sent:
             if (
@@ -4586,8 +4986,8 @@ class TrayController:
                 self.window.send_button.setEnabled(True)
                 self.window.send_without_screenshot_button.setEnabled(True)
                 self.window.set_status(
-                    "Could not capture screenshot when the microphone was "
-                    f"released: {pending_capture.error}",
+                    "Could not capture screenshot after the microphone hold: "
+                    f"{pending_capture.error}",
                     error=True,
                 )
                 return
@@ -4615,7 +5015,18 @@ class TrayController:
         )
         self.window.begin_response_display(text)
         self.window.set_status("Sending to ChatGPT…")
-        self.browser_monitor.request_send(tab_id, text, screenshot)
+        preserve_attachments = bool(
+            pending_capture is not None and pending_capture.preuploaded
+        )
+        if preserve_attachments:
+            self.browser_monitor.request_send(
+                tab_id,
+                text,
+                screenshot,
+                preserve_attachments=True,
+            )
+        else:
+            self.browser_monitor.request_send(tab_id, text, screenshot)
 
     def _refresh_capture_sources(self) -> None:
         if self.window.capture_source_combo.view().isVisible():
@@ -4730,6 +5141,8 @@ class TrayController:
             self._local_dictation_thread.stop_recording(cancel=True)
             self._local_dictation_thread.wait(5_000)
         if self._local_speech_thread is not None:
+            if isinstance(self._local_speech_thread, _QueuedLocalSpeechThread):
+                self._local_speech_thread.finish_queue()
             try:
                 import sounddevice as sd
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -27,6 +28,7 @@ from live_gpt.app import (  # noqa: E402
     TranscriptEditor,
     TrayController,
     _LocalSpeechThread,
+    _QueuedLocalSpeechThread,
 )
 from live_gpt.config import Config  # noqa: E402
 from live_gpt.screen_capture import CaptureSource  # noqa: E402
@@ -150,6 +152,110 @@ class LocalSpeechThreadTests(unittest.TestCase):
             np.asarray([[0.0], [1.0], [0.0]], dtype=np.float32),
         )
         self.assertEqual(len(writes), 1)
+
+    def test_queued_speech_generates_ahead_and_reuses_output_stream(self) -> None:
+        import numpy as np
+
+        writes: list[object] = []
+        second_generation_started = threading.Event()
+        streams: list[object] = []
+
+        class FakeOutputStream:
+            def __init__(self, **_kwargs: object) -> None:
+                streams.append(self)
+
+            def start(self) -> None:
+                pass
+
+            def write(self, samples: object) -> None:
+                if not writes:
+                    self.assert_generation_is_ahead()
+                writes.append(samples)
+
+            @staticmethod
+            def assert_generation_is_ahead() -> None:
+                if not second_generation_started.wait(1):
+                    raise AssertionError("second sentence was not generated ahead")
+
+            def stop(self) -> None:
+                pass
+
+            def close(self) -> None:
+                pass
+
+        manager = Mock()
+        manager.display_name = "Test TTS"
+        manager.continuous_audio_stream = True
+
+        def synthesize(_model, sentence, _speaker, _language):
+            if sentence == "Second sentence.":
+                second_generation_started.set()
+            return ((np.ones(20, dtype=np.float32), 24000, sentence),)
+
+        manager.synthesize_stream.side_effect = synthesize
+        worker = _QueuedLocalSpeechThread(manager, "model", "speaker", "en")
+        worker.enqueue("First sentence.", "First sentence. Second sentence.")
+        worker.enqueue("Second sentence.", "First sentence. Second sentence.")
+        worker.finish_queue()
+
+        with patch.dict(
+            "sys.modules",
+            {"sounddevice": SimpleNamespace(OutputStream=FakeOutputStream)},
+        ):
+            worker.run()
+
+        self.assertEqual(len(streams), 1)
+        self.assertEqual(len(writes), 2)
+        self.assertEqual(
+            [call.args[1] for call in manager.synthesize_stream.call_args_list],
+            ["First sentence.", "Second sentence."],
+        )
+
+    def test_response_sentence_splitter_waits_for_complete_sentence(self) -> None:
+        sentences, consumed = TrayController._completed_response_sentences(
+            "First sentence. Second sentence is still", final=False
+        )
+        self.assertEqual(sentences, ["First sentence."])
+        self.assertEqual(
+            "First sentence. Second sentence is still"[consumed:],
+            "Second sentence is still",
+        )
+
+        sentences, consumed = TrayController._completed_response_sentences(
+            "Second sentence is done", final=True
+        )
+        self.assertEqual(sentences, ["Second sentence is done"])
+        self.assertEqual(consumed, len("Second sentence is done"))
+
+    def test_response_rewrite_queues_sentences_after_the_spoken_position(self) -> None:
+        controller = TrayController.__new__(TrayController)
+        controller._local_voice_longest_text = "Original first. Partial"
+        controller._local_voice_queued_sentences = ["Original first."]
+        worker = _QueuedLocalSpeechThread(Mock(), "model", "speaker", "en")
+        controller._local_speech_thread = worker
+
+        controller._update_local_voice(
+            "Rewritten first. Rewritten second. Final remainder",
+            True,
+        )
+
+        queued = worker._sentences.get_nowait()
+        remainder = worker._sentences.get_nowait()
+        finished = worker._sentences.get_nowait()
+        self.assertEqual(queued, "Rewritten second.")
+        self.assertEqual(remainder, "Final remainder")
+        self.assertIs(finished, worker._FINISHED)
+
+    def test_temporary_shorter_response_snapshot_is_ignored(self) -> None:
+        controller = TrayController.__new__(TrayController)
+        controller._local_voice_longest_text = "First sentence. Partial response"
+        controller._local_voice_queued_sentences = ["First sentence."]
+        worker = _QueuedLocalSpeechThread(Mock(), "model", "speaker", "en")
+        controller._local_speech_thread = worker
+
+        controller._update_local_voice("short", False)
+
+        self.assertTrue(worker._sentences.empty())
 
 
 class TranscriptEditorTests(unittest.TestCase):
@@ -419,6 +525,45 @@ class SettingsDialogTests(unittest.TestCase):
             )
         finally:
             cosy_dialog.close()
+
+        sovits_dialog = HotkeyConfigDialog(
+            QKeySequence("CapsLock"),
+            QKeySequence("Ctrl+S"),
+            QKeySequence("Ctrl+D"),
+            playing_backend="sovits",
+            sovits_text_lang="en",
+            sovits_prompt_lang="zh",
+            sovits_ref_audio_path="E:/voices/reference.wav",
+            sovits_prompt_text="参考音频文本",
+        )
+        try:
+            self.assertEqual(
+                sovits_dialog.sovits_reference_title.text(),
+                "Reference voice",
+            )
+            self.assertEqual(
+                sovits_dialog.sovits_prompt_lang_label.text(),
+                "Reference language",
+            )
+            self.assertEqual(
+                sovits_dialog.sovits_output_title.text(),
+                "Generated speech",
+            )
+            self.assertEqual(
+                sovits_dialog.sovits_text_lang_label.text(),
+                "Output language",
+            )
+            layout = sovits_dialog.playing_qwen_card.layout()
+            self.assertLess(
+                layout.indexOf(sovits_dialog.sovits_reference_title),
+                layout.indexOf(sovits_dialog.sovits_output_title),
+            )
+            self.assertFalse(sovits_dialog.sovits_reference_title.isHidden())
+            self.assertFalse(sovits_dialog.sovits_output_title.isHidden())
+            self.assertEqual(sovits_dialog.sovits_prompt_lang(), "zh")
+            self.assertEqual(sovits_dialog.sovits_text_lang(), "en")
+        finally:
+            sovits_dialog.close()
 
     def test_settings_save_every_valid_change_without_save_button(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1015,6 +1160,30 @@ class TrayControllerBrowserTests(unittest.TestCase):
         finally:
             window.close()
 
+    def test_subtitle_wraps_cjk_and_long_unbroken_text(self) -> None:
+        window = OverlayWindow()
+        try:
+            window.show()
+            window.begin_reading("Reading aloud…")
+            QApplication.processEvents()
+            available = window.subtitle_panel.width() - 32
+            metrics = window.subtitle_line_one.fontMetrics()
+
+            for subtitle in ("这是一个没有空格的中文字幕句子" * 12, "x" * 300):
+                window.set_reading_subtitle(subtitle)
+                lines = window._subtitle_lines()
+
+                self.assertGreater(len(lines), 2)
+                self.assertTrue(
+                    all(
+                        metrics.horizontalAdvance(line) <= available
+                        for line in lines
+                    )
+                )
+                self.assertEqual("".join(lines), subtitle)
+        finally:
+            window.close()
+
     def test_subtitle_progress_rolls_exactly_one_rendered_line(self) -> None:
         window = OverlayWindow()
         try:
@@ -1301,6 +1470,36 @@ class TrayControllerBrowserTests(unittest.TestCase):
         finally:
             window.close()
 
+    def test_response_updates_do_not_override_active_local_subtitles(self) -> None:
+        window = OverlayWindow()
+        try:
+            window.begin_response_display()
+            window.set_response_update(
+                "ChatGPT is responding…", "First sentence. Second sentence"
+            )
+            window.begin_reading("Playing with streaming GPT-SoVITS…")
+            window.set_reading_subtitle(
+                {
+                    "text": "First sentence. Second sentence",
+                    "spoken_characters": 15,
+                    "fraction": 0.45,
+                }
+            )
+
+            longer = "First sentence. Second sentence is still growing."
+            window.set_response_update("ChatGPT is responding…", longer)
+            window.set_response_finished(True, "Reply complete · Local voice queued")
+
+            self.assertTrue(window._subtitle_reading_active)
+            self.assertEqual(window.transcript_area.placeholderText(), "Reading aloud…")
+            self.assertAlmostEqual(window._reading_fraction, 15 / len(longer))
+            self.assertNotEqual(
+                window.subtitle_line_one.text(), "Reply complete · Local voice queued"
+            )
+            self.assertFalse(window._auto_hide_timer.isActive())
+        finally:
+            window.close()
+
     def test_auto_hide_waits_while_unsent_dictation_is_present(self) -> None:
         window = OverlayWindow()
         try:
@@ -1416,6 +1615,7 @@ class TrayControllerBrowserTests(unittest.TestCase):
             True,
             "Browser dictation is listening",
         )
+        controller._dictation_pressed_since = time.monotonic() - 0.6
         controller._dictation_listening_since = time.monotonic() - 0.6
         controller.finish_dictation()
 
@@ -1443,8 +1643,8 @@ class TrayControllerBrowserTests(unittest.TestCase):
             finishing=False,
         )
 
-    @patch("live_gpt.app.capture_webp", return_value=b"release-screenshot")
-    def test_auto_send_screenshot_is_frozen_on_microphone_release(
+    @patch("live_gpt.app.capture_webp", return_value=b"hold-screenshot")
+    def test_auto_send_screenshot_is_uploaded_after_half_second_hold(
         self,
         capture: Mock,
     ) -> None:
@@ -1479,12 +1679,21 @@ class TrayControllerBrowserTests(unittest.TestCase):
         controller.dictation_tab_id = "selected-tab"
         controller._dictation_state = "listening"
         controller._dictation_input_held = True
+        controller._dictation_pressed_since = time.monotonic() - 0.6
         controller._dictation_listening_since = time.monotonic() - 0.6
+        controller._dictation_press_generation = 1
+        controller._dictation_attachment_tab_id = None
         controller._pending_dictation_capture = None
 
-        controller.finish_dictation()
+        controller._upload_dictation_screenshot_after_hold(1)
 
         capture.assert_called_once_with(release_source)
+        controller.browser_monitor.request_replace_attachment.assert_called_once_with(
+            "selected-tab",
+            b"hold-screenshot",
+        )
+        controller.finish_dictation()
+
         controller.browser_monitor.request_finish_dictation.assert_called_once_with(
             "selected-tab"
         )
@@ -1495,8 +1704,45 @@ class TrayControllerBrowserTests(unittest.TestCase):
         controller.browser_monitor.request_send.assert_called_once_with(
             "selected-tab",
             "Dictated text",
-            b"release-screenshot",
+            None,
+            preserve_attachments=True,
         )
+
+    def test_new_recording_removes_the_previous_pending_screenshot(self) -> None:
+        controller = TrayController.__new__(TrayController)
+        controller.window = Mock()
+        controller.window.transcript_area.is_showing_response = False
+        controller.browser_monitor = Mock()
+        controller.selected_chatgpt_tab_id = "selected-tab"
+        controller.dictation_tab_id = None
+        controller._dictation_state = "idle"
+        controller._dictation_input_held = False
+        controller._dictation_press_generation = 1
+        controller._dictation_attachment_tab_id = "selected-tab"
+        controller._pending_dictation_capture = Mock()
+
+        controller.start_dictation()
+
+        controller.browser_monitor.request_clear_attachments.assert_called_once_with(
+            "selected-tab"
+        )
+        self.assertIsNone(controller._dictation_attachment_tab_id)
+
+    @patch("live_gpt.app.capture_webp")
+    def test_cancelled_hold_does_not_upload_a_screenshot(self, capture: Mock) -> None:
+        controller = TrayController.__new__(TrayController)
+        controller.window = Mock()
+        controller.window.auto_send_enabled = True
+        controller.browser_monitor = Mock()
+        controller.selected_chatgpt_tab_id = "selected-tab"
+        controller._dictation_press_generation = 2
+        controller._dictation_input_held = False
+        controller._dictation_state = "cancelling"
+
+        controller._upload_dictation_screenshot_after_hold(2)
+
+        capture.assert_not_called()
+        controller.browser_monitor.request_replace_attachment.assert_not_called()
 
     def test_short_mouse_dictation_is_cancelled(self) -> None:
         controller = TrayController.__new__(TrayController)

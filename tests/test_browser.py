@@ -229,6 +229,46 @@ class BrowserMonitorTests(unittest.TestCase):
         )
         send_button.click.assert_called_once_with(timeout=15_000)
 
+    def test_preuploaded_attachment_is_preserved_when_sending(self) -> None:
+        composer = Mock()
+        send_button = Mock()
+        page = Mock()
+
+        def locate(selector: str) -> Mock:
+            if selector == CHATGPT_COMPOSER_SELECTOR:
+                return Mock(first=composer)
+            return Mock(first=send_button)
+
+        page.locator.side_effect = locate
+
+        with patch.object(BrowserMonitor, "_clear_chatgpt_attachments") as clear:
+            BrowserMonitor._send_to_chatgpt_page(
+                page,
+                "Dictated prompt",
+                preserve_attachments=True,
+            )
+
+        clear.assert_not_called()
+        composer.fill.assert_called_once_with("Dictated prompt")
+        send_button.click.assert_called_once_with(timeout=15_000)
+
+    def test_attachment_request_replaces_pending_chatgpt_image(self) -> None:
+        page = Mock()
+        page.is_closed.return_value = False
+        page.url = "https://chatgpt.com/c/conversation"
+        browser = Mock(contexts=[Mock(pages=[page])])
+        monitor = BrowserMonitor()
+
+        with (
+            patch.object(BrowserMonitor, "_clear_chatgpt_attachments") as clear,
+            patch.object(BrowserMonitor, "_paste_screenshot") as paste,
+        ):
+            monitor.request_replace_attachment(str(id(page)), b"webp bytes")
+            monitor._process_attachment_requests(browser, FakePlaywrightError)
+
+        clear.assert_called_once_with(page)
+        paste.assert_called_once_with(page, b"webp bytes")
+
     def test_dictation_press_clicks_chatgpt_microphone(self) -> None:
         composer = Mock()
         composer.evaluate.return_value = "Existing text"
@@ -521,10 +561,37 @@ class BrowserMonitorTests(unittest.TestCase):
         self.assertEqual(requested, ["Local reply"])
         self.assertEqual(
             finished,
-            [(True, "Reply complete · Starting local voice")],
+            [(True, "Reply complete · Local voice queued")],
         )
         self.assertIsNone(state.active_response)
         self.assertIsNone(state.active_reading)
+
+    def test_growing_local_response_is_emitted_before_completion(self) -> None:
+        monitor = BrowserMonitor()
+        monitor.set_use_browser_voice(False)
+        state = _MonitorState(
+            active_response=_ActiveResponse(
+                page=Mock(),
+                turn_marker_before="previous-turn",
+            )
+        )
+        snapshot = _ResponseSnapshot(
+            has_new_turn=True,
+            is_generating=True,
+            has_completion_controls=False,
+            text="The first sentence. The second is growing",
+            status="ChatGPT is responding…",
+        )
+        updates: list[tuple[str, bool]] = []
+        monitor.local_voice_updated.connect(
+            lambda text, final: updates.append((text, final))
+        )
+
+        with patch.object(monitor, "_response_snapshot", return_value=snapshot):
+            monitor._poll_active_response(state)
+
+        self.assertEqual(updates, [(snapshot.text, False)])
+        self.assertIsNotNone(state.active_response)
 
     def test_late_trailing_text_resets_completion_stability_window(self) -> None:
         page = Mock()
