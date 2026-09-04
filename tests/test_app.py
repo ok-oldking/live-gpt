@@ -354,6 +354,10 @@ class SettingsDialogTests(unittest.TestCase):
             self.assertFalse(dialog.language_nav_button.icon().isNull())
             self.assertFalse(dialog.recording_nav_button.icon().isNull())
             self.assertFalse(dialog.playing_nav_button.icon().isNull())
+            self.assertEqual(
+                dialog.hold_without_screenshot_edit.keySequence().toString(),
+                "Shift",
+            )
             self.assertTrue(dialog.language_combo.isEnabled())
             self.assertEqual(dialog.language_combo.currentText(), "English")
             self.assertEqual(dialog.language_combo.count(), 2)
@@ -1727,6 +1731,72 @@ class TrayControllerBrowserTests(unittest.TestCase):
             "selected-tab"
         )
         self.assertIsNone(controller._dictation_attachment_tab_id)
+
+    def test_record_hotkey_stops_playback_and_forces_auto_send(self) -> None:
+        controller = TrayController.__new__(TrayController)
+        controller.window = Mock()
+        controller.window.auto_send_enabled = False
+        controller.window.transcript_area.is_showing_response = False
+        controller.browser_monitor = Mock()
+        controller.selected_chatgpt_tab_id = "selected-tab"
+        controller.dictation_tab_id = None
+        controller._dictation_state = "idle"
+        controller._dictation_input_held = False
+        controller._dictation_press_generation = 0
+        controller._dictation_attachment_tab_id = None
+        playback = Mock()
+        controller._local_speech_thread = playback
+
+        controller.start_dictation(
+            force_auto_send=True,
+            include_screenshot=False,
+        )
+
+        playback.request_stop.assert_called_once_with()
+        controller.browser_monitor.request_stop_reading.assert_called_once_with()
+        controller.window.finish_reading.assert_called_once_with(
+            False,
+            "Playback stopped for recording",
+        )
+
+        controller._dictation_state = "finishing"
+        controller._dictation_input_held = False
+        controller._on_dictation_finished(True, "Dictated text", "Finished")
+
+        controller.window.request_auto_send.assert_called_once_with()
+
+    def test_interrupted_reply_does_not_restart_voice_during_recording(self) -> None:
+        controller = TrayController.__new__(TrayController)
+        controller._local_voice_interrupted = True
+        controller._local_speech_thread = None
+        controller._local_voice_longest_text = ""
+        controller._local_voice_queued_sentences = []
+
+        controller._update_local_voice("Old reply continues.", False)
+
+        self.assertIsNone(controller._local_speech_thread)
+        self.assertEqual(controller._local_voice_longest_text, "")
+
+    @patch("live_gpt.app.capture_webp")
+    def test_record_without_screenshot_hotkey_never_captures(
+        self,
+        capture: Mock,
+    ) -> None:
+        controller = TrayController.__new__(TrayController)
+        controller.window = Mock()
+        controller.window.auto_send_enabled = False
+        controller.browser_monitor = Mock()
+        controller.selected_chatgpt_tab_id = "selected-tab"
+        controller._dictation_press_generation = 3
+        controller._dictation_input_held = True
+        controller._dictation_state = "listening"
+        controller._dictation_force_auto_send = True
+        controller._dictation_include_screenshot = False
+
+        controller._upload_dictation_screenshot_after_hold(3)
+
+        capture.assert_not_called()
+        self.assertIsNone(controller._pending_dictation_capture.source)
 
     @patch("live_gpt.app.capture_webp")
     def test_cancelled_hold_does_not_upload_a_screenshot(self, capture: Mock) -> None:

@@ -61,6 +61,9 @@ _QT_SPECIAL_KEYS = {
     Qt.Key.Key_Delete.value: VK_DELETE,
     Qt.Key.Key_NumLock.value: VK_NUMLOCK,
     Qt.Key.Key_ScrollLock.value: VK_SCROLL,
+    Qt.Key.Key_Shift.value: VK_SHIFT,
+    Qt.Key.Key_Control.value: VK_CONTROL,
+    Qt.Key.Key_Alt.value: VK_MENU,
 }
 
 
@@ -107,9 +110,18 @@ class HotkeyBinding:
         meta_down = is_down(VK_LWIN) or is_down(VK_RWIN)
         return (
             is_down(self.virtual_key)
-            and is_down(VK_CONTROL) == self.control
-            and is_down(VK_SHIFT) == self.shift
-            and is_down(VK_MENU) == self.alt
+            and (
+                self.virtual_key == VK_CONTROL
+                or is_down(VK_CONTROL) == self.control
+            )
+            and (
+                self.virtual_key == VK_SHIFT
+                or is_down(VK_SHIFT) == self.shift
+            )
+            and (
+                self.virtual_key == VK_MENU
+                or is_down(VK_MENU) == self.alt
+            )
             and meta_down == self.meta
         )
 
@@ -130,6 +142,8 @@ class GlobalHotkeyMonitor(QObject):
 
     hold_pressed = Signal()
     hold_released = Signal()
+    hold_without_screenshot_pressed = Signal()
+    hold_without_screenshot_released = Signal()
     send_pressed = Signal()
     send_without_screenshot_pressed = Signal()
 
@@ -140,6 +154,7 @@ class GlobalHotkeyMonitor(QObject):
         send_without_screenshot: HotkeyBinding,
         parent: QObject | None = None,
         *,
+        hold_without_screenshot: HotkeyBinding | None = None,
         key_state: Callable[[int], int] | None = None,
         clock: Callable[[], float] | None = None,
         interval_ms: int = 25,
@@ -149,8 +164,14 @@ class GlobalHotkeyMonitor(QObject):
         self._key_state = key_state or _default_key_state
         self._clock = clock or time.monotonic
         self._hold_delay = hold_delay_ms / 1_000
-        self._hold_started_at: float | None = None
-        self._hold_emitted = False
+        self._hold_started_at: dict[str, float | None] = {
+            "hold": None,
+            "hold_without_screenshot": None,
+        }
+        self._hold_emitted = {
+            "hold": False,
+            "hold_without_screenshot": False,
+        }
         self._bindings: dict[str, HotkeyBinding] = {}
         self._pressed = {
             "hold": False,
@@ -160,32 +181,61 @@ class GlobalHotkeyMonitor(QObject):
         self._timer = QTimer(self)
         self._timer.setInterval(interval_ms)
         self._timer.timeout.connect(self.poll_now)
-        self.update_bindings(hold, send, send_without_screenshot)
+        self.update_bindings(
+            hold,
+            send,
+            send_without_screenshot,
+            hold_without_screenshot=hold_without_screenshot,
+        )
 
     def update_bindings(
         self,
         hold: HotkeyBinding,
         send: HotkeyBinding,
         send_without_screenshot: HotkeyBinding,
+        *,
+        hold_without_screenshot: HotkeyBinding | None = None,
     ) -> None:
         self._bindings = {
             "hold": hold,
+            "hold_without_screenshot": (
+                hold_without_screenshot
+                or HotkeyBinding.from_sequence("Shift")
+            ),
             "send": send,
             "send_without_screenshot": send_without_screenshot,
         }
         self._pressed = {name: False for name in self._bindings}
-        self._hold_started_at = None
-        self._hold_emitted = False
+        self._hold_started_at = {
+            "hold": None,
+            "hold_without_screenshot": None,
+        }
+        self._hold_emitted = {
+            "hold": False,
+            "hold_without_screenshot": False,
+        }
 
     def start(self) -> None:
         self._timer.start()
 
+    @property
+    def hold_delay_seconds(self) -> float:
+        return self._hold_delay
+
     def stop(self) -> None:
-        if self._hold_emitted:
+        if self._hold_emitted["hold"]:
             self.hold_released.emit()
+        if self._hold_emitted["hold_without_screenshot"]:
+            self.hold_without_screenshot_released.emit()
         self._pressed = {name: False for name in self._bindings}
-        self._hold_started_at = None
-        self._hold_emitted = False
+        self._hold_started_at = {
+            "hold": None,
+            "hold_without_screenshot": None,
+        }
+        self._hold_emitted = {
+            "hold": False,
+            "hold_without_screenshot": False,
+        }
         self._timer.stop()
 
     def poll_now(self) -> None:
@@ -195,21 +245,30 @@ class GlobalHotkeyMonitor(QObject):
         }
 
         now = self._clock()
-        if current["hold"]:
-            if not self._pressed["hold"]:
-                self._hold_started_at = now
-            if (
-                not self._hold_emitted
-                and self._hold_started_at is not None
-                and now - self._hold_started_at >= self._hold_delay
-            ):
-                self._hold_emitted = True
-                self.hold_pressed.emit()
-        else:
-            if self._hold_emitted:
-                self.hold_released.emit()
-            self._hold_started_at = None
-            self._hold_emitted = False
+        hold_signals = {
+            "hold": (self.hold_pressed, self.hold_released),
+            "hold_without_screenshot": (
+                self.hold_without_screenshot_pressed,
+                self.hold_without_screenshot_released,
+            ),
+        }
+        for name, (pressed_signal, released_signal) in hold_signals.items():
+            if current[name]:
+                if not self._pressed[name]:
+                    self._hold_started_at[name] = now
+                started_at = self._hold_started_at[name]
+                if (
+                    not self._hold_emitted[name]
+                    and started_at is not None
+                    and now - started_at >= self._hold_delay
+                ):
+                    self._hold_emitted[name] = True
+                    pressed_signal.emit()
+            else:
+                if self._hold_emitted[name]:
+                    released_signal.emit()
+                self._hold_started_at[name] = None
+                self._hold_emitted[name] = False
 
         if current["send"] and not self._pressed["send"]:
             self.send_pressed.emit()

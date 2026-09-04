@@ -196,6 +196,7 @@ class BrowserMonitor(QThread):
         super().__init__()
         self._stop_requested = False
         self._retry_connection_requested = False
+        self._stop_reading_requested = False
         self._send_requests: Queue[_SendRequest] = Queue()
         self._attachment_requests: Queue[_AttachmentRequest] = Queue()
         self._dictation_requests: Queue[_DictationRequest] = Queue()
@@ -214,6 +215,10 @@ class BrowserMonitor(QThread):
 
     def request_retry_connection(self) -> None:
         self._retry_connection_requested = True
+        self._wake_event.set()
+
+    def request_stop_reading(self) -> None:
+        self._stop_reading_requested = True
         self._wake_event.set()
 
     def request_send(
@@ -306,6 +311,7 @@ class BrowserMonitor(QThread):
                     if self._is_connected(state.browser)
                     else None
                 )
+                self._stop_active_reading(state)
                 self._process_dictation_requests(
                     connected_browser,
                     PlaywrightError,
@@ -333,6 +339,27 @@ class BrowserMonitor(QThread):
                 self._wake_event.clear()
 
         logger.info("Browser monitor stopped")
+
+    def _stop_active_reading(self, state: _MonitorState) -> None:
+        if not self._stop_reading_requested:
+            return
+        self._stop_reading_requested = False
+        reading = state.active_reading
+        if reading is None:
+            return
+        try:
+            reading.page.evaluate(
+                """
+                () => document.querySelectorAll('audio, video').forEach(media => {
+                    media.pause();
+                    media.currentTime = 0;
+                })
+                """
+            )
+        except Exception as error:
+            logger.warning(f"Unable to stop ChatGPT playback cleanly: {error}")
+        state.active_reading = None
+        self.reading_finished.emit(False, "Playback stopped for recording")
 
     def _try_connect(
         self,

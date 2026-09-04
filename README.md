@@ -160,8 +160,12 @@ Qwen model and speaker. Offline and streaming STT models are labeled explicitly.
 Streaming recording models decode microphone chunks continuously and update the
 test transcript in real time. Each test reports its inference or generation latency.
 Hotkey defaults are
-**Caps Lock** (hold to dictate), **Ctrl+S** (send with the selected screenshot),
-and **Ctrl+D** (send without a screenshot). The shortcuts work while the
+**Caps Lock** (record and automatically send with the selected screenshot),
+**Shift** (record and automatically send without a screenshot), **Ctrl+S**
+(send with the selected screenshot), and **Ctrl+D** (send without a screenshot).
+The recording shortcuts always send successful dictation regardless of the
+Auto Send toggle. Starting either recording shortcut stops active local or
+browser voice playback. The shortcuts work while the
 overlay is hidden or unfocused. Live GPT observes their key state without
 registering or swallowing the keys, so the foreground program continues to
 receive the same keystrokes. Changes are saved for the current Windows user.

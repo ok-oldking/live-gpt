@@ -269,6 +269,28 @@ class BrowserMonitorTests(unittest.TestCase):
         clear.assert_called_once_with(page)
         paste.assert_called_once_with(page, b"webp bytes")
 
+    def test_recording_request_stops_active_browser_playback(self) -> None:
+        page = Mock()
+        monitor = BrowserMonitor()
+        state = _MonitorState(
+            active_reading=_ActiveReading(
+                page=page,
+                full_text="Reply",
+                subtitles=("Reply",),
+            )
+        )
+        results: list[tuple[bool, str]] = []
+        monitor.reading_finished.connect(
+            lambda success, message: results.append((success, message))
+        )
+
+        monitor.request_stop_reading()
+        monitor._stop_active_reading(state)
+
+        page.evaluate.assert_called_once()
+        self.assertIsNone(state.active_reading)
+        self.assertEqual(results, [(False, "Playback stopped for recording")])
+
     def test_dictation_press_clicks_chatgpt_microphone(self) -> None:
         composer = Mock()
         composer.evaluate.return_value = "Existing text"

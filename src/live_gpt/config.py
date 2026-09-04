@@ -17,6 +17,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "version": 1,
     "language": "en",
     "hotkey_hold": "CapsLock",
+    "hotkey_hold_without_screenshot": "Shift",
     "hotkey_send": "Ctrl+S",
     "hotkey_send_without_screenshot": "Ctrl+D",
     "auto_send": False,

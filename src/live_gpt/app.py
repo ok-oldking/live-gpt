@@ -101,12 +101,16 @@ UNLOCK_ICON_PATH = ASSET_DIRECTORY / "unlock.svg"
 logger = Logger.get_logger(__name__)
 
 DEFAULT_HOLD_MIC_HOTKEY = str(DEFAULT_CONFIG["hotkey_hold"])
+DEFAULT_HOLD_WITHOUT_SCREENSHOT_HOTKEY = str(
+    DEFAULT_CONFIG["hotkey_hold_without_screenshot"]
+)
 DEFAULT_SEND_HOTKEY = str(DEFAULT_CONFIG["hotkey_send"])
 DEFAULT_SEND_WITHOUT_SCREENSHOT_HOTKEY = str(
     DEFAULT_CONFIG["hotkey_send_without_screenshot"]
 )
 HOTKEY_CONFIG_KEYS = {
     "hold": "hotkey_hold",
+    "hold_without_screenshot": "hotkey_hold_without_screenshot",
     "send": "hotkey_send",
     "send_without_screenshot": "hotkey_send_without_screenshot",
 }
@@ -288,6 +292,16 @@ class _LocalSpeechThread(QThread):
         self.text = text
         self.speaker = speaker
         self.language = language
+        self._cancel_event = threading.Event()
+
+    def request_stop(self) -> None:
+        self._cancel_event.set()
+        try:
+            import sounddevice as sd
+
+            sd.stop()
+        except Exception:
+            pass
 
     def run(self) -> None:
         try:
@@ -309,12 +323,18 @@ class _LocalSpeechThread(QThread):
             self.started.emit(f"Playing with {provider_name}…")
             self.progress.emit({"text": self.text, "fraction": 0.0})
             sd.play(samples, sample_rate, blocking=True)
+            if self._cancel_event.is_set():
+                self.completed.emit(False, "Playback stopped for recording")
+                return
             self.progress.emit({"text": self.text, "fraction": 1.0})
             self.completed.emit(
                 True,
                 f"Generated in {latency_ms:.0f} ms · audio {audio_seconds:.1f} s",
             )
         except Exception as error:
+            if self._cancel_event.is_set():
+                self.completed.emit(False, "Playback stopped for recording")
+                return
             logger.error("Local voice playback failed", error)
             self.completed.emit(False, f"Local voice playback failed: {error}")
 
@@ -351,6 +371,8 @@ class _LocalSpeechThread(QThread):
                     self.speaker,
                     self.language,
                 ):
+                    if self._cancel_event.is_set():
+                        break
                     generated.put(chunk)
             except Exception as error:
                 generated.put(error)
@@ -420,6 +442,9 @@ class _LocalSpeechThread(QThread):
             dtype="float32",
         ) as output:
             while pending is not finished:
+                if self._cancel_event.is_set():
+                    self.completed.emit(False, "Playback stopped for recording")
+                    return
                 if isinstance(pending, Exception):
                     pending_error = pending
                 else:
@@ -522,6 +547,8 @@ class _QueuedLocalSpeechThread(QThread):
         self.language = language
         self._sentences: queue.Queue[object] = queue.Queue()
         self._full_text = ""
+        self._cancel_event = threading.Event()
+        self._output: object | None = None
 
     def enqueue(self, sentence: str, full_text: str) -> None:
         self._full_text = full_text
@@ -533,6 +560,16 @@ class _QueuedLocalSpeechThread(QThread):
 
     def finish_queue(self) -> None:
         self._sentences.put(self._FINISHED)
+
+    def request_stop(self) -> None:
+        self._cancel_event.set()
+        self._sentences.put(self._FINISHED)
+        output = self._output
+        if output is not None:
+            try:
+                output.abort()
+            except Exception:
+                pass
 
     def run(self) -> None:
         output = None
@@ -554,6 +591,9 @@ class _QueuedLocalSpeechThread(QThread):
                 sentence_index = 0
                 try:
                     while True:
+                        if self._cancel_event.is_set():
+                            generated.put(self._FINISHED)
+                            return
                         item = self._sentences.get()
                         if item is self._FINISHED:
                             logger.debug(
@@ -577,6 +617,9 @@ class _QueuedLocalSpeechThread(QThread):
                             self.speaker,
                             self.language,
                         ):
+                            if self._cancel_event.is_set():
+                                generated.put(self._FINISHED)
+                                return
                             generated.put((chunk, sentence))
                             produced = True
                         if not produced:
@@ -598,6 +641,9 @@ class _QueuedLocalSpeechThread(QThread):
             sentence_characters_reported = 0
             while True:
                 item = generated.get()
+                if self._cancel_event.is_set():
+                    self.completed.emit(False, "Playback stopped for recording")
+                    return
                 if item is self._FINISHED:
                     break
                 if isinstance(item, Exception):
@@ -632,6 +678,7 @@ class _QueuedLocalSpeechThread(QThread):
                         channels=1,
                         dtype="float32",
                     )
+                    self._output = output
                     output.start()
                     first_audio_at = time.perf_counter()
                     provider = getattr(self.manager, "display_name", "local TTS")
@@ -685,14 +732,22 @@ class _QueuedLocalSpeechThread(QThread):
                 f"audio {audio_seconds:.1f} s",
             )
         except Exception as error:
+            if self._cancel_event.is_set():
+                self.completed.emit(False, "Playback stopped for recording")
+                return
             logger.error("Queued local voice playback failed", error)
             self.completed.emit(False, f"Local voice playback failed: {error}")
         finally:
             if output is not None:
                 try:
                     output.stop()
-                finally:
+                except Exception:
+                    pass
+                try:
                     output.close()
+                except Exception:
+                    pass
+            self._output = None
 
 
 class HotkeyConfigDialog(QDialog):
@@ -705,6 +760,7 @@ class HotkeyConfigDialog(QDialog):
         send_without_screenshot: QKeySequence,
         parent: QWidget | None = None,
         *,
+        hold_without_screenshot: QKeySequence | None = None,
         language: str = "en",
         recording_backend: str = "web",
         playing_backend: str = "web",
@@ -756,6 +812,9 @@ class HotkeyConfigDialog(QDialog):
         self.resize(940, 820)
 
         self.hold_microphone_edit = self._sequence_edit(hold_microphone)
+        self.hold_without_screenshot_edit = self._sequence_edit(
+            hold_without_screenshot or QKeySequence("Shift")
+        )
         self.send_edit = self._sequence_edit(send)
         self.send_without_screenshot_edit = self._sequence_edit(
             send_without_screenshot
@@ -879,7 +938,14 @@ class HotkeyConfigDialog(QDialog):
         form.setContentsMargins(0, 4, 0, 0)
         form.setHorizontalSpacing(22)
         form.setVerticalSpacing(12)
-        form.addRow("Hold microphone", self.hold_microphone_edit)
+        form.addRow(
+            "Record and Send with Screenshot",
+            self.hold_microphone_edit,
+        )
+        form.addRow(
+            "Record and Send without Screenshot",
+            self.hold_without_screenshot_edit,
+        )
         form.addRow("Send with screenshot", self.send_edit)
         form.addRow(
             "Send without screenshot",
@@ -1897,6 +1963,7 @@ class HotkeyConfigDialog(QDialog):
         )
         for editor in (
             self.hold_microphone_edit,
+            self.hold_without_screenshot_edit,
             self.send_edit,
             self.send_without_screenshot_edit,
         ):
@@ -2443,6 +2510,9 @@ class HotkeyConfigDialog(QDialog):
     def sequences(self) -> dict[str, QKeySequence]:
         return {
             "hold": self.hold_microphone_edit.keySequence(),
+            "hold_without_screenshot": (
+                self.hold_without_screenshot_edit.keySequence()
+            ),
             "send": self.send_edit.keySequence(),
             "send_without_screenshot": (
                 self.send_without_screenshot_edit.keySequence()
@@ -4175,6 +4245,7 @@ class TrayController:
         ) = None
         self._local_voice_longest_text = ""
         self._local_voice_queued_sentences: list[str] = []
+        self._local_voice_interrupted = False
         self._stt_preload_thread: threading.Thread | None = None
         self._qwen_preload_thread: threading.Thread | None = None
         self._migrate_legacy_hotkeys()
@@ -4199,6 +4270,8 @@ class TrayController:
         self.dictation_tab_id: str | None = None
         self._dictation_state = "idle"
         self._dictation_input_held = False
+        self._dictation_force_auto_send = False
+        self._dictation_include_screenshot = True
         self._dictation_pressed_since: float | None = None
         self._dictation_listening_since: float | None = None
         self._dictation_press_generation = 0
@@ -4211,6 +4284,7 @@ class TrayController:
             bindings["send"],
             bindings["send_without_screenshot"],
             self.window,
+            hold_without_screenshot=bindings["hold_without_screenshot"],
         )
 
         self.application.setWindowIcon(self.icon)
@@ -4256,7 +4330,7 @@ class TrayController:
             self.window.set_reading_subtitle
         )
         self.browser_monitor.reading_finished.connect(
-            self.window.finish_reading
+            self._on_browser_reading_finished
         )
         self.browser_monitor.local_voice_updated.connect(
             self._update_local_voice
@@ -4270,8 +4344,24 @@ class TrayController:
         self.browser_monitor.clear_finished.connect(
             self._on_clear_finished
         )
-        self.hotkey_monitor.hold_pressed.connect(self.start_dictation)
+        self.hotkey_monitor.hold_pressed.connect(
+            lambda: self.start_dictation(
+                force_auto_send=True,
+                include_screenshot=True,
+                initial_hold_seconds=self.hotkey_monitor.hold_delay_seconds,
+            )
+        )
         self.hotkey_monitor.hold_released.connect(self.finish_dictation)
+        self.hotkey_monitor.hold_without_screenshot_pressed.connect(
+            lambda: self.start_dictation(
+                force_auto_send=True,
+                include_screenshot=False,
+                initial_hold_seconds=self.hotkey_monitor.hold_delay_seconds,
+            )
+        )
+        self.hotkey_monitor.hold_without_screenshot_released.connect(
+            self.finish_dictation
+        )
         self.hotkey_monitor.send_pressed.connect(
             lambda: self.window.request_send_from_hotkey(True)
         )
@@ -4333,7 +4423,7 @@ class TrayController:
             name: HotkeyBinding.from_sequence(sequence)
             for name, sequence in sequences.items()
         }
-        if len({binding.text.casefold() for binding in bindings.values()}) != 3:
+        if len({binding.text.casefold() for binding in bindings.values()}) != 4:
             raise ValueError("Each action must use a different hotkey")
         return bindings
 
@@ -4353,6 +4443,9 @@ class TrayController:
     def _load_hotkey_sequences(self) -> dict[str, QKeySequence]:
         defaults = {
             "hold": DEFAULT_HOLD_MIC_HOTKEY,
+            "hold_without_screenshot": (
+                DEFAULT_HOLD_WITHOUT_SCREENSHOT_HOTKEY
+            ),
             "send": DEFAULT_SEND_HOTKEY,
             "send_without_screenshot": (
                 DEFAULT_SEND_WITHOUT_SCREENSHOT_HOTKEY
@@ -4390,6 +4483,9 @@ class TrayController:
                 self._hotkey_sequences["send"],
                 self._hotkey_sequences["send_without_screenshot"],
                 self.window,
+                hold_without_screenshot=self._hotkey_sequences[
+                    "hold_without_screenshot"
+                ],
                 language=str(self.config["language"]),
                 recording_backend=str(self.config["recording_backend"]),
                 playing_backend=str(self.config["playing_backend"]),
@@ -4434,6 +4530,7 @@ class TrayController:
                 bindings["hold"],
                 bindings["send"],
                 bindings["send_without_screenshot"],
+                hold_without_screenshot=bindings["hold_without_screenshot"],
             )
             self.window.set_status("Settings updated")
             logger.info(
@@ -4525,6 +4622,8 @@ class TrayController:
         return sentences, consumed
 
     def _update_local_voice(self, text: str, final: bool) -> None:
+        if getattr(self, "_local_voice_interrupted", False):
+            return
         text = text.strip()
         if not text:
             return
@@ -4553,7 +4652,7 @@ class TrayController:
             self._local_speech_thread = worker
             worker.started.connect(self.window.begin_reading)
             worker.progress.connect(self.window.set_reading_subtitle)
-            worker.completed.connect(self.window.finish_reading)
+            worker.completed.connect(self._on_local_speech_completed)
             worker.finished.connect(self._local_speech_finished)
             worker.start()
 
@@ -4666,9 +4765,28 @@ class TrayController:
         if worker is not None:
             worker.deleteLater()
 
-    def start_dictation(self) -> None:
+    def _on_local_speech_completed(self, success: bool, message: str) -> None:
+        if getattr(self, "_dictation_state", "idle") == "idle":
+            self.window.finish_reading(success, message)
+
+    def _on_browser_reading_finished(self, success: bool, message: str) -> None:
+        if getattr(self, "_dictation_state", "idle") == "idle":
+            self.window.finish_reading(success, message)
+
+    def start_dictation(
+        self,
+        *,
+        force_auto_send: bool = False,
+        include_screenshot: bool = True,
+        initial_hold_seconds: float = 0.0,
+    ) -> None:
+        self._stop_playback_for_recording()
+        self._dictation_force_auto_send = force_auto_send
+        self._dictation_include_screenshot = include_screenshot
         self._dictation_input_held = True
-        self._dictation_pressed_since = time.monotonic()
+        self._dictation_pressed_since = (
+            time.monotonic() - max(0.0, initial_hold_seconds)
+        )
         self._dictation_press_generation = (
             getattr(self, "_dictation_press_generation", 0) + 1
         )
@@ -4716,10 +4834,23 @@ class TrayController:
         self._schedule_dictation_screenshot_upload()
         self.browser_monitor.request_start_dictation(tab_id)
 
+    def _stop_playback_for_recording(self) -> None:
+        self.browser_monitor.request_stop_reading()
+        worker = getattr(self, "_local_speech_thread", None)
+        if worker is not None:
+            self._local_voice_interrupted = True
+            worker.request_stop()
+            self.window.finish_reading(False, "Playback stopped for recording")
+
     def _schedule_dictation_screenshot_upload(self) -> None:
         generation = self._dictation_press_generation
+        pressed_since = self._dictation_pressed_since or time.monotonic()
+        remaining_ms = max(
+            0,
+            round((0.5 - (time.monotonic() - pressed_since)) * 1_000),
+        )
         QTimer.singleShot(
-            500,
+            remaining_ms,
             lambda: self._upload_dictation_screenshot_after_hold(generation),
         )
 
@@ -4729,8 +4860,18 @@ class TrayController:
             or not getattr(self, "_dictation_input_held", False)
             or getattr(self, "_dictation_state", "idle")
             not in ("starting", "listening")
-            or self.window.auto_send_enabled is not True
+            or not (
+                self.window.auto_send_enabled is True
+                or getattr(self, "_dictation_force_auto_send", False)
+            )
         ):
+            return
+
+        if not getattr(self, "_dictation_include_screenshot", True):
+            self._pending_dictation_capture = _PendingDictationCapture(
+                source=None,
+                screenshot=None,
+            )
             return
 
         selected = self.window.capture_source_combo.currentData()
@@ -4915,6 +5056,12 @@ class TrayController:
     ) -> None:
         was_cancelled = getattr(self, "_dictation_state", "idle") == "cancelling"
         restart = getattr(self, "_dictation_input_held", False)
+        pressed_since = getattr(self, "_dictation_pressed_since", None)
+        restart_held_seconds = (
+            max(0.0, time.monotonic() - pressed_since)
+            if restart and pressed_since is not None
+            else 0.0
+        )
         self._dictation_state = "idle"
         self._dictation_pressed_since = None
         self._dictation_listening_since = None
@@ -4937,7 +5084,10 @@ class TrayController:
             not was_cancelled
             and not restart
             and text.strip()
-            and self.window.auto_send_enabled
+            and (
+                self.window.auto_send_enabled
+                or getattr(self, "_dictation_force_auto_send", False)
+            )
         )
         if auto_sent:
             self._dictation_input_held = False
@@ -4950,13 +5100,30 @@ class TrayController:
             self._discard_preuploaded_dictation_screenshot()
             self.window.schedule_auto_hide()
         if restart and not auto_sent:
+            force_auto_send = getattr(self, "_dictation_force_auto_send", False)
+            include_screenshot = getattr(
+                self,
+                "_dictation_include_screenshot",
+                True,
+            )
             if (
                 getattr(self, "config", {}).get("recording_backend", "web")
                 == "sherpa"
             ):
-                QTimer.singleShot(0, self.start_dictation)
+                QTimer.singleShot(
+                    0,
+                    lambda: self.start_dictation(
+                        force_auto_send=force_auto_send,
+                        include_screenshot=include_screenshot,
+                        initial_hold_seconds=restart_held_seconds,
+                    ),
+                )
             else:
-                self.start_dictation()
+                self.start_dictation(
+                    force_auto_send=force_auto_send,
+                    include_screenshot=include_screenshot,
+                    initial_hold_seconds=restart_held_seconds,
+                )
 
     def _handle_send_requested(
         self,
@@ -5015,6 +5182,7 @@ class TrayController:
         )
         self.window.begin_response_display(text)
         self.window.set_status("Sending to ChatGPT…")
+        self._local_voice_interrupted = False
         preserve_attachments = bool(
             pending_capture is not None and pending_capture.preuploaded
         )

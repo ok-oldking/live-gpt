@@ -14,6 +14,7 @@ from live_gpt.hotkeys import (  # noqa: E402
     HotkeyBinding,
     VK_CAPITAL,
     VK_CONTROL,
+    VK_SHIFT,
 )
 
 
@@ -29,6 +30,7 @@ class GlobalHotkeyMonitorTests(unittest.TestCase):
             HotkeyBinding.from_sequence("CapsLock"),
             HotkeyBinding.from_sequence("Ctrl+S"),
             HotkeyBinding.from_sequence("Ctrl+D"),
+            hold_without_screenshot=HotkeyBinding.from_sequence("Shift"),
             key_state=lambda key: 0x8000 if key in self.pressed else 0,
             clock=lambda: self.now,
         )
@@ -61,6 +63,24 @@ class GlobalHotkeyMonitorTests(unittest.TestCase):
         self.monitor.poll_now()
 
         self.assertEqual(events, [])
+
+    def test_shift_is_an_independent_hold_hotkey(self) -> None:
+        events: list[str] = []
+        self.monitor.hold_without_screenshot_pressed.connect(
+            lambda: events.append("pressed")
+        )
+        self.monitor.hold_without_screenshot_released.connect(
+            lambda: events.append("released")
+        )
+
+        self.pressed.add(VK_SHIFT)
+        self.monitor.poll_now()
+        self.now += 0.31
+        self.monitor.poll_now()
+        self.pressed.remove(VK_SHIFT)
+        self.monitor.poll_now()
+
+        self.assertEqual(events, ["pressed", "released"])
 
     def test_send_hotkey_only_emits_once_until_released(self) -> None:
         events: list[str] = []
