@@ -965,6 +965,7 @@ class TrayControllerBrowserTests(unittest.TestCase):
 
             self.assertTrue(window.subtitle_line_one.isHidden())
             self.assertFalse(window.subtitle_full_text.isHidden())
+            self.assertTrue(window._subtitle_outside_timer.isActive())
             self.assertEqual(
                 window.subtitle_full_text.toPlainText(),
                 response,
@@ -978,11 +979,34 @@ class TrayControllerBrowserTests(unittest.TestCase):
                 window._collapse_subtitle_if_outside()
 
             self.assertFalse(window._subtitle_expanded)
+            self.assertFalse(window._subtitle_outside_timer.isActive())
             self.assertEqual(window.height(), collapsed_height)
             self.assertFalse(window.subtitle_line_one.isHidden())
             self.assertTrue(window.subtitle_full_text.isHidden())
             self.assertEqual(window.subtitle_line_one.text(), "Question")
             self.assertEqual(window.subtitle_line_two.text(), "Writing…")
+        finally:
+            window.close()
+
+    def test_expanded_subtitle_polling_catches_missed_leave_event(self) -> None:
+        window = OverlayWindow()
+        try:
+            window.show()
+            window.begin_response_display("Question")
+            window.set_response_update("Writing…", "Complete response")
+            window._expand_subtitle()
+            QApplication.processEvents()
+
+            with patch(
+                "live_gpt.app.QCursor.pos",
+                return_value=QPoint(-10_000, -10_000),
+            ):
+                window._subtitle_outside_timer.timeout.emit()
+
+            self.assertFalse(window._subtitle_expanded)
+            self.assertFalse(window._subtitle_outside_timer.isActive())
+            self.assertFalse(window.subtitle_line_one.isHidden())
+            self.assertTrue(window.subtitle_full_text.isHidden())
         finally:
             window.close()
 

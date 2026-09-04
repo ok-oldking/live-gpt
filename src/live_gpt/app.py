@@ -2891,6 +2891,11 @@ class OverlayWindow(QMainWindow):
         self._auto_hide_timer = QTimer(self)
         self._auto_hide_timer.setSingleShot(True)
         self._auto_hide_timer.timeout.connect(self._hide_for_auto_hide)
+        self._subtitle_outside_timer = QTimer(self)
+        self._subtitle_outside_timer.setInterval(75)
+        self._subtitle_outside_timer.timeout.connect(
+            self._collapse_subtitle_if_outside
+        )
 
         container = QWidget(self)
         container.setObjectName("overlayContainer")
@@ -3688,6 +3693,7 @@ class OverlayWindow(QMainWindow):
         if not self._subtitle_mode_active or self._subtitle_expanded:
             return
         self._subtitle_expanded = True
+        self._subtitle_outside_timer.start()
         self._subtitle_collapsed_geometry = QRect(self.geometry())
         self.subtitle_full_text.setPlainText(
             self._reading_full_text or self._subtitle_status_text
@@ -3733,6 +3739,7 @@ class OverlayWindow(QMainWindow):
         self.setGeometry(geometry)
 
     def _collapse_subtitle(self) -> None:
+        self._subtitle_outside_timer.stop()
         if not self._subtitle_expanded:
             return
         self._subtitle_expanded = False
