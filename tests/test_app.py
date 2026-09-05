@@ -1965,6 +1965,68 @@ class TrayControllerBrowserTests(unittest.TestCase):
         controller.window.request_auto_send.assert_called_once_with()
         controller.window.show_for_auto_hide.assert_not_called()
 
+    def test_one_character_voice_result_is_not_sent(self) -> None:
+        controller = TrayController.__new__(TrayController)
+        controller.window = Mock()
+        controller.window.auto_send_enabled = True
+        controller._dictation_input_held = False
+
+        controller._on_dictation_finished(
+            True,
+            "A",
+            "Dictation copied from ChatGPT",
+        )
+
+        controller.window.set_transcript.assert_called_once_with("A")
+        controller.window.request_auto_send.assert_not_called()
+        controller.window.show_for_auto_hide.assert_called_once_with()
+        controller.window.set_microphone_state.assert_called_once_with(
+            "saved",
+            "Voice input must contain at least 2 characters to send",
+        )
+        self.assertEqual(controller._short_voice_text, "A")
+
+    def test_two_character_voice_result_can_auto_send(self) -> None:
+        controller = TrayController.__new__(TrayController)
+        controller.window = Mock()
+        controller.window.auto_send_enabled = True
+        controller._dictation_input_held = False
+
+        controller._on_dictation_finished(True, "OK", "Finished")
+
+        controller.window.request_auto_send.assert_called_once_with()
+        self.assertIsNone(controller._short_voice_text)
+
+    def test_unchanged_one_character_voice_result_cannot_be_sent(self) -> None:
+        controller = TrayController.__new__(TrayController)
+        controller.window = Mock()
+        controller.browser_monitor = Mock()
+        controller.selected_chatgpt_tab_id = "selected-tab"
+        controller._short_voice_text = "A"
+
+        controller._handle_send_requested("A", None)
+
+        controller.browser_monitor.request_send.assert_not_called()
+        controller.window.begin_response_display.assert_not_called()
+        controller.window.set_status.assert_called_once_with(
+            "Voice input must contain at least 2 characters to send",
+            error=True,
+        )
+
+    def test_manually_typed_one_character_can_still_be_sent(self) -> None:
+        controller = TrayController.__new__(TrayController)
+        controller.window = Mock()
+        controller.browser_monitor = Mock()
+        controller.selected_chatgpt_tab_id = "selected-tab"
+
+        controller._handle_send_requested("A", None)
+
+        controller.browser_monitor.request_send.assert_called_once_with(
+            "selected-tab",
+            "A",
+            None,
+        )
+
     def test_tray_double_click_disables_auto_hide_before_showing(self) -> None:
         controller = TrayController.__new__(TrayController)
         controller.window = Mock()

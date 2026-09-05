@@ -23,7 +23,10 @@ reviewed or sent; enabling auto-hide does not hide unsent text or interrupt
 dictation, response generation, playback, or an expanded subtitle. Enable
 **Auto Send** to send successful dictation
 immediately, using the selected screenshot when one is selected and sending
-without one when **No screenshot** is selected.
+without one when **No screenshot** is selected. Voice recognition must produce
+at least two non-whitespace characters before it can be sent. A one-character
+result remains in the editor for correction; manually typed one-character
+messages are still allowed.
 Double-click the tray icon to reveal it and turn auto-hide off. The **Exit**
 button closes the app.
 
@@ -210,10 +213,11 @@ remote debugging for this browser instance** through Windows accessibility,
 verifies that the browser's per-user `DevToolsActivePort` marker contains a live
 endpoint, and then connects. If the browser is already open, the settings page
 opens in a new tab without replacing the active page. The browser can still ask
-the user to approve the incoming connection. If approval arrives after a
-connection request times out, Live GPT retries automatically at a short interval
-until it connects. When a live debugging marker already exists, **Enable
-Debugging** retries immediately and leaves the browser tabs unchanged. Attached
+the user to approve the incoming connection. Live GPT keeps one approval request
+pending until the user chooses **Allow** or **Deny**, preventing unanswered
+requests from creating a stack of dialogs. After choosing **Deny**, click
+**Enable Debugging** to make another request; the browser tabs remain unchanged.
+Attached
 ChatGPT pages retain the browser's native color-scheme
 preference. Live GPT does not launch the browser with debugging flags or create
 a separate profile. The optional `LIVE_GPT_CDP_ENDPOINT` environment variable

@@ -108,6 +108,7 @@ DEFAULT_SEND_HOTKEY = str(DEFAULT_CONFIG["hotkey_send"])
 DEFAULT_SEND_WITHOUT_SCREENSHOT_HOTKEY = str(
     DEFAULT_CONFIG["hotkey_send_without_screenshot"]
 )
+MIN_VOICE_SEND_CHARACTERS = 2
 HOTKEY_CONFIG_KEYS = {
     "hold": "hotkey_hold",
     "hold_without_screenshot": "hotkey_hold_without_screenshot",
@@ -4278,6 +4279,7 @@ class TrayController:
         self._dictation_state = "idle"
         self._dictation_input_held = False
         self._dictation_force_auto_send = False
+        self._short_voice_text: str | None = None
         self._dictation_include_screenshot = True
         self._dictation_pressed_since: float | None = None
         self._dictation_listening_since: float | None = None
@@ -5081,16 +5083,32 @@ class TrayController:
             self.window.schedule_auto_hide(5_000)
             return
 
+        recognized_text = text.strip()
+        voice_text_too_short = bool(
+            not was_cancelled
+            and recognized_text
+            and len(recognized_text) < MIN_VOICE_SEND_CHARACTERS
+        )
         if was_cancelled:
             self._discard_preuploaded_dictation_screenshot()
             self.window.set_microphone_state("idle", message)
         else:
+            self._short_voice_text = (
+                recognized_text if voice_text_too_short else None
+            )
             self.window.set_transcript(text)
-            self.window.set_microphone_state("saved", message)
+            self.window.set_microphone_state(
+                "saved",
+                (
+                    "Voice input must contain at least 2 characters to send"
+                    if voice_text_too_short
+                    else message
+                ),
+            )
         auto_sent = bool(
             not was_cancelled
             and not restart
-            and text.strip()
+            and len(recognized_text) >= MIN_VOICE_SEND_CHARACTERS
             and (
                 self.window.auto_send_enabled
                 or getattr(self, "_dictation_force_auto_send", False)
@@ -5100,7 +5118,7 @@ class TrayController:
             self._dictation_input_held = False
             self.window.request_auto_send()
             self._pending_dictation_capture = None
-        elif text.strip():
+        elif recognized_text:
             self._discard_preuploaded_dictation_screenshot()
             self.window.show_for_auto_hide()
         else:
@@ -5137,6 +5155,14 @@ class TrayController:
         text: str,
         capture_source: CaptureSource | None,
     ) -> None:
+        normalized_text = text.strip()
+        if normalized_text == getattr(self, "_short_voice_text", None):
+            self.window.set_status(
+                "Voice input must contain at least 2 characters to send",
+                error=True,
+            )
+            return
+        self._short_voice_text = None
         pending_capture = getattr(
             self,
             "_pending_dictation_capture",
@@ -5214,6 +5240,7 @@ class TrayController:
         self.window.set_capture_sources(sources)
 
     def _handle_clear_requested(self) -> None:
+        self._short_voice_text = None
         tab_id = self.selected_chatgpt_tab_id
         if tab_id is None:
             self.window.set_status(

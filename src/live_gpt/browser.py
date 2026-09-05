@@ -6,7 +6,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from queue import Empty, Queue
-from typing import Any
+from typing import Any, Callable
 
 from PySide6.QtCore import QThread, Signal
 
@@ -43,7 +43,6 @@ DICTATION_RESULT_POLL_INTERVAL_MS = 200
 DICTATION_RESULT_POLL_COUNT = (
     DICTATION_RESULT_TIMEOUT_MS // DICTATION_RESULT_POLL_INTERVAL_MS
 )
-REMOTE_DEBUGGING_RETRY_INTERVAL_SECONDS = 3.0
 DICTATION_END_SELECTORS = (
     'button[aria-label="Submit dictation"]',
     'button[aria-label="Done"]',
@@ -108,7 +107,6 @@ class _MonitorState:
     settings_opened: bool = False
     next_settings_attempt: float = 0.0
     retry_endpoint: str | None = None
-    next_connection_attempt: float = 0.0
     last_tabs: list[dict[str, str]] | None = None
     media_reset_pages: set[str] = field(default_factory=set)
     active_response: _ActiveResponse | None = None
@@ -196,6 +194,10 @@ class BrowserMonitor(QThread):
         super().__init__()
         self._stop_requested = False
         self._retry_connection_requested = False
+        self._connection_pending = threading.Event()
+        self._playwright_cancellation: (
+            tuple[Any, Callable[[], None]] | None
+        ) = None
         self._stop_reading_requested = False
         self._send_requests: Queue[_SendRequest] = Queue()
         self._attachment_requests: Queue[_AttachmentRequest] = Queue()
@@ -212,6 +214,10 @@ class BrowserMonitor(QThread):
     def request_stop(self) -> None:
         self._stop_requested = True
         self._wake_event.set()
+        cancellation = self._playwright_cancellation
+        if self._connection_pending.is_set() and cancellation is not None:
+            loop, stop_transport = cancellation
+            loop.call_soon_threadsafe(stop_transport)
 
     def request_retry_connection(self) -> None:
         self._retry_connection_requested = True
@@ -287,6 +293,15 @@ class BrowserMonitor(QThread):
 
         state = _MonitorState()
         with sync_playwright() as playwright:
+            connection = playwright._impl_obj._connection
+            # An unlimited CDP approval wait still needs to be cancellable when
+            # the application exits. Playwright exposes no public cancellation
+            # token for connect_over_cdp, so terminate its driver safely on the
+            # Playwright event loop only while that call is pending.
+            self._playwright_cancellation = (
+                connection._loop,
+                connection._transport._proc.terminate,
+            )
             while not self._stop_requested:
                 if not self._is_connected(state.browser):
                     self._try_connect(playwright, PlaywrightError, state)
@@ -337,6 +352,7 @@ class BrowserMonitor(QThread):
                 )
                 self._wake_event.wait(0.25 if is_busy else 1.5)
                 self._wake_event.clear()
+            self._playwright_cancellation = None
 
         logger.info("Browser monitor stopped")
 
@@ -375,44 +391,44 @@ class BrowserMonitor(QThread):
         if self._retry_connection_requested:
             self._retry_connection_requested = False
             state.retry_endpoint = None
-            state.next_connection_attempt = 0.0
 
         if endpoint is None:
             self._prepare_remote_debugging(state)
             return
 
-        if (
-            endpoint == state.retry_endpoint
-            and time.monotonic() < state.next_connection_attempt
-        ):
+        if endpoint == state.retry_endpoint:
             self._set_status(
-                "Waiting for remote debugging approval; retrying automatically…"
+                "Remote debugging was not approved; "
+                "click Enable Debugging to retry"
             )
             return
 
         self._set_status("Approve remote debugging in the browser…")
+        self._connection_pending.set()
         try:
             state.browser = playwright.chromium.connect_over_cdp(
                 endpoint,
-                timeout=15_000,
+                timeout=0,
             )
-        except playwright_error as error:
+        except Exception as error:
+            if self._stop_requested:
+                return
+            if not isinstance(error, playwright_error):
+                raise
             logger.warning(
                 "Unable to connect to remote-debug browser "
                 f"endpoint={endpoint!r}: {error}"
             )
             state.retry_endpoint = endpoint
-            state.next_connection_attempt = (
-                time.monotonic()
-                + REMOTE_DEBUGGING_RETRY_INTERVAL_SECONDS
-            )
             self._set_status(
-                "Waiting for remote debugging approval; retrying automatically…"
+                "Remote debugging was not approved; "
+                "click Enable Debugging to retry"
             )
             return
+        finally:
+            self._connection_pending.clear()
 
         state.retry_endpoint = None
-        state.next_connection_attempt = 0.0
         state.media_reset_pages.clear()
         state.settings_opened = False
         self._set_status("Browser connected")

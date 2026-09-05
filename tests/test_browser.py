@@ -10,7 +10,6 @@ from live_gpt.browser import (
     DICTATION_CANCEL_SELECTORS,
     DICTATION_RESULT_POLL_COUNT,
     DICTATION_RESULT_TIMEOUT_MS,
-    REMOTE_DEBUGGING_RETRY_INTERVAL_SECONDS,
     _ActiveReading,
     BrowserMonitor,
     _ActiveResponse,
@@ -60,7 +59,7 @@ class BrowserMonitorTests(unittest.TestCase):
         hidden_composer.wait_for.assert_not_called()
 
     @patch("live_gpt.browser.discover_cdp_endpoint")
-    def test_timed_out_endpoint_is_retried_automatically(
+    def test_declined_endpoint_waits_for_explicit_retry(
         self,
         discover_endpoint: Mock,
     ) -> None:
@@ -71,20 +70,20 @@ class BrowserMonitorTests(unittest.TestCase):
         monitor = BrowserMonitor()
         state = _MonitorState()
 
-        with patch("live_gpt.browser.time.monotonic") as monotonic:
-            monotonic.return_value = 100.0
-            monitor._try_connect(playwright, FakePlaywrightError, state)
-            monitor._try_connect(playwright, FakePlaywrightError, state)
-            self.assertEqual(chromium.connect_over_cdp.call_count, 1)
+        monitor._try_connect(playwright, FakePlaywrightError, state)
+        monitor._try_connect(playwright, FakePlaywrightError, state)
+        self.assertEqual(chromium.connect_over_cdp.call_count, 1)
 
-            monotonic.return_value = (
-                100.0 + REMOTE_DEBUGGING_RETRY_INTERVAL_SECONDS
-            )
-            monitor._try_connect(playwright, FakePlaywrightError, state)
+        monitor.request_retry_connection()
+        monitor._try_connect(playwright, FakePlaywrightError, state)
         self.assertEqual(chromium.connect_over_cdp.call_count, 2)
+        chromium.connect_over_cdp.assert_called_with(
+            "http://127.0.0.1:9222",
+            timeout=0,
+        )
 
     @patch("live_gpt.browser.discover_cdp_endpoint")
-    def test_requested_retry_does_not_wait_for_interval(
+    def test_requested_retry_retries_declined_endpoint(
         self,
         discover_endpoint: Mock,
     ) -> None:
@@ -101,6 +100,17 @@ class BrowserMonitorTests(unittest.TestCase):
             monitor._try_connect(playwright, FakePlaywrightError, state)
 
         self.assertEqual(chromium.connect_over_cdp.call_count, 2)
+
+    def test_stop_interrupts_pending_browser_approval(self) -> None:
+        monitor = BrowserMonitor()
+        loop = Mock()
+        stop_transport = Mock()
+        monitor._playwright_cancellation = (loop, stop_transport)
+        monitor._connection_pending.set()
+
+        monitor.request_stop()
+
+        loop.call_soon_threadsafe.assert_called_once_with(stop_transport)
 
     def test_native_color_scheme_is_restored_once_per_page(self) -> None:
         page = Mock()
@@ -883,6 +893,11 @@ class BrowserWindowsTests(unittest.TestCase):
         script = run_powershell.call_args.args[0]
         self.assertIn("0x54", script)
         self.assertNotIn("New Tab button not found", script)
+        self.assertIn("AttachThreadInput", script)
+        self.assertEqual(
+            script.count("[LiveGptWindowMessages]::ActivateWindow($window)"),
+            2,
+        )
 
     @patch("live_gpt.browser_windows._wait_for_remote_debugging_marker")
     @patch("live_gpt.browser_windows._enable_remote_debugging")

@@ -237,10 +237,80 @@ public static class LiveGptWindowMessages {{
     public static extern bool PostMessage(
         IntPtr window, uint message, IntPtr parameter, IntPtr extra
     );
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(
+        IntPtr window, IntPtr processId
+    );
+
+    [DllImport("kernel32.dll")]
+    private static extern uint GetCurrentThreadId();
+
+    [DllImport("user32.dll", SetLastError=true)]
+    private static extern bool AttachThreadInput(
+        uint threadId, uint attachToThreadId, bool attach
+    );
+
+    [DllImport("user32.dll")]
+    private static extern bool IsIconic(IntPtr window);
+
+    [DllImport("user32.dll")]
+    private static extern bool ShowWindowAsync(IntPtr window, int command);
+
+    [DllImport("user32.dll")]
+    private static extern bool BringWindowToTop(IntPtr window);
+
+    [DllImport("user32.dll")]
+    private static extern bool SetForegroundWindow(IntPtr window);
+
+    public static bool ActivateWindow(IntPtr window) {{
+        const int RestoreWindow = 9;
+        if (IsIconic(window)) {{
+            ShowWindowAsync(window, RestoreWindow);
+        }}
+
+        uint currentThread = GetCurrentThreadId();
+        uint foregroundThread = GetWindowThreadProcessId(
+            GetForegroundWindow(), IntPtr.Zero
+        );
+        uint windowThread = GetWindowThreadProcessId(window, IntPtr.Zero);
+        bool attachedForeground = false;
+        bool attachedWindow = false;
+        try {{
+            if (foregroundThread != 0 && foregroundThread != currentThread) {{
+                attachedForeground = AttachThreadInput(
+                    currentThread, foregroundThread, true
+                );
+            }}
+            if (
+                windowThread != 0 &&
+                windowThread != currentThread &&
+                windowThread != foregroundThread
+            ) {{
+                attachedWindow = AttachThreadInput(
+                    currentThread, windowThread, true
+                );
+            }}
+            BringWindowToTop(window);
+            return SetForegroundWindow(window);
+        }} finally {{
+            if (attachedWindow) {{
+                AttachThreadInput(currentThread, windowThread, false);
+            }}
+            if (attachedForeground) {{
+                AttachThreadInput(currentThread, foregroundThread, false);
+            }}
+        }}
+    }}
 }}
 '@
+$window = [System.IntPtr]::new({window_handle})
+[void][LiveGptWindowMessages]::ActivateWindow($window)
 $root = [System.Windows.Automation.AutomationElement]::FromHandle(
-    [System.IntPtr]::new({window_handle})
+    $window
 )
 if ({create_new_tab_value}) {{
     $newTabCondition = New-Object `
@@ -327,6 +397,7 @@ $addressBar.SetFocus()
     [System.IntPtr]::new(0x0D),
     [System.IntPtr]::Zero
 )
+[void][LiveGptWindowMessages]::ActivateWindow($window)
 Write-Output 'Navigated'
 """
     output = _run_powershell(script, timeout=7)
