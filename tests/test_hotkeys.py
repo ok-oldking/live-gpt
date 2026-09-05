@@ -114,6 +114,33 @@ class GlobalHotkeyMonitorTests(unittest.TestCase):
         self.assertEqual(binding.virtual_key, ord("S"))
         self.assertTrue(binding.control)
 
+    def test_disabled_shortcuts_do_not_trigger_and_can_be_enabled(self) -> None:
+        events = []
+        self.monitor.hold_pressed.connect(lambda: events.append("hold"))
+        self.monitor.hold_without_screenshot_pressed.connect(lambda: events.append("shift"))
+        self.monitor.send_pressed.connect(lambda: events.append("send"))
+        self.monitor.send_without_screenshot_pressed.connect(lambda: events.append("text"))
+        def configure(enabled):
+            self.monitor.update_bindings(
+                HotkeyBinding.from_sequence("CapsLock"),
+                HotkeyBinding.from_sequence("Ctrl+S"),
+                HotkeyBinding.from_sequence("Ctrl+D"),
+                enabled=enabled,
+            )
+        configure({"hold": True})
+        for keys in ({VK_CAPITAL}, {VK_SHIFT}, {VK_CONTROL, ord("S")}, {VK_CONTROL, ord("D")}):
+            self.pressed = keys
+            self.monitor.poll_now()
+            self.now += 0.4
+            self.monitor.poll_now()
+            self.pressed = set()
+            self.monitor.poll_now()
+        self.assertEqual(events, ["hold"])
+        configure({"send": True})
+        self.pressed = {VK_CONTROL, ord("S")}
+        self.monitor.poll_now()
+        self.assertEqual(events, ["hold", "send"])
+
 
 if __name__ == "__main__":
     unittest.main()

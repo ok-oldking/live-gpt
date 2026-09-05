@@ -581,6 +581,15 @@ class SettingsDialogTests(unittest.TestCase):
             )
             try:
                 self.assertFalse(hasattr(dialog, "settings_buttons"))
+                self.assertTrue(dialog.hotkey_enabled_switches["hold"].isChecked())
+                for name in ("hold_without_screenshot", "send", "send_without_screenshot"):
+                    self.assertFalse(dialog.hotkey_enabled_switches[name].isChecked())
+                self.assertFalse(dialog.send_edit.isEnabled())
+                dialog.hotkey_enabled_switches["send"].setChecked(True)
+                self.assertTrue(dialog.send_edit.isEnabled())
+                self.assertTrue(Config(path)["hotkey_send_enabled"])
+                dialog.hotkey_enabled_switches["hold"].setChecked(False)
+                self.assertFalse(Config(path)["hotkey_hold_enabled"])
                 dialog.language_combo.setCurrentIndex(1)
                 dialog.recording_backend_combo.setCurrentIndex(
                     dialog.recording_backend_combo.findData("sherpa")
@@ -996,6 +1005,21 @@ class TrayControllerBrowserTests(unittest.TestCase):
             window.set_response_update("Writing…", "Complete response")
             window._expand_subtitle()
             QApplication.processEvents()
+
+            options_position = window.configure_button.mapToGlobal(
+                window.configure_button.rect().center()
+            )
+            self.assertFalse(window.subtitle_panel.rect().contains(
+                window.subtitle_panel.mapFromGlobal(options_position)
+            ))
+            with patch(
+                "live_gpt.app.QCursor.pos",
+                return_value=options_position,
+            ):
+                window._subtitle_outside_timer.timeout.emit()
+
+            self.assertTrue(window._subtitle_expanded)
+            self.assertTrue(window._subtitle_outside_timer.isActive())
 
             with patch(
                 "live_gpt.app.QCursor.pos",

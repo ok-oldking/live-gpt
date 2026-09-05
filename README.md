@@ -166,7 +166,10 @@ Hotkey defaults are
 **Caps Lock** (record and automatically send with the selected screenshot),
 **Shift** (record and automatically send without a screenshot), **Ctrl+S**
 (send with the selected screenshot), and **Ctrl+D** (send without a screenshot).
-The recording shortcuts always send successful dictation regardless of the
+Each shortcut has an **Enabled** switch in settings. Only Caps Lock (Record
+and Send with Screenshot) is enabled by default; the other three shortcuts
+are disabled until enabled. Switch settings are saved automatically.
+The enabled recording shortcuts always send successful dictation regardless of the
 Auto Send toggle. Starting either recording shortcut stops active local or
 browser voice playback. The shortcuts work while the
 overlay is hidden or unfocused. Live GPT observes their key state without
@@ -195,7 +198,7 @@ shows the current status. When **Read aloud** starts, the prompt is removed and
 both lines show the response. During playback, subtitles follow the browser
 media's progress and roll forward one line at a time. Hover over the subtitle
 area to expand a full-response view whose height fits the wrapped text. Moving
-the pointer outside always restores the two-line view at the current playback
+the pointer outside the whole overlay restores the two-line view at the current playback
 line. Left-click it to return to input mode. If
 ChatGPT does not expose its media element, subtitle timing falls back to an
 estimate. Press the microphone or its hotkey to dismiss subtitles and dictate

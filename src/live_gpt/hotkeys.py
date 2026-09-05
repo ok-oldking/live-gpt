@@ -155,6 +155,7 @@ class GlobalHotkeyMonitor(QObject):
         parent: QObject | None = None,
         *,
         hold_without_screenshot: HotkeyBinding | None = None,
+        enabled: dict[str, bool] | None = None,
         key_state: Callable[[int], int] | None = None,
         clock: Callable[[], float] | None = None,
         interval_ms: int = 25,
@@ -186,6 +187,7 @@ class GlobalHotkeyMonitor(QObject):
             send,
             send_without_screenshot,
             hold_without_screenshot=hold_without_screenshot,
+            enabled=enabled,
         )
 
     def update_bindings(
@@ -195,7 +197,9 @@ class GlobalHotkeyMonitor(QObject):
         send_without_screenshot: HotkeyBinding,
         *,
         hold_without_screenshot: HotkeyBinding | None = None,
+        enabled: dict[str, bool] | None = None,
     ) -> None:
+        self._enabled = dict(enabled) if enabled is not None else None
         self._bindings = {
             "hold": hold,
             "hold_without_screenshot": (
@@ -240,7 +244,10 @@ class GlobalHotkeyMonitor(QObject):
 
     def poll_now(self) -> None:
         current = {
-            name: binding.is_pressed(self._key_state)
+            name: (
+                (self._enabled is None or self._enabled.get(name, False))
+                and binding.is_pressed(self._key_state)
+            )
             for name, binding in self._bindings.items()
         }
 

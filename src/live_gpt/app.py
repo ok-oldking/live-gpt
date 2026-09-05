@@ -35,6 +35,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
+    QCheckBox,
     QComboBox,
     QDialog,
     QFileDialog,
@@ -939,19 +940,29 @@ class HotkeyConfigDialog(QDialog):
         form.setContentsMargins(0, 4, 0, 0)
         form.setHorizontalSpacing(22)
         form.setVerticalSpacing(12)
-        form.addRow(
-            "Record and Send with Screenshot",
-            self.hold_microphone_edit,
-        )
-        form.addRow(
-            "Record and Send without Screenshot",
-            self.hold_without_screenshot_edit,
-        )
-        form.addRow("Send with screenshot", self.send_edit)
-        form.addRow(
-            "Send without screenshot",
-            self.send_without_screenshot_edit,
-        )
+        self.hotkey_enabled_switches: dict[str, QCheckBox] = {}
+        for name, label, editor in (
+            ("hold", "Record and Send with Screenshot", self.hold_microphone_edit),
+            ("hold_without_screenshot", "Record and Send without Screenshot",
+             self.hold_without_screenshot_edit),
+            ("send", "Send with screenshot", self.send_edit),
+            ("send_without_screenshot", "Send without screenshot",
+             self.send_without_screenshot_edit),
+        ):
+            key = HOTKEY_CONFIG_KEYS[name] + "_enabled"
+            switch = QCheckBox("Enabled")
+            switch.setAccessibleName(f"Enable {label}")
+            switch.setChecked(bool((self.config if self.config is not None else DEFAULT_CONFIG)[key]))
+            editor.setEnabled(switch.isChecked())
+            switch.toggled.connect(editor.setEnabled)
+            switch.toggled.connect(
+                lambda enabled, key=key: self._save_setting(key, enabled)
+            )
+            self.hotkey_enabled_switches[name] = switch
+            row = QHBoxLayout()
+            row.addWidget(editor)
+            row.addWidget(switch)
+            form.addRow(label, row)
         hotkey_card_layout.addLayout(form)
 
         note = QLabel(
@@ -3760,8 +3771,8 @@ class OverlayWindow(QMainWindow):
     def _collapse_subtitle_if_outside(self) -> None:
         if not self._subtitle_expanded:
             return
-        position = self.subtitle_panel.mapFromGlobal(QCursor.pos())
-        if not self.subtitle_panel.rect().contains(position):
+        position = self.mapFromGlobal(QCursor.pos())
+        if not self.rect().contains(position):
             self._collapse_subtitle()
             self.schedule_auto_hide(5_000)
 
@@ -4294,6 +4305,7 @@ class TrayController:
             bindings["send_without_screenshot"],
             self.window,
             hold_without_screenshot=bindings["hold_without_screenshot"],
+            enabled=self._hotkey_enabled_states(),
         )
 
         self.application.setWindowIcon(self.icon)
@@ -4424,6 +4436,12 @@ class TrayController:
         self._start_stt_preload()
         self._start_qwen_preload()
 
+    def _hotkey_enabled_states(self) -> dict[str, bool]:
+        return {
+            name: bool(self.config[key + "_enabled"])
+            for name, key in HOTKEY_CONFIG_KEYS.items()
+        }
+
     @staticmethod
     def _bindings_for_sequences(
         sequences: dict[str, QKeySequence],
@@ -4540,6 +4558,7 @@ class TrayController:
                 bindings["send"],
                 bindings["send_without_screenshot"],
                 hold_without_screenshot=bindings["hold_without_screenshot"],
+                enabled=self._hotkey_enabled_states(),
             )
             self.window.set_status("Settings updated")
             logger.info(

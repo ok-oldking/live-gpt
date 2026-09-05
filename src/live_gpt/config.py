@@ -20,6 +20,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "hotkey_hold_without_screenshot": "Shift",
     "hotkey_send": "Ctrl+S",
     "hotkey_send_without_screenshot": "Ctrl+D",
+    "hotkey_hold_enabled": True,
+    "hotkey_hold_without_screenshot_enabled": False,
+    "hotkey_send_enabled": False,
+    "hotkey_send_without_screenshot_enabled": False,
     "auto_send": False,
     "auto_hide": False,
     "capture_source": "",
@@ -136,7 +140,7 @@ def _valid_value(key: str, value: Any, default: Any) -> bool:
             "auto", "auto_yue", "zh", "en", "ja", "yue", "ko",
             "all_zh", "all_ja", "all_yue", "all_ko",
         )
-    if key.startswith("hotkey_"):
+    if key.startswith("hotkey_") and not key.endswith("_enabled"):
         return bool(value.strip())
     if key == "window_geometry":
         return value == [] or (
