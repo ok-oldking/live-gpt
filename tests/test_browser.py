@@ -33,6 +33,46 @@ class BrowserDiscoveryTests(unittest.TestCase):
 
 
 class BrowserMonitorTests(unittest.TestCase):
+    def test_refresh_discovers_new_tabs_and_navigation_after_empty_connection(self):
+        monitor = BrowserMonitor()
+        updates = []
+        monitor.tabs_changed.connect(updates.append)
+        page = Mock(url="about:blank")
+        page.is_closed.return_value = False
+        page.title.return_value = "New conversation"
+        context = Mock(pages=[])
+        browser = Mock(contexts=[context])
+        state = _MonitorState(browser=browser)
+        session = browser.new_browser_cdp_session.return_value
+        monitor._refresh_tabs(state, FakePlaywrightError)
+        self.assertEqual(updates, [[]])
+        # Model events becoming visible only when a sync API call pumps them.
+        session.send.side_effect = lambda _: context.pages.append(page)
+        monitor._refresh_tabs(state, FakePlaywrightError)
+        self.assertEqual(updates, [[]])
+        session.send.side_effect = lambda _: setattr(page, "url", "https://chatgpt.com/")
+        monitor._refresh_tabs(state, FakePlaywrightError)
+        self.assertEqual(updates[-1], [{"id": str(id(page)), "title": "New conversation", "url": "https://chatgpt.com/"}])
+        monitor._refresh_tabs(state, FakePlaywrightError)
+        self.assertEqual(len(updates), 2)
+        browser.new_browser_cdp_session.assert_called_once()
+        session.send.assert_called_with("Target.getTargets")
+        session.send.side_effect = lambda _: context.pages.clear()
+        monitor._refresh_tabs(state, FakePlaywrightError)
+        self.assertEqual(updates[-1], [])
+
+    def test_discovery_failure_clears_connection_and_session(self):
+        monitor = BrowserMonitor()
+        connections = []
+        monitor.debug_connection_changed.connect(connections.append)
+        browser = Mock()
+        browser.new_browser_cdp_session.return_value.send.side_effect = FakePlaywrightError("Disconnected")
+        state = _MonitorState(browser=browser)
+        monitor._refresh_tabs(state, FakePlaywrightError)
+        self.assertIsNone(state.browser)
+        self.assertIsNone(state.discovery_session)
+        self.assertEqual(connections, [False])
+
     def test_composer_text_uses_visible_contenteditable_match(self) -> None:
         hidden_composer = Mock()
         hidden_composer.evaluate.return_value = "Hidden composer"

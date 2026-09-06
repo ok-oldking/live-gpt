@@ -104,6 +104,7 @@ _MEDIA_PROGRESS_SCRIPT = """
 @dataclass
 class _MonitorState:
     browser: Any | None = None
+    discovery_session: Any | None = None
     settings_opened: bool = False
     next_settings_attempt: float = 0.0
     retry_endpoint: str | None = None
@@ -174,6 +175,7 @@ class _ActiveReading:
 
 
 class BrowserMonitor(QThread):
+    debug_connection_changed = Signal(bool)
     """Own Playwright on a worker thread and publish live ChatGPT tab state."""
 
     tabs_changed = Signal(object)
@@ -304,19 +306,12 @@ class BrowserMonitor(QThread):
             )
             while not self._stop_requested:
                 if not self._is_connected(state.browser):
+                    if state.browser is not None:
+                        self._handle_disconnect(state)
                     self._try_connect(playwright, PlaywrightError, state)
 
                 if self._is_connected(state.browser):
-                    tabs = self._collect_chatgpt_tabs(
-                        state.browser,
-                        PlaywrightError,
-                        state.media_reset_pages,
-                    )
-                    if tabs is None:
-                        self._handle_disconnect(state)
-                    elif tabs != state.last_tabs:
-                        state.last_tabs = tabs
-                        self.tabs_changed.emit(tabs)
+                    self._refresh_tabs(state, PlaywrightError)
                 elif state.last_tabs:
                     state.last_tabs = []
                     self.tabs_changed.emit([])
@@ -384,6 +379,7 @@ class BrowserMonitor(QThread):
         state: _MonitorState,
     ) -> None:
         state.browser = None
+        state.discovery_session = None
         endpoint = discover_cdp_endpoint()
         if self._stop_requested:
             return
@@ -431,6 +427,7 @@ class BrowserMonitor(QThread):
         state.retry_endpoint = None
         state.media_reset_pages.clear()
         state.settings_opened = False
+        self.debug_connection_changed.emit(True)
         self._set_status("Browser connected")
         logger.info(f"Connected to browser endpoint={endpoint!r}")
 
@@ -450,6 +447,24 @@ class BrowserMonitor(QThread):
 
         if state.settings_opened:
             self._set_status("Enable remote debugging in the browser")
+
+    def _refresh_tabs(self, state: _MonitorState, playwright_error: type[Exception]) -> None:
+        try:
+            if state.discovery_session is None:
+                state.discovery_session = state.browser.new_browser_cdp_session()
+            # A sync API round trip dispatches pending page/navigation events.
+            # Reading contexts/pages alone uses cached data and can stall forever
+            # when no matching page exists to trigger another Playwright call.
+            state.discovery_session.send("Target.getTargets")
+        except playwright_error:
+            self._handle_disconnect(state)
+            return
+        tabs = self._collect_chatgpt_tabs(state.browser, playwright_error, state.media_reset_pages)
+        if tabs is None:
+            self._handle_disconnect(state)
+        elif tabs != state.last_tabs:
+            state.last_tabs = tabs
+            self.tabs_changed.emit(tabs)
 
     @staticmethod
     def _collect_chatgpt_tabs(
@@ -495,7 +510,9 @@ class BrowserMonitor(QThread):
             self.reading_finished.emit(False, "Browser disconnected")
             state.active_reading = None
         state.browser = None
+        state.discovery_session = None
         state.media_reset_pages.clear()
+        self.debug_connection_changed.emit(False)
         self._set_status("Browser disconnected")
         if state.last_tabs != []:
             state.last_tabs = []

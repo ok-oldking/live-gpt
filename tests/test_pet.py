@@ -210,6 +210,49 @@ class PetTests(unittest.TestCase):
         w.set_chatgpt_tabs(tabs)
         self.assertTrue(w._auto_hide_timer.isActive())
 
+    def test_debug_connected_hint_then_late_tab_is_selected(self):
+        w = self.window
+        w.set_debug_connection(True)
+        w.set_chatgpt_tabs([])
+        self.assertIn("Open chatgpt.com", w.transcript_area.placeholderText())
+        self.assertTrue(w.remote_debugging_button.isHidden())
+        for status in ("Browser connected", "Enable remote debugging in the browser",
+                       "Retrying connection… approve it in the browser"):
+            w.set_browser_status(status)
+            self.assertIn("Debugger connected", w.chatgpt_tab_combo.currentText())
+            self.assertIn("Open chatgpt.com", w.transcript_area.placeholderText())
+            self.assertIn("Open chatgpt.com", w.chatgpt_tab_combo.toolTip())
+        self.assertFalse(w.transcript_area.isEnabled())
+        self.assertTrue(w._chrome_visible)
+        selections = []
+        w.chatgpt_tab_selected.connect(selections.append)
+        w.set_chatgpt_tabs([{"id": "new", "title": "ChatGPT", "url": "https://chatgpt.com/"}])
+        self.assertEqual(selections, ["new"])
+        self.assertTrue(w.transcript_area.isEnabled())
+        w.set_chatgpt_tabs([])
+        self.assertIn("Open chatgpt.com", w.transcript_area.placeholderText())
+        w.set_debug_connection(False)
+        self.assertFalse(w.remote_debugging_button.isHidden())
+
+    def test_visible_input_repaints_after_debug_approval(self):
+        w = self.window
+        w.set_browser_status("Approve remote debugging in the browser…")
+        QApplication.processEvents()
+        area = w.transcript_area.rect()
+        area.moveTopLeft(w.transcript_area.mapTo(w, QPoint()))
+        before = w.grab(area).toImage()
+        w.set_debug_connection(True)
+        w.set_chatgpt_tabs([])
+        QApplication.processEvents()
+        self.assertFalse(w.transcript_area.graphicsEffect().isEnabled())
+        self.assertIn("Open chatgpt.com", w.transcript_area.placeholderText())
+        self.assertNotEqual(before, w.grab(area).toImage())
+        w.set_chatgpt_tabs([{"id": "tab", "title": "ChatGPT", "url": "https://chatgpt.com"}])
+        w._set_chrome_visible(False)
+        self.assertTrue(w.transcript_area.graphicsEffect().isEnabled())
+        w._set_chrome_visible(True)
+        self.assertFalse(w.transcript_area.graphicsEffect().isEnabled())
+
     def test_screen_tracking_shows_margin_and_hides_everything_except_pet(self):
         w = self.window
         w.set_chatgpt_tabs([{"id": "tab", "title": "ChatGPT", "url": "https://chatgpt.com"}])

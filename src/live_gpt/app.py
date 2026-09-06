@@ -2830,6 +2830,7 @@ class TranscriptEditor(QPlainTextEdit):
         ):
             palette.setColor(group, QPalette.ColorRole.PlaceholderText, color)
         self.setPalette(palette)
+        self.viewport().update()
 
     def _sync_action_visibility(self) -> None:
         has_text = bool(self.toPlainText().strip()) and not self._response_mode
@@ -2889,6 +2890,7 @@ class OverlayWindow(QMainWindow):
         self._focus_restorer = ForegroundWindowRestorer()
         self._auto_hide_enabled = False
         self._browser_connected = False
+        self._debug_connected = False
         self._preferred_capture_source_key = ""
         self._preferred_chatgpt_url = ""
         self.setWindowTitle("Live GPT")
@@ -3394,12 +3396,12 @@ class OverlayWindow(QMainWindow):
         self.chatgpt_tab_combo.blockSignals(True)
         self.chatgpt_tab_combo.clear()
         if not tabs:
-            self.chatgpt_tab_combo.addItem("No ChatGPT windows")
+            self.chatgpt_tab_combo.addItem("No ChatGPT tabs open")
             self.chatgpt_tab_combo.setEnabled(False)
-            self.remote_debugging_button.setVisible(True)
+            self.remote_debugging_button.setVisible(not self._debug_connected)
             self.microphone_button.setEnabled(False)
             self.transcript_area.setEnabled(False)
-            self.set_status("Connect to a ChatGPT window to begin")
+            self._show_browser_connection_hint()
         else:
             for tab in tabs:
                 self.chatgpt_tab_combo.addItem(tab["title"], tab["id"])
@@ -3442,7 +3444,30 @@ class OverlayWindow(QMainWindow):
                 save_preference=not bool(self._preferred_chatgpt_url),
             )
 
+    def set_debug_connection(self, connected: bool) -> None:
+        self._debug_connected = connected
+        if not self._browser_connected:
+            self.remote_debugging_button.setVisible(not connected)
+            self._show_browser_connection_hint()
+
+    def _show_browser_connection_hint(self) -> None:
+        if self._debug_connected:
+            self.chatgpt_tab_combo.setItemText(0, "Debugger connected — open ChatGPT")
+        message = (
+            "Debugger connected. No ChatGPT tab is open. Open chatgpt.com in this browser; "
+            "Live GPT will detect the tab automatically."
+            if self._debug_connected else
+            "Connect to a ChatGPT window to begin"
+        )
+        self.chatgpt_tab_combo.setToolTip(message)
+        self.set_status(message)
+
     def set_browser_status(self, status: str) -> None:
+        # Connection state takes precedence over queued setup/retry messages.
+        # The explicit disconnect signal clears this state on a real disconnect.
+        if self._debug_connected and not self._browser_connected:
+            self._show_browser_connection_hint()
+            return
         self.chatgpt_tab_combo.setToolTip(status)
         status_lower = status.casefold()
         self.set_status(
@@ -4076,6 +4101,9 @@ class OverlayWindow(QMainWindow):
         self._microphone_opacity.setOpacity(opacity)
         for effect in self._content_opacities:
             effect.setOpacity(opacity)
+            # Render visible editors directly: an enabled opacity effect can
+            # retain stale viewport pixels when only placeholder text changes.
+            effect.setEnabled(not visible)
         self.panel.setProperty("chromeVisible", visible)
         self._resize_surface.setProperty("chromeVisible", visible)
         for widget in (self.panel, self._resize_surface):
@@ -4394,6 +4422,7 @@ class TrayController:
             self._save_capture_source_preference
         )
         self.browser_monitor.tabs_changed.connect(self.window.set_chatgpt_tabs)
+        self.browser_monitor.debug_connection_changed.connect(self.window.set_debug_connection)
         self.browser_monitor.status_changed.connect(
             self.window.set_browser_status
         )
