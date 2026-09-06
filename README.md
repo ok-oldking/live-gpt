@@ -10,12 +10,12 @@ live-gpt
 
 The app starts as a translucent, always-on-top overlay centered above the
 bottom of the screen and also places an icon in the Windows system tray. Drag
-any non-button area to reposition it, or drag any border or corner to resize
+any non-interactive area of the overlay to reposition it, or drag any border or corner to resize
 it. The lock button beside **Configure** freezes both its position and size;
-click it again to unlock. When the pointer is outside the overlay, its frame,
-title controls, and microphone become fully transparent while the input area
-stays visible. They return when the pointer enters or while a border is being
-resized. The **Auto-hide** button hides the overlay completely so clicks pass
+click it again to unlock. Screen pointer tracking keeps the overlay visible within a 5% margin on each
+edge. Outside that boundary, everything except the pet becomes transparent,
+including the input, subtitles, and dictation area. The overlay stays visible
+while dragging or resizing. The **Auto-hide** button hides the overlay completely so clicks pass
 through to the underlying app. In auto-hide mode it reappears for dictation,
 incoming replies, and Read Aloud, then hides five seconds after playback ends.
 If dictation produces text, the overlay stays visible so that text can be
@@ -225,3 +225,19 @@ ChatGPT pages retain the browser's native color-scheme
 preference. Live GPT does not launch the browser with debugging flags or create
 a separate profile. The optional `LIVE_GPT_CDP_ENDPOINT` environment variable
 can point the app at a specific CDP HTTP or WebSocket endpoint.
+
+## Pet
+
+The default pet is `assets/pets/feibi-jiubi`. Set `pet_path` in the user
+configuration to a Codex pet directory or its `pet.json` to choose another pet
+(restart to apply). An empty path uses the bundled default. Both v1 (8×9)
+and v2 (8×11) sprite sheets with 192×208 cells are supported; an omitted
+`spriteVersionNumber` is treated as v1. Invalid custom pets fall back to the default.
+
+The pet uses idle at rest, waiting during dictation, running while awaiting a
+response, review during speech playback, and failed for errors. Dragging uses
+running-right or running-left and restores the current activity on release.
+V2 pets look toward the screen pointer while idle when its distance from the
+pet is less than half the height of the screen containing the pet. Moving
+farther away or leaving the pointer still for five seconds restores the idle
+loop. The lock button locks overlay dragging and resizing.

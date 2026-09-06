@@ -30,6 +30,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "chatgpt_window": "",
     "window_geometry": [],
     "window_locked": False,
+    "pet_path": "",
     "recording_backend": "web",
     "playing_backend": "web",
     "pypi_mirror": "default",

@@ -19,3 +19,6 @@ live-gpt = "live_gpt.app:main"
 
 [tool.setuptools.package-data]
 live_gpt = ["assets/*.ico", "assets/*.png", "assets/*.svg"]
+
+[tool.setuptools.data-files]
+"share/live-gpt/pets/feibi-jiubi" = ["assets/pets/feibi-jiubi/pet.json", "assets/pets/feibi-jiubi/spritesheet.webp"]

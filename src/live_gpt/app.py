@@ -66,6 +66,7 @@ from .browser import (
     open_remote_debugging_settings,
 )
 from .config import Config, DEFAULT_CONFIG
+from .pet import PetWidget
 from .logger import Logger, config_logger, shutdown_logger
 from .hotkeys import GlobalHotkeyMonitor, HotkeyBinding
 from .screen_capture import CaptureSource, capture_webp, list_capture_sources
@@ -2873,10 +2874,13 @@ class OverlayWindow(QMainWindow):
     capture_source_selected = Signal(str)
     geometry_changed = Signal(object)
 
-    def __init__(self) -> None:
+    def __init__(self, pet_path: str = "") -> None:
         super().__init__()
         logger.debug("Creating overlay window")
-        self._drag_offset: QPoint | None = None
+        self._pet_response_pending = False
+        self._pet_playing = False
+        self._pet_listening = False
+        self._pet_error = False
         self._position_locked = False
         self._resize_edges = Qt.Edges()
         self._resize_start_global: QPoint | None = None
@@ -3119,6 +3123,12 @@ class OverlayWindow(QMainWindow):
         panel_layout.addWidget(self.title_bar)
         recording_layout = QHBoxLayout()
         recording_layout.setSpacing(16)
+        try:
+            self.pet = PetWidget(pet_path)
+        except (OSError, ValueError, TypeError, KeyError) as error:
+            logger.warning(f"Unable to load selected pet; using default: {error}")
+            self.pet = PetWidget()
+        recording_layout.addWidget(self.pet, 0, Qt.AlignmentFlag.AlignVCenter)
         recording_layout.addWidget(self.transcript_area, 1)
         recording_layout.addWidget(self.subtitle_panel, 1)
         recording_layout.addWidget(self.dictation_panel, 1)
@@ -3140,6 +3150,12 @@ class OverlayWindow(QMainWindow):
             self.microphone_button
         )
         self.microphone_button.setGraphicsEffect(self._microphone_opacity)
+        self._content_opacities = []
+        for widget in (self.transcript_area, self.subtitle_panel, self.dictation_panel):
+            effect = QGraphicsOpacityEffect(widget)
+            widget.setGraphicsEffect(effect)
+            self._content_opacities.append(effect)
+        self.pet.pointer_tracked.connect(self._track_pointer)
 
         self.setStyleSheet(
             """
@@ -3340,6 +3356,7 @@ class OverlayWindow(QMainWindow):
             "error": "Browser dictation unavailable",
         }
         label = message or labels[state]
+        self._pet_listening = state == "recording"
         self.set_status(label, error=state == "error")
         self.microphone_button.setProperty("recordingState", state)
         self.microphone_button.setAccessibleName(label)
@@ -3351,6 +3368,17 @@ class OverlayWindow(QMainWindow):
 
     def set_status(self, message: str, *, error: bool = False) -> None:
         self.transcript_area.set_hint(message, error=error)
+        self._pet_error = error
+        self._refresh_pet()
+
+    def _refresh_pet(self) -> None:
+        state = (
+            "failed" if self._pet_error else
+            "waiting" if self._pet_listening else
+            "review" if self._pet_playing else
+            "running" if self._pet_response_pending else "idle"
+        )
+        self.pet.set_state(state)
 
     def set_transcript(self, text: str) -> None:
         self.transcript_area.setPlainText(text)
@@ -3456,6 +3484,7 @@ class OverlayWindow(QMainWindow):
         self.send_button.setEnabled(True)
         self.send_without_screenshot_button.setEnabled(True)
         if not success:
+            self._pet_response_pending = False
             self.show_for_auto_hide()
             self.dismiss_subtitle_mode()
             self.set_transcript(sent_text)
@@ -3475,6 +3504,9 @@ class OverlayWindow(QMainWindow):
         sent_text: str = "",
         message: str = "Sending to ChatGPT…",
     ) -> None:
+        self._pet_response_pending = True
+        self._pet_playing = False
+        self._pet_listening = False
         self._collapse_subtitle()
         self._subtitle_mode_active = True
         self._subtitle_dismissed = False
@@ -3518,12 +3550,15 @@ class OverlayWindow(QMainWindow):
             self._update_expanded_subtitle()
 
     def set_response_finished(self, success: bool, message: str) -> None:
+        self._pet_response_pending = False
+        self._pet_error = not success
+        self._refresh_pet()
         if self._subtitle_dismissed:
             return
         self.show_for_auto_hide()
         self.transcript_area.finish_response()
         self.microphone_button.setVisible(True)
-        if self._subtitle_reading_active:
+        if self._subtitle_reading_active and success:
             self.set_status("Reading aloud…")
             return
         self.set_status(message, error=not success)
@@ -3532,6 +3567,9 @@ class OverlayWindow(QMainWindow):
         self.schedule_auto_hide(5_000)
 
     def begin_reading(self, message: str) -> None:
+        self._pet_playing = True
+        self._pet_error = False
+        self._refresh_pet()
         if self._subtitle_dismissed:
             return
         self.show_for_auto_hide()
@@ -3662,6 +3700,9 @@ class OverlayWindow(QMainWindow):
         )
 
     def finish_reading(self, success: bool, message: str) -> None:
+        self._pet_playing = False
+        self._pet_error = not success
+        self._refresh_pet()
         if self._subtitle_dismissed:
             return
         self.transcript_area.finish_reading()
@@ -3794,6 +3835,11 @@ class OverlayWindow(QMainWindow):
         return True
 
     def begin_dictation_waiting(self) -> None:
+        self._pet_listening = True
+        self._pet_playing = False
+        self._pet_response_pending = False
+        self._pet_error = False
+        self._refresh_pet()
         self.dismiss_subtitle_mode()
         self.show_for_auto_hide()
         self.subtitle_panel.hide()
@@ -3804,6 +3850,8 @@ class OverlayWindow(QMainWindow):
         self.dictation_panel.show()
 
     def set_dictation_listening(self) -> None:
+        self._pet_listening = True
+        self._refresh_pet()
         self.dictation_state_label.setText("Listening…")
 
     def set_dictation_partial(
@@ -3823,6 +3871,8 @@ class OverlayWindow(QMainWindow):
         self.dictation_state_label.setText("Cancelling short dictation…")
 
     def end_dictation_display(self) -> None:
+        self._pet_listening = False
+        self._refresh_pet()
         self.dictation_panel.hide()
         self.transcript_area.show()
 
@@ -3987,7 +4037,7 @@ class OverlayWindow(QMainWindow):
 
     def _set_position_locked(self, locked: bool) -> None:
         self._position_locked = locked
-        self._drag_offset = None
+        self.pet.set_locked(locked)
         self._end_border_resize()
         if locked:
             self.setFixedSize(self.size())
@@ -4003,11 +4053,16 @@ class OverlayWindow(QMainWindow):
         self.lock_button.setToolTip(label)
 
     def _set_chrome_visible(self, visible: bool) -> None:
-        visible = visible or bool(self._resize_edges)
+        visible = visible or bool(self._resize_edges) or self.pet._drag_offset is not None
+        if visible == self._chrome_visible and hasattr(self, "_chrome_initialized"):
+            return
+        self._chrome_initialized = True
         self._chrome_visible = visible
         opacity = 1.0 if visible else 0.0
         self._title_opacity.setOpacity(opacity)
         self._microphone_opacity.setOpacity(opacity)
+        for effect in self._content_opacities:
+            effect.setOpacity(opacity)
         self.panel.setProperty("chromeVisible", visible)
         self._resize_surface.setProperty("chromeVisible", visible)
         for widget in (self.panel, self._resize_surface):
@@ -4017,7 +4072,7 @@ class OverlayWindow(QMainWindow):
             widget.update()
 
     def enterEvent(self, event) -> None:  # noqa: N802
-        self._set_chrome_visible(True)
+        self._track_pointer(QCursor.pos())
         super().enterEvent(event)
 
     def resizeEvent(self, event) -> None:  # noqa: N802
@@ -4040,8 +4095,17 @@ class OverlayWindow(QMainWindow):
         super().leaveEvent(event)
 
     def _hide_chrome_if_outside(self) -> None:
-        if not self._resize_edges and not self.underMouse():
-            self._set_chrome_visible(False)
+        self._track_pointer(QCursor.pos())
+
+    def _pointer_hover_bounds(self) -> QRect:
+        bounds = self.frameGeometry()
+        # Add 5% of the overlay dimensions on each side for border access.
+        margin_x = max(1, round(bounds.width() * 0.05))
+        margin_y = max(1, round(bounds.height() * 0.05))
+        return bounds.adjusted(-margin_x, -margin_y, margin_x, margin_y)
+
+    def _track_pointer(self, position: QPoint) -> None:
+        self._set_chrome_visible(self._pointer_hover_bounds().contains(position))
 
     def eventFilter(self, watched, event) -> bool:  # noqa: N802
         subtitle_widgets = getattr(self, "_subtitle_hover_widgets", ())
@@ -4144,7 +4208,6 @@ class OverlayWindow(QMainWindow):
         self._resize_edges = edges
         self._resize_start_global = global_position
         self._resize_start_geometry = self.geometry()
-        self._drag_offset = None
         self._set_chrome_visible(True)
 
     def _update_border_resize(self, global_position: QPoint) -> None:
@@ -4181,8 +4244,8 @@ class OverlayWindow(QMainWindow):
         self._resize_edges = Qt.Edges()
         self._resize_start_global = None
         self._resize_start_geometry = None
-        if was_resizing and not self.underMouse():
-            self._set_chrome_visible(False)
+        if was_resizing:
+            self._track_pointer(QCursor.pos())
 
     def _update_border_cursor(self, position: QPoint) -> None:
         edges = self._resize_edges or self._resize_edges_at(position)
@@ -4211,38 +4274,24 @@ class OverlayWindow(QMainWindow):
         event.ignore()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
-        if (
-            not self._position_locked
-            and event.button() == Qt.MouseButton.LeftButton
-        ):
-            clicked_widget = self.childAt(event.position().toPoint())
-            if not isinstance(clicked_widget, (QPushButton, QComboBox)):
-                self._drag_offset = (
-                    event.globalPosition().toPoint()
-                    - self.frameGeometry().topLeft()
-                )
-                event.accept()
-                return
+        if not self._position_locked and event.button() == Qt.MouseButton.LeftButton:
+            self.pet.begin_drag(event.globalPosition().toPoint())
+            self._set_chrome_visible(True)
+            event.accept()
+            return
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
-        if (
-            not self._position_locked
-            and self._drag_offset is not None
-            and event.buttons() & Qt.MouseButton.LeftButton
-        ):
-            self.move(event.globalPosition().toPoint() - self._drag_offset)
+        if self.pet._drag_offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            self.pet.drag_to(event.globalPosition().toPoint())
             event.accept()
             return
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
-        if (
-            event.button() == Qt.MouseButton.LeftButton
-            and self._drag_offset is not None
-        ):
-            self._drag_offset = None
-            logger.debug(f"Overlay moved to {self.pos().x()},{self.pos().y()}")
+        if event.button() == Qt.MouseButton.LeftButton and self.pet._drag_offset is not None:
+            self.pet._finish_drag()
+            self._track_pointer(event.globalPosition().toPoint())
             event.accept()
             return
         super().mouseReleaseEvent(event)
@@ -4268,7 +4317,7 @@ class TrayController:
         self._stt_preload_thread: threading.Thread | None = None
         self._qwen_preload_thread: threading.Thread | None = None
         self._migrate_legacy_hotkeys()
-        self.window = OverlayWindow()
+        self.window = OverlayWindow(str(self.config["pet_path"]))
         self.window.set_preferred_capture_source(
             str(self.config["capture_source"])
         )
