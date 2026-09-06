@@ -164,7 +164,20 @@ class PetWidget(QWidget):
             if dx:
                 self._animate("running-right" if dx > 0 else "running-left")
             self._last_drag_position = position
-            self.window().move(position - self._drag_offset)
+            window = self.window()
+            # Choose by pointer, not window center, so clamping at a shared
+            # edge never prevents a drag from crossing onto another monitor.
+            screen = QApplication.screenAt(position) or window.screen()
+            bounds = screen.availableGeometry()
+            target = position - self._drag_offset
+            size = window.frameGeometry().size()
+            # If the window is larger than the work area, keep its top-left
+            # controls reachable rather than moving them beyond the screen.
+            max_x = max(bounds.left(), bounds.right() - size.width() + 1)
+            max_y = max(bounds.top(), bounds.bottom() - size.height() + 1)
+            target.setX(max(bounds.left(), min(target.x(), max_x)))
+            target.setY(max(bounds.top(), min(target.y(), max_y)))
+            window.move(target)
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton:

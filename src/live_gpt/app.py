@@ -2888,6 +2888,7 @@ class OverlayWindow(QMainWindow):
         self._chrome_visible = False
         self._focus_restorer = ForegroundWindowRestorer()
         self._auto_hide_enabled = False
+        self._browser_connected = False
         self._preferred_capture_source_key = ""
         self._preferred_chatgpt_url = ""
         self.setWindowTitle("Live GPT")
@@ -3387,6 +3388,8 @@ class OverlayWindow(QMainWindow):
         self.transcript_area.setTextCursor(cursor)
 
     def set_chatgpt_tabs(self, tabs: list[dict[str, str]]) -> None:
+        was_connected = self._browser_connected
+        self._browser_connected = bool(tabs)
         selected_id = self.chatgpt_tab_combo.currentData()
         self.chatgpt_tab_combo.blockSignals(True)
         self.chatgpt_tab_combo.clear()
@@ -3425,6 +3428,13 @@ class OverlayWindow(QMainWindow):
                 selected_index if selected_index >= 0 else 0
             )
         self.chatgpt_tab_combo.blockSignals(False)
+        if not self._browser_connected:
+            self._auto_hide_timer.stop()
+            if was_connected and self.isHidden():
+                self.showNormal()
+        elif not was_connected:
+            self.schedule_auto_hide()
+        self._track_pointer(QCursor.pos())
         self.chatgpt_connection_changed.emit(bool(tabs))
         if tabs:
             self._activate_chatgpt_tab(
@@ -4000,7 +4010,7 @@ class OverlayWindow(QMainWindow):
             self._auto_hide_timer.stop()
 
     def _can_auto_hide(self) -> bool:
-        if not self._auto_hide_enabled:
+        if not self._browser_connected or not self._auto_hide_enabled:
             return False
         if not self.dictation_panel.isHidden():
             return False
@@ -4053,7 +4063,10 @@ class OverlayWindow(QMainWindow):
         self.lock_button.setToolTip(label)
 
     def _set_chrome_visible(self, visible: bool) -> None:
-        visible = visible or bool(self._resize_edges) or self.pet._drag_offset is not None
+        visible = (
+            visible or not self._browser_connected
+            or bool(self._resize_edges) or self.pet._drag_offset is not None
+        )
         if visible == self._chrome_visible and hasattr(self, "_chrome_initialized"):
             return
         self._chrome_initialized = True

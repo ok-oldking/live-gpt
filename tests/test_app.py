@@ -809,6 +809,8 @@ class TrayControllerBrowserTests(unittest.TestCase):
     def test_chrome_is_transparent_outside_and_visible_while_resizing(self) -> None:
         window = OverlayWindow()
         try:
+            window.set_chatgpt_tabs([{"id": "tab", "title": "ChatGPT", "url": "https://chatgpt.com"}])
+            window._set_chrome_visible(False)
             self.assertEqual(window._title_opacity.opacity(), 0.0)
             self.assertEqual(window._microphone_opacity.opacity(), 0.0)
             self.assertFalse(window.panel.property("chromeVisible"))
@@ -1491,6 +1493,7 @@ class TrayControllerBrowserTests(unittest.TestCase):
     def test_auto_hide_reveals_for_activity_and_hides_afterwards(self) -> None:
         window = OverlayWindow()
         try:
+            window.set_chatgpt_tabs([{"id": "tab", "title": "ChatGPT", "url": "https://chatgpt.com"}])
             window.show()
             window.auto_hide_button.click()
             QApplication.processEvents()
@@ -1555,6 +1558,7 @@ class TrayControllerBrowserTests(unittest.TestCase):
     def test_auto_hide_waits_while_unsent_dictation_is_present(self) -> None:
         window = OverlayWindow()
         try:
+            window.set_chatgpt_tabs([{"id": "tab", "title": "ChatGPT", "url": "https://chatgpt.com"}])
             window.show()
             window.set_transcript("Unsent dictated text")
 

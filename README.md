@@ -241,3 +241,12 @@ V2 pets look toward the screen pointer while idle when its distance from the
 pet is less than half the height of the screen containing the pet. Moving
 farther away or leaving the pointer still for five seconds restores the idle
 loop. The lock button locks overlay dragging and resizing.
+
+Mouse-out hiding and auto-hide only run while a ChatGPT browser tab is connected.
+Before connection or after disconnection, the full overlay stays visible so you
+can reconnect. Your auto-hide preference is retained for the next connection.
+
+Dragging keeps the overlay inside the usable area of the screen under the
+pointer. Move the pointer onto another monitor to transfer the overlay there.
+If the overlay is larger than that screen's usable area, its top-left corner
+stays on-screen so its controls remain reachable.

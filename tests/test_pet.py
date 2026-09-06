@@ -5,11 +5,12 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, Qt
 from PySide6.QtGui import QMouseEvent
 from PySide6.QtWidgets import QApplication
 
@@ -81,7 +82,9 @@ class PetTests(unittest.TestCase):
         self.window.set_response_finished(False, "Disconnected")
         self.assertEqual(self.pet.state, "failed")
 
-    def test_overlay_and_pet_drag_and_restore_current_activity(self):
+    @patch("live_gpt.pet.QApplication.screenAt")
+    def test_overlay_and_pet_drag_and_restore_current_activity(self, screen_at):
+        screen_at.return_value = SimpleNamespace(availableGeometry=lambda: QRect(-4000, -4000, 8000, 8000))
         w = self.window
         origin = QPoint(w.pos())
         point = w.title_bar.mapToGlobal(w.title_bar.rect().center())
@@ -106,6 +109,29 @@ class PetTests(unittest.TestCase):
         self.mouse(self.pet, QEvent.Type.MouseButtonPress, point)
         self.mouse(self.pet, QEvent.Type.MouseMove, point + QPoint(100, 0), Qt.MouseButton.NoButton)
         self.assertEqual(w.pos(), origin)
+
+    def test_drag_stays_in_work_area_and_crosses_to_other_monitors(self):
+        w = self.window
+        w.move(100, 100)
+        self.pet.begin_drag(QPoint(150, 150))
+        areas = [QRect(0, 0, 1920, 1040), QRect(1920, 0, 1920, 1040),
+                 QRect(-1920, 0, 1920, 1040), QRect(0, -1080, 1920, 1080)]
+        monitors = [SimpleNamespace(availableGeometry=lambda area=area: area) for area in areas]
+
+        def screen_at(point):
+            return next((screen for screen, area in zip(monitors, areas) if area.contains(point)), monitors[0])
+
+        with patch("live_gpt.pet.QApplication.screenAt", side_effect=screen_at):
+            for point, area in [(QPoint(0, 0), areas[0]),
+                                (QPoint(1919, 1039), areas[0]),
+                                (QPoint(1920, 500), areas[1]),
+                                (QPoint(3839, 1039), areas[1]),
+                                (QPoint(-1, 500), areas[2]),
+                                (QPoint(-1920, 0), areas[2]),
+                                (QPoint(500, -1), areas[3])]:
+                self.pet.drag_to(point)
+                self.assertTrue(area.contains(w.frameGeometry()), (point, w.frameGeometry()))
+        self.pet._finish_drag()
 
     def test_v2_all_look_directions_and_idle_deadzone(self):
         import math
@@ -157,8 +183,36 @@ class PetTests(unittest.TestCase):
         self.pet.update_look(center + QPoint(radius, 0))
         self.assertIsNone(self.pet.look_direction)
 
+    def test_hiding_requires_connection_and_disconnect_restores_controls(self):
+        w = self.window
+        outside = w._pointer_hover_bounds().topLeft() - QPoint(1, 1)
+        w._track_pointer(outside)
+        self.assertTrue(w._chrome_visible)
+        self.assertTrue(all(effect.opacity() == 1 for effect in w._content_opacities))
+        w.auto_hide_button.setChecked(True)
+        w._hide_for_auto_hide()
+        self.assertFalse(w.isHidden())
+        self.assertFalse(w._auto_hide_timer.isActive())
+        tabs = [{"id": "tab", "title": "ChatGPT", "url": "https://chatgpt.com"}]
+        w.set_chatgpt_tabs(tabs)
+        w._track_pointer(outside)
+        self.assertFalse(w._chrome_visible)
+        self.assertTrue(w._auto_hide_timer.isActive())
+        w._hide_for_auto_hide()
+        self.assertTrue(w.isHidden())
+        w.set_chatgpt_tabs([])
+        self.assertFalse(w.isHidden())
+        self.assertTrue(w._chrome_visible)
+        self.assertFalse(w._auto_hide_timer.isActive())
+        w._hide_for_auto_hide()
+        self.assertFalse(w.isHidden())
+        self.assertTrue(w.auto_hide_enabled)
+        w.set_chatgpt_tabs(tabs)
+        self.assertTrue(w._auto_hide_timer.isActive())
+
     def test_screen_tracking_shows_margin_and_hides_everything_except_pet(self):
         w = self.window
+        w.set_chatgpt_tabs([{"id": "tab", "title": "ChatGPT", "url": "https://chatgpt.com"}])
         bounds = w._pointer_hover_bounds()
         inside_margin = QPoint(w.frameGeometry().left() - 1, w.frameGeometry().center().y())
         outside = bounds.topLeft() - QPoint(1, 1)
