@@ -20,10 +20,8 @@ through to the underlying app. In auto-hide mode it reappears for dictation,
 incoming replies, and Read Aloud, then hides five seconds after playback ends.
 If dictation produces text, the overlay stays visible so that text can be
 reviewed or sent; enabling auto-hide does not hide unsent text or interrupt
-dictation, response generation, playback, or an expanded subtitle. Enable
-**Auto Send** to send successful dictation
-immediately, using the selected screenshot when one is selected and sending
-without one when **No screenshot** is selected. Voice recognition must produce
+dictation, response generation, playback, or an expanded subtitle. Text recorded with the UI microphone stays in the input until you explicitly
+send it. Recording hotkeys automatically send successful dictation. Voice recognition must produce
 at least two non-whitespace characters before it can be sent. A one-character
 result remains in the editor for correction; manually typed one-character
 messages are still allowed.
@@ -63,7 +61,7 @@ BitBlt/PrintWindow approach with full-content rendering enabled.
 When a screenshot source is selected, the **With Screenshot** action remains
 available even with an empty prompt. If the editor also contains text, a
 paper-plane **No Screenshot** action appears so the prompt can be sent without
-changing the selector. For dictated prompts using **Auto Send**, Live GPT
+changing the selector. For dictated prompts, Live GPT
 captures and pastes the selected screenshot into ChatGPT after the microphone
 has remained pressed for 0.5 seconds. A cancelled short press uploads nothing.
 Starting another recording before the pending prompt is sent removes the
@@ -163,14 +161,16 @@ Qwen model and speaker. Offline and streaming STT models are labeled explicitly.
 Streaming recording models decode microphone chunks continuously and update the
 test transcript in real time. Each test reports its inference or generation latency.
 Hotkey defaults are
-**Caps Lock** (record and automatically send with the selected screenshot),
-**Shift** (record and automatically send without a screenshot), **Ctrl+S**
-(send with the selected screenshot), and **Ctrl+D** (send without a screenshot).
-Each shortcut has an **Enabled** switch in settings. Only Caps Lock (Record
-and Send with Screenshot) is enabled by default; the other three shortcuts
-are disabled until enabled. Switch settings are saved automatically.
-The enabled recording shortcuts always send successful dictation regardless of the
-Auto Send toggle. Starting either recording shortcut stops active local or
+**Right Alt** (record and send with the selected screenshot) and
+**Right Ctrl** (record and send without a screenshot).
+These are the two global shortcuts, and both are enabled by default.
+Click a shortcut field and press a key or combination to change it;
+left and right Alt, Ctrl, and Shift are recognized separately.
+Use the **×** inside a shortcut field to clear it and disable that action.
+Cleared shortcuts stay empty after restarting; changes are saved automatically.
+Recording shortcuts automatically send successful dictation of at least two
+characters; the UI microphone always requires manual sending. Starting either
+recording shortcut stops active local or
 browser voice playback. The shortcuts work while the
 overlay is hidden or unfocused. Live GPT observes their key state without
 registering or swallowing the keys, so the foreground program continues to
@@ -178,7 +178,7 @@ receive the same keystrokes. Changes are saved for the current Windows user.
 
 Preferences are stored as JSON in `%APPDATA%\Live GPT\config.json`. The file is
 updated automatically when a preference changes and includes the language,
-hotkeys, auto-send and auto-hide states, selected screenshot source, selected
+hotkeys, auto-hide state, selected screenshot source, selected
 ChatGPT conversation, independent recording/playback backends, local STT/TTS
 models, Qwen/CosyVoice download sources, Qwen speaker and playback language,
 CosyVoice reference-audio path and transcript, GPT-SoVITS installation,
@@ -228,9 +228,13 @@ can point the app at a specific CDP HTTP or WebSocket endpoint.
 
 ## Pet
 
-The default pet is `assets/pets/feibi-jiubi`. Set `pet_path` in the user
-configuration to a Codex pet directory or its `pet.json` to choose another pet
-(restart to apply). An empty path uses the bundled default. Both v1 (8×9)
+The default pet is `assets/pets/feibi-jiubi`. Open **Settings → Pet** to choose
+a pet from the folders under `assets/pets`; changes apply immediately.
+Idle animation can always play, stay on a still pose, or play for a duration
+(default 10 seconds) each time the pet returns to idle. Looking and activity
+animations are unaffected. Settings are saved automatically. You can also set
+`pet_path` in the user configuration to an external pet directory or `pet.json`
+(restart after manual configuration edits). An empty path uses the bundled default. Both v1 (8×9)
 and v2 (8×11) sprite sheets with 192×208 cells are supported; an omitted
 `spriteVersionNumber` is treated as v1. Invalid custom pets fall back to the default.
 
@@ -250,3 +254,11 @@ Dragging keeps the overlay inside the usable area of the screen under the
 pointer. Move the pointer onto another monitor to transfer the overlay there.
 If the overlay is larger than that screen's usable area, its top-left corner
 stays on-screen so its controls remain reachable.
+
+Click a response to edit, select, copy, or clear it without losing its text.
+HTTP(S) links open in the default browser. Holding the microphone for at least
+0.5 seconds clears the previous input; shorter taps preserve it.
+
+Hover anywhere over the overlay to expand the input vertically to fit its
+content. Expansion is limited to the screen's usable height, with scrolling
+for longer text. Moving away restores the compact window size.

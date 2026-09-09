@@ -158,6 +158,7 @@ class _ResponseSnapshot:
     has_completion_controls: bool
     text: str
     status: str
+    links: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass
@@ -175,6 +176,7 @@ class _ActiveReading:
 
 
 class BrowserMonitor(QThread):
+    response_links_changed = Signal(object)
     debug_connection_changed = Signal(bool)
     """Own Playwright on a worker thread and publish live ChatGPT tab state."""
 
@@ -355,16 +357,26 @@ class BrowserMonitor(QThread):
         if not self._stop_reading_requested:
             return
         self._stop_reading_requested = False
+        # A reply still being generated must not start reading after the mic press.
+        state.active_response = None
         reading = state.active_reading
         if reading is None:
             return
         try:
             reading.page.evaluate(
                 """
-                () => document.querySelectorAll('audio, video').forEach(media => {
-                    media.pause();
-                    media.currentTime = 0;
-                })
+                () => {
+                    // Read aloud can use an Audio object outside the DOM.
+                    const mediaElements = new Set([
+                        window.__liveGptReadAloudTracker?.media,
+                        ...document.querySelectorAll('audio, video')
+                    ]);
+                    for (const media of mediaElements) {
+                        if (!media) continue;
+                        media.pause();
+                        try { media.currentTime = 0; } catch (_) {}
+                    }
+                }
                 """
             )
         except Exception as error:
@@ -796,6 +808,7 @@ class BrowserMonitor(QThread):
         ):
             response.last_status = snapshot.status
             self.response_changed.emit(snapshot.status, snapshot.text)
+            self.response_links_changed.emit(snapshot.links)
         if text_changed and not self._use_browser_voice and snapshot.text:
             self.local_voice_updated.emit(snapshot.text, False)
         completion_candidate = (
@@ -1295,12 +1308,20 @@ class BrowserMonitor(QThread):
             'button[aria-label="Copy response"], '
             'button[aria-label="More actions"]'
         )
+        anchors = turn.locator("a[href]").evaluate_all(
+            "elements => elements.map(a => [a.innerText, a.href])"
+        )
+        links = tuple(
+            (label, url) for label, url in anchors
+            if label and isinstance(url, str) and url.startswith(("https://", "http://"))
+        ) if isinstance(anchors, list) else ()
         return _ResponseSnapshot(
             has_new_turn=True,
             is_generating=is_generating,
             has_completion_controls=int(completion_controls.count()) > 0,
             text=text,
             status=cls._response_activity_status(turn_text, is_generating),
+            links=links,
         )
 
     @staticmethod

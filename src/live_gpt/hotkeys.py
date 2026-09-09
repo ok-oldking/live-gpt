@@ -6,8 +6,9 @@ import time
 from dataclasses import dataclass
 from typing import Callable
 
-from PySide6.QtCore import QObject, QTimer, Signal, Qt
+from PySide6.QtCore import QObject, QTimer, Signal, Qt, QEvent
 from PySide6.QtGui import QKeySequence
+from PySide6.QtWidgets import QLineEdit, QToolButton
 
 
 VK_BACK = 0x08
@@ -37,6 +38,107 @@ VK_SHIFT = 0x10
 VK_CONTROL = 0x11
 VK_MENU = 0x12
 VK_F1 = 0x70
+SIDED_MODIFIERS = {
+    "Left Shift": 0xA0, "Right Shift": 0xA1,
+    "Left Ctrl": 0xA2, "Right Ctrl": 0xA3,
+    "Left Alt": 0xA4, "Right Alt": 0xA5,
+}
+
+
+def shortcut_text(sequence: QKeySequence | str) -> str:
+    return sequence if isinstance(sequence, str) else sequence.toString(
+        QKeySequence.SequenceFormat.PortableText
+    )
+
+
+class HotkeyEdit(QLineEdit):
+    """Capture native modifier sides, which QKeySequence cannot represent."""
+
+    keySequenceChanged = Signal(str)
+
+    def __init__(self, sequence: QKeySequence | str) -> None:
+        super().__init__(shortcut_text(sequence))
+        self.setReadOnly(True)
+        self.setObjectName("hotkeyEdit")
+        self._held_modifiers: dict[int, str] = {}
+        self.setPlaceholderText("Press a shortcut")
+        self.clear_button = QToolButton(self)
+        self.clear_button.setText("×")
+        self.clear_button.setAccessibleName("Clear shortcut")
+        self.clear_button.setToolTip("Clear shortcut")
+        self.clear_button.setCursor(Qt.CursorShape.ArrowCursor)
+        self.clear_button.setStyleSheet(
+            "QToolButton { border: none; background: transparent; color: #cbd5e1; font-size: 20px; }"
+            "QToolButton:hover { color: white; }"
+        )
+        self.clear_button.clicked.connect(self._clear_shortcut)
+        self.textChanged.connect(lambda text: self.clear_button.setVisible(bool(text)))
+        self.clear_button.setVisible(bool(self.text()))
+        self.setTextMargins(0, 0, 30, 0)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.clear_button.setGeometry(self.width() - 30, 0, 28, self.height())
+
+    def _clear_shortcut(self) -> None:
+        self._held_modifiers.clear()
+        self.setKeySequence("")
+        self.setFocus()
+
+    def keySequence(self) -> str:
+        return self.text()
+
+    def setKeySequence(self, sequence: QKeySequence | str) -> None:
+        text = shortcut_text(sequence)
+        self.setText(text)
+        self.keySequenceChanged.emit(text)
+
+    def event(self, event) -> bool:
+        if event.type() == QEvent.Type.ShortcutOverride:
+            event.accept()
+            return True
+        return super().event(event)
+
+    def keyPressEvent(self, event) -> None:
+        if event.isAutoRepeat():
+            return
+        key = event.key()
+        vk = event.nativeVirtualKey()
+        name = next((name for name, value in SIDED_MODIFIERS.items() if value == vk), None)
+        if name is None and key in (Qt.Key.Key_Shift, Qt.Key.Key_Control, Qt.Key.Key_Alt, Qt.Key.Key_AltGr):
+            scan = event.nativeScanCode()
+            # Qt's Windows scan code uses an E0 prefix for extended keys;
+            # some event sources instead expose the extended bit separately.
+            extended = bool(scan & 0xE100 or event.nativeModifiers() & 0x01000000)
+            right = (scan & 0xFF) == 0x36 if key == Qt.Key.Key_Shift else extended
+            if key == Qt.Key.Key_AltGr:
+                right = True
+            modifier = {Qt.Key.Key_Shift: "Shift", Qt.Key.Key_Control: "Ctrl",
+                        Qt.Key.Key_Alt: "Alt", Qt.Key.Key_AltGr: "Alt"}[key]
+            name = ("Right " if right else "Left ") + modifier
+        if name is not None:
+            self._held_modifiers[vk or key] = name
+            # Windows may synthesize Left Ctrl for AltGr.
+            if name == "Right Alt":
+                self._held_modifiers = {k: v for k, v in self._held_modifiers.items() if v != "Left Ctrl"}
+            text = "+".join(self._held_modifiers.values())
+        else:
+            text = "+".join([*self._held_modifiers.values(), QKeySequence(key).toString()])
+        try:
+            binding = HotkeyBinding.from_sequence(text)
+        except ValueError:
+            return
+        self.setKeySequence(binding.text)
+        event.accept()
+
+    def keyReleaseEvent(self, event) -> None:
+        if not event.isAutoRepeat():
+            self._held_modifiers.pop(event.nativeVirtualKey() or event.key(), None)
+        event.accept()
+
+    def focusOutEvent(self, event) -> None:
+        self._held_modifiers.clear()
+        super().focusOutEvent(event)
 
 
 _QT_SPECIAL_KEYS = {
@@ -83,9 +185,22 @@ class HotkeyBinding:
     shift: bool = False
     alt: bool = False
     meta: bool = False
+    sided_modifiers: tuple[int, ...] = ()
 
     @classmethod
     def from_sequence(cls, sequence: QKeySequence | str) -> HotkeyBinding:
+        text = shortcut_text(sequence)
+        if not text.strip():
+            return cls(text="", virtual_key=0)
+        parts = text.split("+")
+        sided = tuple(SIDED_MODIFIERS[part] for part in parts if part in SIDED_MODIFIERS)
+        if sided:
+            remaining = [part for part in parts if part not in SIDED_MODIFIERS]
+            if not remaining:
+                return cls(text=text, virtual_key=sided[-1], sided_modifiers=sided[:-1])
+            base = cls.from_sequence("+".join(remaining))
+            return cls(text=text, virtual_key=base.virtual_key, control=base.control,
+                       shift=base.shift, alt=base.alt, meta=base.meta, sided_modifiers=sided)
         if isinstance(sequence, str):
             sequence = QKeySequence(sequence)
         if sequence.isEmpty() or sequence.count() != 1:
@@ -106,20 +221,27 @@ class HotkeyBinding:
         )
 
     def is_pressed(self, key_state: Callable[[int], int]) -> bool:
+        if not self.text:
+            return False
         is_down = lambda key: bool(key_state(key) & 0x8000)
         meta_down = is_down(VK_LWIN) or is_down(VK_RWIN)
+        required = (self.virtual_key, *self.sided_modifiers)
+        # AltGr reports a synthetic Ctrl state on Windows.
+        altgr = 0xA5 in required and is_down(0xA5)
         return (
             is_down(self.virtual_key)
+            and all(is_down(key) for key in self.sided_modifiers)
             and (
-                self.virtual_key == VK_CONTROL
+                any(key in (VK_CONTROL, 0xA2, 0xA3) for key in required)
+                or altgr
                 or is_down(VK_CONTROL) == self.control
             )
             and (
-                self.virtual_key == VK_SHIFT
+                any(key in (VK_SHIFT, 0xA0, 0xA1) for key in required)
                 or is_down(VK_SHIFT) == self.shift
             )
             and (
-                self.virtual_key == VK_MENU
+                any(key in (VK_MENU, 0xA4, 0xA5) for key in required)
                 or is_down(VK_MENU) == self.alt
             )
             and meta_down == self.meta
@@ -150,8 +272,8 @@ class GlobalHotkeyMonitor(QObject):
     def __init__(
         self,
         hold: HotkeyBinding,
-        send: HotkeyBinding,
-        send_without_screenshot: HotkeyBinding,
+        send: HotkeyBinding | None = None,
+        send_without_screenshot: HotkeyBinding | None = None,
         parent: QObject | None = None,
         *,
         hold_without_screenshot: HotkeyBinding | None = None,
@@ -193,8 +315,8 @@ class GlobalHotkeyMonitor(QObject):
     def update_bindings(
         self,
         hold: HotkeyBinding,
-        send: HotkeyBinding,
-        send_without_screenshot: HotkeyBinding,
+        send: HotkeyBinding | None = None,
+        send_without_screenshot: HotkeyBinding | None = None,
         *,
         hold_without_screenshot: HotkeyBinding | None = None,
         enabled: dict[str, bool] | None = None,
@@ -204,7 +326,7 @@ class GlobalHotkeyMonitor(QObject):
             "hold": hold,
             "hold_without_screenshot": (
                 hold_without_screenshot
-                or HotkeyBinding.from_sequence("Shift")
+                or HotkeyBinding.from_sequence("Right Ctrl")
             ),
             "send": send,
             "send_without_screenshot": send_without_screenshot,
@@ -246,7 +368,7 @@ class GlobalHotkeyMonitor(QObject):
         current = {
             name: (
                 (self._enabled is None or self._enabled.get(name, False))
-                and binding.is_pressed(self._key_state)
+                and binding is not None and binding.is_pressed(self._key_state)
             )
             for name, binding in self._bindings.items()
         }

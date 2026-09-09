@@ -18,6 +18,7 @@ from PySide6.QtCore import (
     QSize,
     QThread,
     QTimer,
+    QUrl,
     Signal,
     Qt,
 )
@@ -26,6 +27,7 @@ from PySide6.QtGui import (
     QCloseEvent,
     QColor,
     QCursor,
+    QDesktopServices,
     QIcon,
     QKeySequence,
     QMouseEvent,
@@ -46,6 +48,8 @@ from PySide6.QtWidgets import (
     QKeySequenceEdit,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -55,6 +59,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QStackedWidget,
+    QSpinBox,
     QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
@@ -66,9 +71,9 @@ from .browser import (
     open_remote_debugging_settings,
 )
 from .config import Config, DEFAULT_CONFIG
-from .pet import PetWidget
+from .pet import PetWidget, available_pets, default_pet_path
 from .logger import Logger, config_logger, shutdown_logger
-from .hotkeys import GlobalHotkeyMonitor, HotkeyBinding
+from .hotkeys import GlobalHotkeyMonitor, HotkeyBinding, HotkeyEdit, shortcut_text
 from .screen_capture import CaptureSource, capture_webp, list_capture_sources
 from .window_focus import ForegroundWindowRestorer
 from .voice.base import ModelProvider, TextToSpeechProvider
@@ -100,27 +105,36 @@ SHORTCUTS_ICON_PATH = ASSET_DIRECTORY / "shortcuts.svg"
 LANGUAGE_ICON_PATH = ASSET_DIRECTORY / "language.svg"
 LOCK_ICON_PATH = ASSET_DIRECTORY / "lock.svg"
 UNLOCK_ICON_PATH = ASSET_DIRECTORY / "unlock.svg"
+PET_ICON_PATH = ASSET_DIRECTORY / "pet.svg"
+COMBOBOX_STYLE = """
+QComboBox, QComboBox#voiceCombo, QComboBox#languageCombo,
+QComboBox#chatgptTabCombo, QComboBox#captureSourceCombo { padding-right: 32px; }
+QComboBox::drop-down {
+    subcontrol-origin: border;
+    subcontrol-position: top right;
+    width: 28px;
+    border: none;
+    background: transparent;
+}
+QComboBox::down-arrow {
+    image: url("%s");
+    width: 16px;
+    height: 16px;
+}
+""" % (ASSET_DIRECTORY / "chevron-down.svg").as_posix()
 logger = Logger.get_logger(__name__)
 
 DEFAULT_HOLD_MIC_HOTKEY = str(DEFAULT_CONFIG["hotkey_hold"])
 DEFAULT_HOLD_WITHOUT_SCREENSHOT_HOTKEY = str(
     DEFAULT_CONFIG["hotkey_hold_without_screenshot"]
 )
-DEFAULT_SEND_HOTKEY = str(DEFAULT_CONFIG["hotkey_send"])
-DEFAULT_SEND_WITHOUT_SCREENSHOT_HOTKEY = str(
-    DEFAULT_CONFIG["hotkey_send_without_screenshot"]
-)
 MIN_VOICE_SEND_CHARACTERS = 2
 HOTKEY_CONFIG_KEYS = {
     "hold": "hotkey_hold",
     "hold_without_screenshot": "hotkey_hold_without_screenshot",
-    "send": "hotkey_send",
-    "send_without_screenshot": "hotkey_send_without_screenshot",
 }
 LEGACY_HOTKEY_SETTING_KEYS = {
     "hold": "hotkeys/hold_microphone",
-    "send": "hotkeys/send",
-    "send_without_screenshot": "hotkeys/send_without_screenshot",
 }
 
 
@@ -755,15 +769,16 @@ class _QueuedLocalSpeechThread(QThread):
 
 class HotkeyConfigDialog(QDialog):
     """Edit Live GPT settings, including pass-through global shortcuts."""
+    pet_settings_changed = Signal(str, str, int)
 
     def __init__(
         self,
-        hold_microphone: QKeySequence,
-        send: QKeySequence,
-        send_without_screenshot: QKeySequence,
+        hold_microphone: QKeySequence | str,
+        send: QKeySequence | None = None,
+        send_without_screenshot: QKeySequence | None = None,
         parent: QWidget | None = None,
         *,
-        hold_without_screenshot: QKeySequence | None = None,
+        hold_without_screenshot: QKeySequence | str | None = None,
         language: str = "en",
         recording_backend: str = "web",
         playing_backend: str = "web",
@@ -816,11 +831,7 @@ class HotkeyConfigDialog(QDialog):
 
         self.hold_microphone_edit = self._sequence_edit(hold_microphone)
         self.hold_without_screenshot_edit = self._sequence_edit(
-            hold_without_screenshot or QKeySequence("Shift")
-        )
-        self.send_edit = self._sequence_edit(send)
-        self.send_without_screenshot_edit = self._sequence_edit(
-            send_without_screenshot
+            hold_without_screenshot if hold_without_screenshot is not None else "Right Ctrl"
         )
 
         self.settings_shell = QFrame()
@@ -896,11 +907,14 @@ class HotkeyConfigDialog(QDialog):
         self.navigation_group.addButton(self.language_nav_button, 1)
         self.navigation_group.addButton(self.recording_nav_button, 2)
         self.navigation_group.addButton(self.playing_nav_button, 3)
+        self.pet_nav_button = self._navigation_button("Pet", PET_ICON_PATH)
+        self.navigation_group.addButton(self.pet_nav_button, 4)
         self.shortcuts_nav_button.setChecked(True)
         navigation_layout.addWidget(self.shortcuts_nav_button)
         navigation_layout.addWidget(self.language_nav_button)
         navigation_layout.addWidget(self.recording_nav_button)
         navigation_layout.addWidget(self.playing_nav_button)
+        navigation_layout.addWidget(self.pet_nav_button)
         navigation_layout.addStretch()
         body_layout.addWidget(navigation)
 
@@ -941,29 +955,12 @@ class HotkeyConfigDialog(QDialog):
         form.setContentsMargins(0, 4, 0, 0)
         form.setHorizontalSpacing(22)
         form.setVerticalSpacing(12)
-        self.hotkey_enabled_switches: dict[str, QCheckBox] = {}
         for name, label, editor in (
             ("hold", "Record and Send with Screenshot", self.hold_microphone_edit),
             ("hold_without_screenshot", "Record and Send without Screenshot",
              self.hold_without_screenshot_edit),
-            ("send", "Send with screenshot", self.send_edit),
-            ("send_without_screenshot", "Send without screenshot",
-             self.send_without_screenshot_edit),
         ):
-            key = HOTKEY_CONFIG_KEYS[name] + "_enabled"
-            switch = QCheckBox("Enabled")
-            switch.setAccessibleName(f"Enable {label}")
-            switch.setChecked(bool((self.config if self.config is not None else DEFAULT_CONFIG)[key]))
-            editor.setEnabled(switch.isChecked())
-            switch.toggled.connect(editor.setEnabled)
-            switch.toggled.connect(
-                lambda enabled, key=key: self._save_setting(key, enabled)
-            )
-            self.hotkey_enabled_switches[name] = switch
-            row = QHBoxLayout()
-            row.addWidget(editor)
-            row.addWidget(switch)
-            form.addRow(label, row)
+            form.addRow(label, editor)
         hotkey_card_layout.addLayout(form)
 
         note = QLabel(
@@ -1499,6 +1496,10 @@ class HotkeyConfigDialog(QDialog):
         self.settings_pages.addWidget(self.language_section)
         self.settings_pages.addWidget(self.recording_scroll)
         self.settings_pages.addWidget(self.playing_scroll)
+        self._build_pet_page()
+        self.pet_nav_button.clicked.connect(
+            lambda checked: checked and self.settings_pages.setCurrentIndex(4)
+        )
         self.shortcuts_nav_button.clicked.connect(
             lambda checked: checked and self.settings_pages.setCurrentIndex(0)
         )
@@ -1716,6 +1717,7 @@ class HotkeyConfigDialog(QDialog):
                 background: transparent;
                 border: none;
             }
+            QLineEdit#hotkeyEdit,
             QKeySequenceEdit QLineEdit,
             QComboBox#languageCombo,
             QComboBox#voiceCombo,
@@ -1729,6 +1731,7 @@ class HotkeyConfigDialog(QDialog):
                 border-radius: 8px;
                 selection-background-color: rgba(76, 201, 240, 130);
             }
+            QLineEdit#hotkeyEdit:focus,
             QKeySequenceEdit QLineEdit:focus {
                 border-color: rgba(76, 201, 240, 190);
             }
@@ -1813,6 +1816,8 @@ class HotkeyConfigDialog(QDialog):
             }
             """
         )
+
+        self.setStyleSheet(self.styleSheet() + COMBOBOX_STYLE)
 
     def _show_recording_page(self, checked: bool) -> None:
         if checked:
@@ -1977,12 +1982,125 @@ class HotkeyConfigDialog(QDialog):
         for editor in (
             self.hold_microphone_edit,
             self.hold_without_screenshot_edit,
-            self.send_edit,
-            self.send_without_screenshot_edit,
         ):
             editor.keySequenceChanged.connect(
                 lambda _sequence: self._save_hotkeys()
             )
+
+    def _build_pet_page(self) -> None:
+        page = QWidget()
+        page.setObjectName("settingsPage")
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        title = QLabel("Pet")
+        title.setObjectName("settingsPageTitle")
+        layout.addWidget(title)
+        description = QLabel("Choose a pet from assets/pets. Changes are saved and applied immediately.")
+        description.setObjectName("settingsPageDescription")
+        description.setWordWrap(True)
+        layout.addWidget(description)
+        pet_card = QFrame()
+        pet_card.setObjectName("settingsCard")
+        pet_layout = QVBoxLayout(pet_card)
+        pet_layout.setContentsMargins(18, 18, 18, 18)
+        pet_title = QLabel("Choose a pet")
+        pet_title.setObjectName("settingsCardTitle")
+        pet_layout.addWidget(pet_title)
+        self.pet_list = QListWidget()
+        self.pet_list.setAccessibleName("Available pets")
+        self.pet_list.setIconSize(QSize(48, 52))
+        self.pet_list.setSpacing(4)
+        self.pet_list.setStyleSheet("""
+            QListWidget { background: transparent; color: #f5f7ff; selection-color: #f5f7ff; border: none; outline: none; }
+            QListWidget::item { padding: 8px 12px; border: 1px solid transparent; border-radius: 8px; }
+            QListWidget::item:hover { background: #202d4b; }
+            QListWidget::item:selected,
+            QListWidget::item:selected:!active { color: #f5f7ff; background: #20445b; border-color: #4cc9f0; }
+        """)
+        values = self.config if self.config is not None else DEFAULT_CONFIG
+        selected_path = Path(str(values["pet_path"] or default_pet_path())).resolve()
+        if selected_path.name == "pet.json":
+            selected_path = selected_path.parent
+        pets = available_pets()
+        if not any(Path(path).resolve() == selected_path for _, path in pets):
+            pets.append((selected_path.name, str(selected_path)))
+        for label, path in pets:
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, path)
+            item.setToolTip(path)
+            item.setSizeHint(QSize(200, 70))
+            try:
+                probe = PetWidget(path)
+                item.setIcon(QIcon(probe.sheet.copy(0, 0, 192, 208)))
+                probe.deleteLater()
+            except (OSError, ValueError, TypeError, KeyError):
+                item.setIcon(QIcon(str(PET_ICON_PATH)))
+            self.pet_list.addItem(item)
+            if Path(path).resolve() == selected_path:
+                self.pet_list.setCurrentItem(item)
+        # Fit the visible rows rather than expanding into unused card space.
+        # Longer collections remain scrollable.
+        self.pet_list.setFixedHeight(min(260, max(78, self.pet_list.count() * 78)))
+        pet_layout.addWidget(self.pet_list)
+        layout.addWidget(pet_card)
+        layout.addSpacing(18)
+        card = QFrame()
+        card.setObjectName("settingsCard")
+        self.pet_idle_form = form = QFormLayout(card)
+        form.setContentsMargins(18, 18, 18, 18)
+        form.setSpacing(16)
+        idle_title = QLabel("Idle animation")
+        idle_title.setObjectName("settingsCardTitle")
+        form.addRow(idle_title)
+        self.pet_idle_combo = QComboBox()
+        self.pet_idle_combo.setObjectName("voiceCombo")
+        for label, mode in (("Always play idle animation", "always"),
+                            ("Do not play idle animation", "never"),
+                            ("Play idle animation for a duration", "timed")):
+            self.pet_idle_combo.addItem(label, mode)
+        self.pet_idle_combo.setCurrentIndex(self.pet_idle_combo.findData(values["pet_idle_mode"]))
+        form.addRow("Playback", self.pet_idle_combo)
+        self.pet_idle_seconds = QSpinBox()
+        self.pet_idle_seconds.setRange(1, 3600)
+        self.pet_idle_seconds.setSuffix(" seconds")
+        self.pet_idle_seconds.setValue(int(values["pet_idle_seconds"]))
+        self.pet_idle_seconds.setEnabled(self.pet_idle_combo.currentData() == "timed")
+        self.pet_idle_seconds.setStyleSheet("QSpinBox { color: #f5f7ff; background: #18213b; padding: 8px; border: 1px solid #536080; border-radius: 6px; }")
+        form.addRow("Duration", self.pet_idle_seconds)
+        form.setRowVisible(self.pet_idle_seconds, self.pet_idle_combo.currentData() == "timed")
+        layout.addWidget(card)
+        self.pet_settings_note = QLabel(
+            "Idle stops on a still pose. The timer restarts when the pet returns to idle. "
+            "Looking and activity animations continue to work."
+        )
+        self.pet_settings_note.setObjectName("settingsPageDescription")
+        self.pet_settings_note.setWordWrap(True)
+        layout.addWidget(self.pet_settings_note)
+        layout.addStretch()
+        self.settings_pages.addWidget(page)
+        self.pet_list.currentRowChanged.connect(self._save_pet_settings)
+        self.pet_idle_combo.currentIndexChanged.connect(self._save_pet_settings)
+        self.pet_idle_seconds.valueChanged.connect(self._save_pet_settings)
+
+    def _save_pet_settings(self) -> None:
+        item = self.pet_list.currentItem()
+        if item is None:
+            return
+        path = str(item.data(Qt.ItemDataRole.UserRole))
+        mode = str(self.pet_idle_combo.currentData())
+        seconds = self.pet_idle_seconds.value()
+        self.pet_idle_seconds.setEnabled(mode == "timed")
+        self.pet_idle_form.setRowVisible(self.pet_idle_seconds, mode == "timed")
+        try:
+            probe = PetWidget(path)
+            probe.deleteLater()
+        except (OSError, ValueError, TypeError, KeyError) as error:
+            self.pet_settings_note.setText(f"Could not load this pet: {error}")
+            return
+        self.pet_settings_note.setText("Saved. Idle stops on a still pose; looking and activity animations remain enabled.")
+        if self.config is not None:
+            self.config.update({"pet_path": path, "pet_idle_mode": mode, "pet_idle_seconds": seconds})
+        self.pet_settings_changed.emit(path, mode, seconds)
 
     def _save_setting(self, key: str, value: object) -> None:
         if self.config is not None:
@@ -1996,13 +2114,9 @@ class HotkeyConfigDialog(QDialog):
         except ValueError:
             return
         updates = {
-            HOTKEY_CONFIG_KEYS[name]: sequence.toString(
-                QKeySequence.SequenceFormat.PortableText
-            )
+            HOTKEY_CONFIG_KEYS[name]: shortcut_text(sequence)
             for name, sequence in self.sequences().items()
         }
-        if not all(updates.values()):
-            return
         self.config.update(updates)
 
     @staticmethod
@@ -2515,20 +2629,14 @@ class HotkeyConfigDialog(QDialog):
         return super().eventFilter(watched, event)
 
     @staticmethod
-    def _sequence_edit(sequence: QKeySequence) -> QKeySequenceEdit:
-        edit = QKeySequenceEdit(sequence)
-        edit.setMaximumSequenceLength(1)
-        return edit
+    def _sequence_edit(sequence: QKeySequence | str) -> HotkeyEdit:
+        return HotkeyEdit(sequence)
 
-    def sequences(self) -> dict[str, QKeySequence]:
+    def sequences(self) -> dict[str, str]:
         return {
             "hold": self.hold_microphone_edit.keySequence(),
             "hold_without_screenshot": (
                 self.hold_without_screenshot_edit.keySequence()
-            ),
-            "send": self.send_edit.keySequence(),
-            "send_without_screenshot": (
-                self.send_without_screenshot_edit.keySequence()
             ),
         }
 
@@ -2605,7 +2713,7 @@ class HotkeyConfigDialog(QDialog):
             name: HotkeyBinding.from_sequence(sequence)
             for name, sequence in self.sequences().items()
         }
-        texts = [binding.text.casefold() for binding in bindings.values()]
+        texts = [binding.text.casefold() for binding in bindings.values() if binding.text]
         if len(set(texts)) != len(texts):
             raise ValueError("Each action must use a different hotkey")
         return bindings
@@ -2636,7 +2744,37 @@ class HotkeyConfigDialog(QDialog):
         super().reject()
 
 
-class TranscriptEditor(QPlainTextEdit):
+class LinkTextEdit(QPlainTextEdit):
+    """Selectable plain text with clickable HTTP(S) and Markdown links."""
+
+    def _link_at(self, position: QPoint) -> str | None:
+        offset = self.cursorForPosition(position).position()
+        text = self.toPlainText()
+        for match in re.finditer(r"\[([^\]]+)\]\((https?://[^\s)]+)\)|https?://[^\s<>]+", text):
+            if match.start() <= offset < match.end():
+                return (match.group(2) or match.group()).rstrip(".,;:!?)\"'")
+        for label, url in getattr(self, "response_links", ()):
+            for match in re.finditer(re.escape(label), text):
+                if match.start() <= offset < match.end():
+                    return url
+        return None
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        self._link_press = event.position().toPoint()
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        super().mouseReleaseEvent(event)
+        position = event.position().toPoint()
+        if (event.button() == Qt.MouseButton.LeftButton
+                and (position - getattr(self, "_link_press", position)).manhattanLength() < 4
+                and not self.textCursor().hasSelection()):
+            link = self._link_at(position)
+            if link:
+                QDesktopServices.openUrl(QUrl(link))
+
+
+class TranscriptEditor(LinkTextEdit):
     """Editable transcript with contextual actions inside the input."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -2681,33 +2819,12 @@ class TranscriptEditor(QPlainTextEdit):
             "Send the text without the selected screenshot"
         )
 
-        self.auto_send_button = QPushButton("Auto Send", self)
-        self.auto_send_button.setObjectName("autoSendButton")
-        self.auto_send_button.setCheckable(True)
-        self.auto_send_button.setFixedSize(104, 32)
-        self.auto_send_button.setAccessibleName(
-            "Automatically send dictated text"
-        )
-        self.auto_send_button.setToolTip(
-            "Automatically send dictated text using the selected "
-            "screenshot option"
-        )
-        self.auto_send_button.toggled.connect(
-            self._sync_auto_send_icon
-        )
-        self._sync_auto_send_icon(False)
-
         self.textChanged.connect(self._sync_action_visibility)
         self._sync_action_visibility()
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
         self._position_action_buttons()
-
-    def _sync_auto_send_icon(self, enabled: bool) -> None:
-        icon = QIcon(str(CHECK_ICON_PATH)) if enabled else QIcon()
-        self.auto_send_button.setIcon(icon)
-        self.auto_send_button.setIconSize(QSize(16, 16))
 
     def _position_action_buttons(self) -> None:
         margin = 8
@@ -2717,7 +2834,6 @@ class TranscriptEditor(QPlainTextEdit):
         for button in (
             self.send_button,
             self.send_without_screenshot_button,
-            self.auto_send_button,
             self.clear_button,
         ):
             if button.isHidden():
@@ -2729,10 +2845,7 @@ class TranscriptEditor(QPlainTextEdit):
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
         if self._response_mode:
-            if not self._response_complete:
-                event.accept()
-                return
-            self.begin_composing()
+            self.begin_composing(preserve_text=True)
         super().mousePressEvent(event)
 
     def keyPressEvent(self, event) -> None:  # noqa: N802
@@ -2758,11 +2871,8 @@ class TranscriptEditor(QPlainTextEdit):
     def is_response_complete(self) -> bool:
         return self._response_complete
 
-    @property
-    def auto_send_enabled(self) -> bool:
-        return self.auto_send_button.isChecked()
-
     def begin_response(self) -> None:
+        self.response_links = ()
         self._response_mode = True
         self._response_complete = False
         self._full_response_text = ""
@@ -2794,12 +2904,15 @@ class TranscriptEditor(QPlainTextEdit):
         self.setPlainText(self._full_response_text)
         self._response_complete = True
 
-    def begin_composing(self) -> None:
+    def begin_composing(self, *, preserve_text: bool = False) -> None:
+        text = self.toPlainText() if preserve_text else ""
+        if not preserve_text:
+            self.response_links = ()
         self._response_mode = False
         self._response_complete = False
         self._full_response_text = ""
         self.setReadOnly(False)
-        self.clear()
+        self.setPlainText(text)
         self._sync_action_visibility()
 
     def set_screenshot_selected(self, selected: bool) -> None:
@@ -2843,12 +2956,10 @@ class TranscriptEditor(QPlainTextEdit):
         self.send_without_screenshot_button.setVisible(
             has_text and self._screenshot_selected
         )
-        self.auto_send_button.setVisible(not self._response_mode)
         visible_buttons = [
             button
             for button in (
                 self.clear_button,
-                self.auto_send_button,
                 self.send_without_screenshot_button,
                 self.send_button,
             )
@@ -2882,6 +2993,9 @@ class OverlayWindow(QMainWindow):
         self._pet_playing = False
         self._pet_listening = False
         self._pet_error = False
+        self._input_collapsed_geometry: QRect | None = None
+        self._fitting_hover_input = False
+        self._fitting_subtitle = False
         self._position_locked = False
         self._resize_edges = Qt.Edges()
         self._resize_start_global: QPoint | None = None
@@ -2910,6 +3024,10 @@ class OverlayWindow(QMainWindow):
         self._auto_hide_timer = QTimer(self)
         self._auto_hide_timer.setSingleShot(True)
         self._auto_hide_timer.timeout.connect(self._hide_for_auto_hide)
+        self._playback_input_timer = QTimer(self)
+        self._playback_input_timer.setSingleShot(True)
+        self._playback_input_timer.setInterval(5_000)
+        self._playback_input_timer.timeout.connect(self._finish_playback_input_delay)
         self._subtitle_outside_timer = QTimer(self)
         self._subtitle_outside_timer.setInterval(75)
         self._subtitle_outside_timer.timeout.connect(
@@ -3049,7 +3167,7 @@ class OverlayWindow(QMainWindow):
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
         )
         self.subtitle_line_two.setWordWrap(False)
-        self.subtitle_full_text = QPlainTextEdit()
+        self.subtitle_full_text = LinkTextEdit()
         self.subtitle_full_text.setObjectName("subtitleFullText")
         self.subtitle_full_text.setReadOnly(True)
         self.subtitle_full_text.setMouseTracking(True)
@@ -3118,7 +3236,6 @@ class OverlayWindow(QMainWindow):
         self.send_without_screenshot_button.clicked.connect(
             self._request_send_without_screenshot
         )
-        self.auto_send_button = self.transcript_area.auto_send_button
 
         self.clear_button = self.transcript_area.clear_button
         self.clear_button.clicked.connect(self._request_clear)
@@ -3263,7 +3380,6 @@ class OverlayWindow(QMainWindow):
             }
             QPushButton#sendButton,
             QPushButton#clearButton,
-            QPushButton#autoSendButton,
             QPushButton#sendWithoutScreenshotButton {
                 min-width: 32px;
                 min-height: 32px;
@@ -3299,14 +3415,6 @@ class OverlayWindow(QMainWindow):
             QPushButton#sendWithoutScreenshotButton:hover {
                 background-color: rgba(48, 145, 185, 220);
             }
-            QPushButton#autoSendButton {
-                min-width: 104px;
-                max-width: 104px;
-            }
-            QPushButton#autoSendButton:checked {
-                background-color: rgba(35, 155, 116, 190);
-                border-color: rgba(130, 255, 195, 190);
-            }
             QPushButton#clearButton:hover {
                 background-color: rgba(210, 116, 34, 190);
             }
@@ -3334,6 +3442,7 @@ class OverlayWindow(QMainWindow):
             }
             """
         )
+        self.setStyleSheet(self.styleSheet() + COMBOBOX_STYLE)
         self._set_chrome_visible(False)
 
     @staticmethod
@@ -3368,6 +3477,7 @@ class OverlayWindow(QMainWindow):
         style.unpolish(self.microphone_button)
         style.polish(self.microphone_button)
         self.microphone_button.update()
+        self._track_pointer(QCursor.pos())
 
     def set_status(self, message: str, *, error: bool = False) -> None:
         self.transcript_area.set_hint(message, error=error)
@@ -3382,6 +3492,7 @@ class OverlayWindow(QMainWindow):
             "running" if self._pet_response_pending else "idle"
         )
         self.pet.set_state(state)
+        self._track_pointer(QCursor.pos())
 
     def set_transcript(self, text: str) -> None:
         self.transcript_area.setPlainText(text)
@@ -3480,6 +3591,10 @@ class OverlayWindow(QMainWindow):
         if not self.chatgpt_tab_combo.isEnabled():
             self.chatgpt_tab_combo.setItemText(0, status)
 
+    def set_response_links(self, links: object) -> None:
+        self.transcript_area.response_links = links
+        self.subtitle_full_text.response_links = links
+
     def set_capture_sources(self, sources: list[CaptureSource]) -> None:
         selected = self.capture_source_combo.currentData()
         selected_key = (
@@ -3539,6 +3654,8 @@ class OverlayWindow(QMainWindow):
         sent_text: str = "",
         message: str = "Sending to ChatGPT…",
     ) -> None:
+        self._collapse_hover_input()
+        self._playback_input_timer.stop()
         self._pet_response_pending = True
         self._pet_playing = False
         self._pet_listening = False
@@ -3602,6 +3719,7 @@ class OverlayWindow(QMainWindow):
         self.schedule_auto_hide(5_000)
 
     def begin_reading(self, message: str) -> None:
+        self._playback_input_timer.stop()
         self._pet_playing = True
         self._pet_error = False
         self._refresh_pet()
@@ -3736,7 +3854,10 @@ class OverlayWindow(QMainWindow):
 
     def finish_reading(self, success: bool, message: str) -> None:
         self._pet_playing = False
+        self._pet_response_pending = False
         self._pet_error = not success
+        if not self._subtitle_dismissed:
+            self._playback_input_timer.start()
         self._refresh_pet()
         if self._subtitle_dismissed:
             return
@@ -3745,6 +3866,10 @@ class OverlayWindow(QMainWindow):
         self.microphone_button.setVisible(True)
         self.set_status(message, error=not success)
         self.schedule_auto_hide(5_000)
+
+    def _finish_playback_input_delay(self) -> None:
+        self._playback_input_timer.stop()
+        self._track_pointer(QCursor.pos())
 
     def _set_subtitle_status(self, message: str) -> None:
         self._subtitle_status_text = message
@@ -3778,7 +3903,8 @@ class OverlayWindow(QMainWindow):
         self._fit_expanded_subtitle_height()
 
     def _expand_subtitle(self) -> None:
-        if not self._subtitle_mode_active or self._subtitle_expanded:
+        if (not self._subtitle_mode_active or self._subtitle_expanded
+                or self.pet._drag_offset is not None):
             return
         self._subtitle_expanded = True
         self._subtitle_outside_timer.start()
@@ -3795,6 +3921,7 @@ class OverlayWindow(QMainWindow):
         if (
             not self._subtitle_expanded
             or self._subtitle_collapsed_geometry is None
+            or self.pet._drag_offset is not None
         ):
             return
         available = self.screen().availableGeometry()
@@ -3809,7 +3936,7 @@ class OverlayWindow(QMainWindow):
         ).height()
         panel_height = max(text_height, metrics.lineSpacing()) + 32
         fixed_chrome_height = max(
-            collapsed.height() - self.subtitle_panel.height(),
+            self.height() - self.subtitle_panel.height(),
             0,
         )
         target_height = min(
@@ -3824,7 +3951,11 @@ class OverlayWindow(QMainWindow):
             max(available.top(), collapsed.bottom() - target_height + 1)
         )
         geometry.setHeight(target_height)
-        self.setGeometry(geometry)
+        self._fitting_subtitle = True
+        try:
+            self.setGeometry(geometry)
+        finally:
+            self._fitting_subtitle = False
 
     def _collapse_subtitle(self) -> None:
         self._subtitle_outside_timer.stop()
@@ -3835,9 +3966,13 @@ class OverlayWindow(QMainWindow):
         self.subtitle_line_one.show()
         self.subtitle_line_two.show()
         if self._subtitle_collapsed_geometry is not None:
-            self.setGeometry(self._subtitle_collapsed_geometry)
-            if self._position_locked:
-                self.setFixedSize(self._subtitle_collapsed_geometry.size())
+            self._fitting_subtitle = True
+            try:
+                self.setGeometry(self._subtitle_collapsed_geometry)
+                if self._position_locked:
+                    self.setFixedSize(self._subtitle_collapsed_geometry.size())
+            finally:
+                self._fitting_subtitle = False
         self._subtitle_collapsed_geometry = None
         if self._subtitle_reading_started and self._reading_full_text:
             self._render_reading_subtitle(resized=True)
@@ -3845,7 +3980,7 @@ class OverlayWindow(QMainWindow):
             self._set_subtitle_status(self._subtitle_status_text)
 
     def _collapse_subtitle_if_outside(self) -> None:
-        if not self._subtitle_expanded:
+        if not self._subtitle_expanded or self.pet._drag_offset is not None:
             return
         position = self.mapFromGlobal(QCursor.pos())
         if not self.rect().contains(position):
@@ -3862,7 +3997,9 @@ class OverlayWindow(QMainWindow):
         self._subtitle_reading_started = False
         self.subtitle_panel.hide()
         self.dictation_panel.hide()
-        self.transcript_area.begin_composing()
+        response_text = self._reading_full_text or self.transcript_area.toPlainText()
+        self.transcript_area.begin_composing(preserve_text=True)
+        self.transcript_area.setPlainText(response_text)
         self.transcript_area.show()
         self.microphone_button.setVisible(True)
         self.set_status("Hold the microphone or enter a message")
@@ -3870,6 +4007,7 @@ class OverlayWindow(QMainWindow):
         return True
 
     def begin_dictation_waiting(self) -> None:
+        self._playback_input_timer.stop()
         self._pet_listening = True
         self._pet_playing = False
         self._pet_response_pending = False
@@ -3883,11 +4021,23 @@ class OverlayWindow(QMainWindow):
             "Waiting for the browser to start listening…"
         )
         self.dictation_panel.show()
+        self._track_pointer(QCursor.pos())
+
+    def prepare_for_dictation(self) -> None:
+        self._playback_input_timer.stop()
+        self.dismiss_subtitle_mode()
+        self._subtitle_dismissed = True
+        self._reading_full_text = ""
+        self._pet_playing = False
+        self._pet_response_pending = False
+        self.clear_transcript()
 
     def set_dictation_listening(self) -> None:
         self._pet_listening = True
+        self._pet_error = False
         self._refresh_pet()
         self.dictation_state_label.setText("Listening…")
+        self._track_pointer(QCursor.pos())
 
     def set_dictation_partial(
         self,
@@ -3910,6 +4060,7 @@ class OverlayWindow(QMainWindow):
         self._refresh_pet()
         self.dictation_panel.hide()
         self.transcript_area.show()
+        self._track_pointer(QCursor.pos())
 
     def _chatgpt_tab_changed(self, index: int) -> None:
         self._activate_chatgpt_tab(index, save_preference=True)
@@ -3954,7 +4105,7 @@ class OverlayWindow(QMainWindow):
             self.capture_source_selected.emit(source_key)
 
     def clear_transcript(self) -> None:
-        self.transcript_area.clear()
+        self.transcript_area.begin_composing()
         self.set_status("Text cleared")
 
     def _request_clear(self) -> None:
@@ -3996,9 +4147,6 @@ class OverlayWindow(QMainWindow):
             restore_focus=False,
         )
 
-    def request_auto_send(self) -> None:
-        self._request_send(include_screenshot=True, restore_focus=False)
-
     def remember_foreground_app(self) -> None:
         self._focus_restorer.remember_foreground()
 
@@ -4011,10 +4159,6 @@ class OverlayWindow(QMainWindow):
     @property
     def auto_hide_enabled(self) -> bool:
         return self._auto_hide_enabled
-
-    @property
-    def auto_send_enabled(self) -> bool:
-        return self.transcript_area.auto_send_enabled
 
     def disable_auto_hide(self) -> None:
         if self.auto_hide_button.isChecked():
@@ -4092,18 +4236,25 @@ class OverlayWindow(QMainWindow):
             visible or not self._browser_connected
             or bool(self._resize_edges) or self.pet._drag_offset is not None
         )
-        if visible == self._chrome_visible and hasattr(self, "_chrome_initialized"):
+        content_visible = (
+            visible or self._pet_listening or self._pet_response_pending
+            or self._pet_playing or self._playback_input_timer.isActive()
+        )
+        if (visible == self._chrome_visible
+                and content_visible == getattr(self, "_content_visible", None)
+                and hasattr(self, "_chrome_initialized")):
             return
         self._chrome_initialized = True
         self._chrome_visible = visible
+        self._content_visible = content_visible
         opacity = 1.0 if visible else 0.0
         self._title_opacity.setOpacity(opacity)
         self._microphone_opacity.setOpacity(opacity)
         for effect in self._content_opacities:
-            effect.setOpacity(opacity)
+            effect.setOpacity(1.0 if content_visible else 0.0)
             # Render visible editors directly: an enabled opacity effect can
             # retain stale viewport pixels when only placeholder text changes.
-            effect.setEnabled(not visible)
+            effect.setEnabled(not content_visible)
         self.panel.setProperty("chromeVisible", visible)
         self._resize_surface.setProperty("chromeVisible", visible)
         for widget in (self.panel, self._resize_surface):
@@ -4123,13 +4274,21 @@ class OverlayWindow(QMainWindow):
                 self._render_reading_subtitle(resized=True)
             elif self._subtitle_mode_active:
                 self._set_subtitle_status(self._subtitle_status_text)
-        if not getattr(self, "_subtitle_mode_active", False):
+        if not getattr(self, "_subtitle_mode_active", False) and self._input_collapsed_geometry is None:
             self.geometry_changed.emit(QRect(self.geometry()))
 
     def moveEvent(self, event) -> None:  # noqa: N802
         super().moveEvent(event)
-        if not getattr(self, "_subtitle_mode_active", False):
-            self.geometry_changed.emit(QRect(self.geometry()))
+        if self._fitting_hover_input or self._fitting_subtitle:
+            return
+        delta = event.pos() - event.oldPos()
+        if self._subtitle_collapsed_geometry is not None:
+            self._subtitle_collapsed_geometry.translate(delta)
+        if self._input_collapsed_geometry is not None and not self._fitting_hover_input:
+            self._input_collapsed_geometry.translate(delta)
+        self.geometry_changed.emit(QRect(
+            self._subtitle_collapsed_geometry or self._input_collapsed_geometry or self.geometry()
+        ))
 
     def leaveEvent(self, event) -> None:  # noqa: N802
         QTimer.singleShot(0, self._hide_chrome_if_outside)
@@ -4146,7 +4305,61 @@ class OverlayWindow(QMainWindow):
         return bounds.adjusted(-margin_x, -margin_y, margin_x, margin_y)
 
     def _track_pointer(self, position: QPoint) -> None:
-        self._set_chrome_visible(self._pointer_hover_bounds().contains(position))
+        hovered = self._pointer_hover_bounds().contains(position)
+        self._set_chrome_visible(hovered)
+        if self._fitting_hover_input or self._resize_edges or self.pet._drag_offset is not None:
+            return
+        if hovered:
+            if self._subtitle_mode_active:
+                self._expand_subtitle()
+            else:
+                self._fit_hover_input()
+        else:
+            self._collapse_hover_input()
+
+    def _fit_hover_input(self) -> None:
+        if self._input_collapsed_geometry is None:
+            self._input_collapsed_geometry = QRect(self.geometry())
+        if not self.dictation_panel.isHidden():
+            widget = self.dictation_panel
+            text = self.dictation_state_label.text()
+            metrics = self.dictation_state_label.fontMetrics()
+            width = max(self.dictation_state_label.width(), 1)
+        else:
+            widget = self.transcript_area
+            text = widget.toPlainText() or widget.placeholderText()
+            metrics = widget.fontMetrics()
+            width = max(widget.viewport().width() - 12, 1)
+        text_height = metrics.boundingRect(
+            QRect(0, 0, width, 16_777_215), Qt.TextFlag.TextWordWrap, text + "\n"
+        ).height()
+        base = self._input_collapsed_geometry
+        available = self.screen().availableGeometry()
+        height = min(max(base.height(), self.height() - widget.height() + text_height + 28), available.height())
+        target = QRect(base)
+        target.setTop(max(available.top(), min(base.bottom() - height + 1, available.bottom() - height + 1)))
+        target.setHeight(height)
+        self._fitting_hover_input = True
+        try:
+            if self._position_locked:
+                self.setMinimumSize(760, 180)
+                self.setMaximumSize(16_777_215, 16_777_215)
+            self.setGeometry(target)
+        finally:
+            self._fitting_hover_input = False
+
+    def _collapse_hover_input(self) -> None:
+        base = self._input_collapsed_geometry
+        if base is None:
+            return
+        self._fitting_hover_input = True
+        try:
+            self.setGeometry(base)
+            if self._position_locked:
+                self.setFixedSize(base.size())
+        finally:
+            self._input_collapsed_geometry = None
+            self._fitting_hover_input = False
 
     def eventFilter(self, watched, event) -> bool:  # noqa: N802
         subtitle_widgets = getattr(self, "_subtitle_hover_widgets", ())
@@ -4179,6 +4392,10 @@ class OverlayWindow(QMainWindow):
                 event_type == QEvent.Type.MouseButtonPress
                 and event.button() == Qt.MouseButton.LeftButton
             ):
+                if watched in (self.subtitle_full_text, self.subtitle_full_text.viewport()):
+                    position = event.position().toPoint()
+                    if self.subtitle_full_text._link_at(position):
+                        return False
                 if self.dismiss_subtitle_mode():
                     event.accept()
                     return True
@@ -4246,6 +4463,7 @@ class OverlayWindow(QMainWindow):
         edges: Qt.Edges,
         global_position: QPoint,
     ) -> None:
+        self._input_collapsed_geometry = None
         self._resize_edges = edges
         self._resize_start_global = global_position
         self._resize_start_geometry = self.geometry()
@@ -4359,14 +4577,12 @@ class TrayController:
         self._qwen_preload_thread: threading.Thread | None = None
         self._migrate_legacy_hotkeys()
         self.window = OverlayWindow(str(self.config["pet_path"]))
+        self.window.pet.set_idle_behavior(str(self.config["pet_idle_mode"]), int(self.config["pet_idle_seconds"]))
         self.window.set_preferred_capture_source(
             str(self.config["capture_source"])
         )
         self.window.set_preferred_chatgpt_window(
             str(self.config["chatgpt_window"])
-        )
-        self.window.auto_send_button.setChecked(
-            bool(self.config["auto_send"])
         )
         self.window.auto_hide_button.setChecked(
             bool(self.config["auto_hide"])
@@ -4379,7 +4595,6 @@ class TrayController:
         self.dictation_tab_id: str | None = None
         self._dictation_state = "idle"
         self._dictation_input_held = False
-        self._dictation_force_auto_send = False
         self._short_voice_text: str | None = None
         self._dictation_include_screenshot = True
         self._dictation_pressed_since: float | None = None
@@ -4391,9 +4606,7 @@ class TrayController:
         bindings = self._bindings_for_sequences(self._hotkey_sequences)
         self.hotkey_monitor = GlobalHotkeyMonitor(
             bindings["hold"],
-            bindings["send"],
-            bindings["send_without_screenshot"],
-            self.window,
+            parent=self.window,
             hold_without_screenshot=bindings["hold_without_screenshot"],
             enabled=self._hotkey_enabled_states(),
         )
@@ -4422,6 +4635,7 @@ class TrayController:
             self._save_capture_source_preference
         )
         self.browser_monitor.tabs_changed.connect(self.window.set_chatgpt_tabs)
+        self.browser_monitor.response_links_changed.connect(self.window.set_response_links)
         self.browser_monitor.debug_connection_changed.connect(self.window.set_debug_connection)
         self.browser_monitor.status_changed.connect(
             self.window.set_browser_status
@@ -4458,7 +4672,7 @@ class TrayController:
         )
         self.hotkey_monitor.hold_pressed.connect(
             lambda: self.start_dictation(
-                force_auto_send=True,
+                send_on_finish=True,
                 include_screenshot=True,
                 initial_hold_seconds=self.hotkey_monitor.hold_delay_seconds,
             )
@@ -4466,7 +4680,7 @@ class TrayController:
         self.hotkey_monitor.hold_released.connect(self.finish_dictation)
         self.hotkey_monitor.hold_without_screenshot_pressed.connect(
             lambda: self.start_dictation(
-                force_auto_send=True,
+                send_on_finish=True,
                 include_screenshot=False,
                 initial_hold_seconds=self.hotkey_monitor.hold_delay_seconds,
             )
@@ -4474,20 +4688,11 @@ class TrayController:
         self.hotkey_monitor.hold_without_screenshot_released.connect(
             self.finish_dictation
         )
-        self.hotkey_monitor.send_pressed.connect(
-            lambda: self.window.request_send_from_hotkey(True)
-        )
-        self.hotkey_monitor.send_without_screenshot_pressed.connect(
-            lambda: self.window.request_send_from_hotkey(False)
-        )
 
         self._position_overlay()
         self._restore_window_geometry()
         self.window.lock_button.setChecked(
             bool(self.config["window_locked"])
-        )
-        self.window.auto_send_button.toggled.connect(
-            lambda enabled: self.config.__setitem__("auto_send", enabled)
         )
         self.window.auto_hide_button.toggled.connect(
             lambda enabled: self.config.__setitem__("auto_hide", enabled)
@@ -4529,19 +4734,19 @@ class TrayController:
 
     def _hotkey_enabled_states(self) -> dict[str, bool]:
         return {
-            name: bool(self.config[key + "_enabled"])
+            name: bool(self.config[key])
             for name, key in HOTKEY_CONFIG_KEYS.items()
         }
 
     @staticmethod
     def _bindings_for_sequences(
-        sequences: dict[str, QKeySequence],
+        sequences: dict[str, str],
     ) -> dict[str, HotkeyBinding]:
         bindings = {
             name: HotkeyBinding.from_sequence(sequence)
             for name, sequence in sequences.items()
         }
-        if len({binding.text.casefold() for binding in bindings.values()}) != 4:
+        if len({binding.text.casefold() for binding in bindings.values() if binding.text}) != sum(bool(binding.text) for binding in bindings.values()):
             raise ValueError("Each action must use a different hotkey")
         return bindings
 
@@ -4558,21 +4763,15 @@ class TrayController:
             self.config.update(migrated)
             logger.info("Migrated legacy hotkeys to JSON configuration")
 
-    def _load_hotkey_sequences(self) -> dict[str, QKeySequence]:
+    def _load_hotkey_sequences(self) -> dict[str, str]:
         defaults = {
             "hold": DEFAULT_HOLD_MIC_HOTKEY,
             "hold_without_screenshot": (
                 DEFAULT_HOLD_WITHOUT_SCREENSHOT_HOTKEY
             ),
-            "send": DEFAULT_SEND_HOTKEY,
-            "send_without_screenshot": (
-                DEFAULT_SEND_WITHOUT_SCREENSHOT_HOTKEY
-            ),
         }
         sequences = {
-            name: QKeySequence(
-                str(self.config[HOTKEY_CONFIG_KEYS[name]])
-            )
+            name: str(self.config[HOTKEY_CONFIG_KEYS[name]])
             for name in defaults
         }
         try:
@@ -4580,14 +4779,12 @@ class TrayController:
         except ValueError as error:
             logger.warning(f"Invalid saved hotkey configuration: {error}")
             sequences = {
-                name: QKeySequence(default)
+                name: default
                 for name, default in defaults.items()
             }
             self.config.update(
                 {
-                    HOTKEY_CONFIG_KEYS[name]: sequence.toString(
-                        QKeySequence.SequenceFormat.PortableText
-                    )
+                    HOTKEY_CONFIG_KEYS[name]: shortcut_text(sequence)
                     for name, sequence in sequences.items()
                 }
             )
@@ -4598,9 +4795,7 @@ class TrayController:
         try:
             dialog = HotkeyConfigDialog(
                 self._hotkey_sequences["hold"],
-                self._hotkey_sequences["send"],
-                self._hotkey_sequences["send_without_screenshot"],
-                self.window,
+                parent=self.window,
                 hold_without_screenshot=self._hotkey_sequences[
                     "hold_without_screenshot"
                 ],
@@ -4634,6 +4829,7 @@ class TrayController:
                 cosyvoice_manager=self.cosyvoice_manager,
                 sovits_manager=self.sovits_manager,
             )
+            dialog.pet_settings_changed.connect(self._apply_pet_settings)
             dialog.exec()
 
             sequences = self._load_hotkey_sequences()
@@ -4646,8 +4842,6 @@ class TrayController:
             self._start_qwen_preload()
             self.hotkey_monitor.update_bindings(
                 bindings["hold"],
-                bindings["send"],
-                bindings["send_without_screenshot"],
                 hold_without_screenshot=bindings["hold_without_screenshot"],
                 enabled=self._hotkey_enabled_states(),
             )
@@ -4661,6 +4855,10 @@ class TrayController:
             )
         finally:
             self.hotkey_monitor.start()
+
+    def _apply_pet_settings(self, path: str, mode: str, seconds: int) -> None:
+        self.window.pet.load_pet(path)
+        self.window.pet.set_idle_behavior(mode, seconds)
 
     def _handle_activation(
         self, reason: QSystemTrayIcon.ActivationReason
@@ -4895,12 +5093,13 @@ class TrayController:
     def start_dictation(
         self,
         *,
-        force_auto_send: bool = False,
+        send_on_finish: bool = False,
         include_screenshot: bool = True,
         initial_hold_seconds: float = 0.0,
     ) -> None:
         self._stop_playback_for_recording()
-        self._dictation_force_auto_send = force_auto_send
+        self.window.prepare_for_dictation()
+        self._dictation_send_on_finish = send_on_finish
         self._dictation_include_screenshot = include_screenshot
         self._dictation_input_held = True
         self._dictation_pressed_since = (
@@ -4916,12 +5115,6 @@ class TrayController:
         self._pending_dictation_capture = None
 
         self.window.show_for_auto_hide()
-        dismissed = self.window.dismiss_subtitle_mode()
-        if (
-            not dismissed
-            and self.window.transcript_area.is_showing_response
-        ):
-            self.window.transcript_area.begin_composing()
 
         if (
             getattr(self, "config", {}).get("recording_backend", "web")
@@ -4955,6 +5148,7 @@ class TrayController:
 
     def _stop_playback_for_recording(self) -> None:
         self.browser_monitor.request_stop_reading()
+        self._local_voice_interrupted = True
         worker = getattr(self, "_local_speech_thread", None)
         if worker is not None:
             self._local_voice_interrupted = True
@@ -4979,10 +5173,6 @@ class TrayController:
             or not getattr(self, "_dictation_input_held", False)
             or getattr(self, "_dictation_state", "idle")
             not in ("starting", "listening")
-            or not (
-                self.window.auto_send_enabled is True
-                or getattr(self, "_dictation_force_auto_send", False)
-            )
         ):
             return
 
@@ -5215,27 +5405,22 @@ class TrayController:
                     else message
                 ),
             )
-        auto_sent = bool(
-            not was_cancelled
-            and not restart
+        should_send = (
+            getattr(self, "_dictation_send_on_finish", False)
+            and not was_cancelled and not restart
             and len(recognized_text) >= MIN_VOICE_SEND_CHARACTERS
-            and (
-                self.window.auto_send_enabled
-                or getattr(self, "_dictation_force_auto_send", False)
-            )
         )
-        if auto_sent:
-            self._dictation_input_held = False
-            self.window.request_auto_send()
-            self._pending_dictation_capture = None
+        if should_send:
+            self.window.request_send_from_hotkey(
+                getattr(self, "_dictation_include_screenshot", True)
+            )
         elif recognized_text:
-            self._discard_preuploaded_dictation_screenshot()
             self.window.show_for_auto_hide()
         else:
             self._discard_preuploaded_dictation_screenshot()
             self.window.schedule_auto_hide()
-        if restart and not auto_sent:
-            force_auto_send = getattr(self, "_dictation_force_auto_send", False)
+        if restart:
+            send_on_finish = getattr(self, "_dictation_send_on_finish", False)
             include_screenshot = getattr(
                 self,
                 "_dictation_include_screenshot",
@@ -5248,14 +5433,14 @@ class TrayController:
                 QTimer.singleShot(
                     0,
                     lambda: self.start_dictation(
-                        force_auto_send=force_auto_send,
+                        send_on_finish=send_on_finish,
                         include_screenshot=include_screenshot,
                         initial_hold_seconds=restart_held_seconds,
                     ),
                 )
             else:
                 self.start_dictation(
-                    force_auto_send=force_auto_send,
+                    send_on_finish=send_on_finish,
                     include_screenshot=include_screenshot,
                     initial_hold_seconds=restart_held_seconds,
                 )
@@ -5434,6 +5619,7 @@ class TrayController:
     def _save_window_geometry(self) -> None:
         geometry = (
             self.window._subtitle_collapsed_geometry
+            or self.window._input_collapsed_geometry
             or self.window.geometry()
         )
         self.config["window_geometry"] = [

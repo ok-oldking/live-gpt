@@ -15,6 +15,9 @@ from PySide6.QtGui import QMouseEvent
 from PySide6.QtWidgets import QApplication
 
 from live_gpt.app import OverlayWindow
+from live_gpt.app import HotkeyConfigDialog
+from live_gpt.config import Config
+from PySide6.QtGui import QKeySequence
 
 
 class PetTests(unittest.TestCase):
@@ -56,7 +59,7 @@ class PetTests(unittest.TestCase):
         w.begin_reading("Playing")
         self.assertEqual(self.pet.state, "review")
         w.finish_reading(True, "Audio caught up")
-        self.assertEqual(self.pet.state, "running")
+        self.assertEqual(self.pet.state, "idle")
         w.set_response_finished(True, "Done")
         self.assertEqual(self.pet.state, "idle")
         w.set_status("Error", error=True)
@@ -65,6 +68,31 @@ class PetTests(unittest.TestCase):
         self.assertEqual(self.pet.state, "running")
         w.set_send_result(False, "retry", "Failed")
         self.assertEqual(self.pet.state, "failed")
+
+    def test_listening_keeps_input_region_visible_outside_overlay(self):
+        w = self.window
+        w.set_chatgpt_tabs([{"id": "tab", "title": "ChatGPT", "url": "https://chatgpt.com"}])
+        outside = w._pointer_hover_bounds().topLeft() - QPoint(100, 100)
+        with patch("live_gpt.app.QCursor.pos", return_value=outside):
+            w._track_pointer(outside)
+            self.assertFalse(w._chrome_visible)
+            w.begin_dictation_waiting()
+            w.set_microphone_state("recording")
+            w.set_dictation_listening()
+            w._track_pointer(outside)
+            self.assertEqual(self.pet.animation, "waiting")
+            self.assertTrue(w.dictation_panel.isVisible())
+            self.assertFalse(w._chrome_visible)
+            self.assertTrue(w._content_visible)
+            self.assertEqual(w.dictation_panel.graphicsEffect().opacity(), 1)
+            w.set_dictation_partial("Live transcript")
+            w.set_dictation_finishing()
+            w._track_pointer(outside)
+            self.assertFalse(w._chrome_visible)
+            self.assertTrue(w._content_visible)
+            w.end_dictation_display()
+            w.set_microphone_state("idle")
+            self.assertFalse(w._chrome_visible)
 
     def test_dismissed_subtitle_still_tracks_playback_completion(self):
         w = self.window
@@ -81,6 +109,35 @@ class PetTests(unittest.TestCase):
         self.window.begin_reading("Playing")
         self.window.set_response_finished(False, "Disconnected")
         self.assertEqual(self.pet.state, "failed")
+
+    def test_processing_and_playback_show_content_and_hover_reveals_controls(self):
+        w = self.window
+        w.set_chatgpt_tabs([{"id": "tab", "title": "ChatGPT", "url": "https://chatgpt.com"}])
+        outside = w._pointer_hover_bounds().topLeft() - QPoint(100, 100)
+        with patch("live_gpt.app.QCursor.pos", return_value=outside):
+            w.begin_response_display("Hello")
+            for action in (lambda: None, lambda: w.begin_reading("Playing")):
+                action()
+                self.assertFalse(w._chrome_visible)
+                self.assertTrue(w._content_visible)
+                self.assertEqual(w._title_opacity.opacity(), 0)
+                self.assertEqual(w._microphone_opacity.opacity(), 0)
+                self.assertEqual(w.subtitle_panel.graphicsEffect().opacity(), 1)
+                self.assertTrue(w.subtitle_panel.isVisible())
+                w._track_pointer(w.frameGeometry().center())
+                self.assertTrue(w._chrome_visible)
+                self.assertEqual(w._microphone_opacity.opacity(), 1)
+                w._track_pointer(outside)
+                self.assertFalse(w._chrome_visible)
+                self.assertTrue(w._content_visible)
+            w.set_response_finished(True, "Done")
+            self.assertTrue(w._content_visible)
+            w.finish_reading(True, "Done")
+            self.assertEqual(self.pet.state, "idle")
+            self.assertTrue(w._content_visible)
+            self.assertEqual(w._playback_input_timer.interval(), 5000)
+            w._finish_playback_input_delay()
+            self.assertFalse(w._content_visible)
 
     @patch("live_gpt.pet.QApplication.screenAt")
     def test_overlay_and_pet_drag_and_restore_current_activity(self, screen_at):
@@ -253,6 +310,26 @@ class PetTests(unittest.TestCase):
         w._set_chrome_visible(True)
         self.assertFalse(w.transcript_area.graphicsEffect().isEnabled())
 
+    def test_hover_fits_editable_content_and_restores_compact_geometry(self):
+        w = self.window
+        outside = QPoint(-10000, -10000)
+        with patch("live_gpt.app.QCursor.pos", return_value=outside):
+            w._track_pointer(outside)
+            base = QRect(w.geometry())
+            w.set_transcript("\n".join(f"Line {i}" for i in range(20)))
+            w._track_pointer(w.frameGeometry().center())
+            QApplication.processEvents()
+            self.assertGreater(w.height(), base.height())
+            self.assertEqual(w.width(), base.width())
+            self.assertLessEqual(w.height(), w.screen().availableGeometry().height())
+            w.set_transcript("\n".join(f"Line {i}" for i in range(200)))
+            w._track_pointer(w.frameGeometry().center())
+            QApplication.processEvents()
+            self.assertLessEqual(w.height(), w.screen().availableGeometry().height())
+            w._track_pointer(outside)
+            self.assertEqual(w.geometry(), base)
+            self.assertIn("Line 199", w.transcript_area.toPlainText())
+
     def test_screen_tracking_shows_margin_and_hides_everything_except_pet(self):
         w = self.window
         w.set_chatgpt_tabs([{"id": "tab", "title": "ChatGPT", "url": "https://chatgpt.com"}])
@@ -288,6 +365,63 @@ class PetTests(unittest.TestCase):
         self.assertFalse(self.pet._timer.isActive())
         self.window.show()
         self.assertTrue(self.pet._timer.isActive())
+
+    def test_idle_modes_and_timer_restart(self):
+        pet = self.pet
+        with patch("live_gpt.pet.time.monotonic", return_value=0):
+            pet.set_idle_behavior("never")
+        pet._last_tick = 0
+        with patch("live_gpt.pet.time.monotonic", return_value=0.3):
+            pet._tick()
+        self.assertEqual(pet.frame, 0)
+        with patch("live_gpt.pet.time.monotonic", return_value=1):
+            pet.set_idle_behavior("timed", 10)
+        pet._last_tick = 1
+        with patch("live_gpt.pet.time.monotonic", return_value=1.3):
+            pet._tick()
+        self.assertEqual(pet.frame, 1)
+        with patch("live_gpt.pet.time.monotonic", return_value=11):
+            pet._tick()
+        self.assertEqual(pet.frame, 0)
+        pet.set_state("running")
+        with patch("live_gpt.pet.time.monotonic", return_value=20):
+            pet.set_state("idle")
+        pet._last_tick = 20
+        with patch("live_gpt.pet.time.monotonic", return_value=20.3):
+            pet._tick()
+        self.assertEqual(pet.frame, 1)
+        pet.set_idle_behavior("always")
+        pet._last_tick = 0
+        with patch("live_gpt.pet.time.monotonic", return_value=100.4):
+            pet._tick()
+        self.assertNotEqual(pet.frame, 0)
+
+    def test_pet_settings_navigation_selection_and_persistence(self):
+        with tempfile.TemporaryDirectory() as folder:
+            config = Config(Path(folder) / "config.json")
+            dialog = HotkeyConfigDialog(QKeySequence("CapsLock"), QKeySequence("Ctrl+S"), QKeySequence("Ctrl+D"), config=config)
+            try:
+                dialog.pet_nav_button.click()
+                self.assertEqual(dialog.settings_pages.currentIndex(), 4)
+                self.assertGreater(dialog.pet_list.count(), 0)
+                self.assertEqual(dialog.pet_idle_seconds.value(), 10)
+                self.assertFalse(dialog.pet_idle_form.isRowVisible(dialog.pet_idle_seconds))
+                changes = []
+                dialog.pet_settings_changed.connect(lambda *values: changes.append(values))
+                dialog.pet_idle_combo.setCurrentIndex(dialog.pet_idle_combo.findData("timed"))
+                dialog.pet_idle_seconds.setValue(7)
+                self.assertTrue(dialog.pet_idle_seconds.isEnabled())
+                self.assertTrue(dialog.pet_idle_form.isRowVisible(dialog.pet_idle_seconds))
+                saved = Config(Path(folder) / "config.json")
+                self.assertEqual(saved["pet_idle_mode"], "timed")
+                self.assertEqual(saved["pet_idle_seconds"], 7)
+                self.assertTrue(Path(saved["pet_path"]).is_dir())
+                self.assertEqual(changes[-1][1:], ("timed", 7))
+                dialog.pet_idle_combo.setCurrentIndex(dialog.pet_idle_combo.findData("never"))
+                self.assertFalse(dialog.pet_idle_seconds.isEnabled())
+                self.assertFalse(dialog.pet_idle_form.isRowVisible(dialog.pet_idle_seconds))
+            finally:
+                dialog.deleteLater()
 
 
 if __name__ == "__main__":

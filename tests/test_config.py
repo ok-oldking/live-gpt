@@ -7,6 +7,38 @@ from live_gpt.config import Config, DEFAULT_CONFIG
 
 
 class ConfigTests(unittest.TestCase):
+    def test_disabled_legacy_shortcut_becomes_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text(json.dumps({
+                "hotkey_hold": "Right Alt",
+                "hotkey_hold_enabled": False,
+                "hotkey_hold_without_screenshot": "Right Ctrl",
+                "hotkey_hold_without_screenshot_enabled": True,
+            }), encoding="utf-8")
+            config = Config(path)
+            self.assertEqual(config["hotkey_hold"], "")
+            self.assertEqual(config["hotkey_hold_without_screenshot"], "Right Ctrl")
+            self.assertNotIn("hotkey_hold_enabled", config)
+            self.assertEqual(Config(path)["hotkey_hold"], "")
+
+    def test_legacy_shortcuts_migrate_and_custom_bindings_survive(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text(json.dumps({
+                "hotkey_hold": "CapsLock",
+                "hotkey_hold_without_screenshot": "Shift",
+                "hotkey_send": "Ctrl+S",
+                "hotkey_send_enabled": True,
+            }), encoding="utf-8")
+            config = Config(path)
+            self.assertEqual(config["hotkey_hold"], "Right Alt")
+            self.assertEqual(config["hotkey_hold_without_screenshot"], "Right Ctrl")
+            self.assertNotIn("hotkey_send", config)
+            self.assertNotIn("hotkey_send_enabled", config)
+            config["hotkey_hold"] = "Left Shift+A"
+            self.assertEqual(Config(path)["hotkey_hold"], "Left Shift+A")
+
     def test_missing_file_uses_defaults_and_creates_json(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"
@@ -25,11 +57,11 @@ class ConfigTests(unittest.TestCase):
             config = Config(path)
 
             config["language"] = "zh"
-            config["auto_send"] = True
+            config["auto_hide"] = True
 
             saved = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(saved["language"], "zh")
-            self.assertTrue(saved["auto_send"])
+            self.assertTrue(saved["auto_hide"])
 
     def test_invalid_json_falls_back_to_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

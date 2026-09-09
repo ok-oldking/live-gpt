@@ -33,6 +33,27 @@ class BrowserDiscoveryTests(unittest.TestCase):
 
 
 class BrowserMonitorTests(unittest.TestCase):
+    def test_response_snapshot_keeps_named_http_links_without_changing_text(self):
+        turn = Mock()
+        turn.get_attribute.return_value = "new-turn"
+        turn.inner_text.return_value = "Read the documentation"
+        anchors = Mock()
+        anchors.evaluate_all.return_value = [
+            ["documentation", "https://example.com/docs"],
+            ["unsafe", "javascript:alert(1)"],
+        ]
+        turn.locator.side_effect = lambda selector: (
+            anchors if selector == "a[href]" else Mock(last=Mock(count=lambda: 0), count=lambda: 1)
+        )
+        page = Mock()
+        page.locator.side_effect = lambda selector: (
+            Mock(count=lambda: 1, last=turn) if 'data-turn="assistant"' in selector
+            else Mock(first=Mock(is_visible=lambda: False))
+        )
+        snapshot = BrowserMonitor._response_snapshot(page, "old-turn")
+        self.assertEqual(snapshot.text, "Read the documentation")
+        self.assertEqual(snapshot.links, (("documentation", "https://example.com/docs"),))
+
     def test_refresh_discovers_new_tabs_and_navigation_after_empty_connection(self):
         monitor = BrowserMonitor()
         updates = []
@@ -340,6 +361,20 @@ class BrowserMonitorTests(unittest.TestCase):
         page.evaluate.assert_called_once()
         self.assertIsNone(state.active_reading)
         self.assertEqual(results, [(False, "Playback stopped for recording")])
+
+    def test_recording_cancels_pending_reply_before_it_can_read_aloud(self) -> None:
+        monitor = BrowserMonitor()
+        state = _MonitorState(
+            active_response=_ActiveResponse(page=Mock(), turn_marker_before=None)
+        )
+
+        monitor.request_stop_reading()
+        monitor._stop_active_reading(state)
+        with patch.object(monitor, "_click_read_aloud") as read:
+            monitor._poll_active_response(state)
+
+        self.assertIsNone(state.active_response)
+        read.assert_not_called()
 
     def test_dictation_press_clicks_chatgpt_microphone(self) -> None:
         composer = Mock()

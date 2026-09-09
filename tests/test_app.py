@@ -311,18 +311,38 @@ class TranscriptEditorTests(unittest.TestCase):
 
         self.assertEqual(self.editor.toPlainText(), full_response)
 
-    def test_auto_send_shows_check_icon_only_while_enabled(self) -> None:
-        self.assertTrue(self.editor.auto_send_button.icon().isNull())
+    def test_auto_send_button_is_removed(self) -> None:
+        self.assertFalse(hasattr(self.editor, "auto_send_button"))
 
-        self.editor.auto_send_button.click()
+    def test_click_response_preserves_text_and_allows_selection_and_clear(self) -> None:
+        self.editor.begin_response()
+        self.editor.update_response("Keep this response")
+        self.editor.finish_response()
+        QTest.mouseClick(self.editor.viewport(), Qt.MouseButton.LeftButton, pos=QPoint(8, 8))
+        self.assertEqual(self.editor.toPlainText(), "Keep this response")
+        self.assertFalse(self.editor.isReadOnly())
+        self.editor.selectAll()
+        self.assertEqual(self.editor.textCursor().selectedText(), "Keep this response")
+        QTest.keyClick(self.editor, Qt.Key.Key_Backspace)
+        self.assertEqual(self.editor.toPlainText(), "")
 
-        self.assertTrue(self.editor.auto_send_button.isChecked())
-        self.assertFalse(self.editor.auto_send_button.icon().isNull())
+    @patch("live_gpt.app.QDesktopServices.openUrl")
+    def test_plain_and_named_response_links_open_browser(self, open_url) -> None:
+        for text, links, url in (
+            ("https://example.com", (), "https://example.com"),
+            ("Read docs", (("docs", "https://example.com/docs"),), "https://example.com/docs"),
+            ("[docs](https://example.com/docs)", (), "https://example.com/docs"),
+        ):
+            self.editor.setPlainText(text)
+            self.editor.response_links = links
+            cursor = self.editor.textCursor()
+            cursor.setPosition(6 if text == "Read docs" else 2)
+            self.editor.setTextCursor(cursor)
+            QApplication.processEvents()
+            point = self.editor.cursorRect(cursor).center()
+            QTest.mouseClick(self.editor.viewport(), Qt.MouseButton.LeftButton, pos=point)
+            self.assertEqual(open_url.call_args.args[0].toString(), url)
 
-        self.editor.auto_send_button.click()
-
-        self.assertFalse(self.editor.auto_send_button.isChecked())
-        self.assertTrue(self.editor.auto_send_button.icon().isNull())
 
 
 class SettingsDialogTests(unittest.TestCase):
@@ -355,8 +375,8 @@ class SettingsDialogTests(unittest.TestCase):
             self.assertFalse(dialog.recording_nav_button.icon().isNull())
             self.assertFalse(dialog.playing_nav_button.icon().isNull())
             self.assertEqual(
-                dialog.hold_without_screenshot_edit.keySequence().toString(),
-                "Shift",
+                dialog.hold_without_screenshot_edit.keySequence(),
+                "Right Ctrl",
             )
             self.assertTrue(dialog.language_combo.isEnabled())
             self.assertEqual(dialog.language_combo.currentText(), "English")
@@ -581,15 +601,18 @@ class SettingsDialogTests(unittest.TestCase):
             )
             try:
                 self.assertFalse(hasattr(dialog, "settings_buttons"))
-                self.assertTrue(dialog.hotkey_enabled_switches["hold"].isChecked())
-                for name in ("hold_without_screenshot", "send", "send_without_screenshot"):
-                    self.assertFalse(dialog.hotkey_enabled_switches[name].isChecked())
-                self.assertFalse(dialog.send_edit.isEnabled())
-                dialog.hotkey_enabled_switches["send"].setChecked(True)
-                self.assertTrue(dialog.send_edit.isEnabled())
-                self.assertTrue(Config(path)["hotkey_send_enabled"])
-                dialog.hotkey_enabled_switches["hold"].setChecked(False)
-                self.assertFalse(Config(path)["hotkey_hold_enabled"])
+                self.assertFalse(hasattr(dialog, "hotkey_enabled_switches"))
+                self.assertFalse(hasattr(dialog, "send_edit"))
+                dialog.hold_microphone_edit.clear_button.click()
+                dialog.hold_without_screenshot_edit.clear_button.click()
+                saved_config = Config(path)
+                self.assertEqual(saved_config["hotkey_hold"], "")
+                self.assertEqual(saved_config["hotkey_hold_without_screenshot"], "")
+                self.assertEqual(dialog.sequences(), {"hold": "", "hold_without_screenshot": ""})
+                controller = TrayController.__new__(TrayController)
+                controller.config = saved_config
+                self.assertEqual(controller._load_hotkey_sequences(), dialog.sequences())
+                self.assertFalse(any(controller._hotkey_enabled_states().values()))
                 dialog.language_combo.setCurrentIndex(1)
                 dialog.recording_backend_combo.setCurrentIndex(
                     dialog.recording_backend_combo.findData("sherpa")
@@ -628,7 +651,7 @@ class SettingsDialogTests(unittest.TestCase):
                     "E:/voices/reference.wav"
                 )
                 dialog.cosyvoice_prompt_text_edit.setText("Reference transcript")
-                dialog.send_edit.setKeySequence(QKeySequence("Ctrl+Shift+S"))
+                dialog.hold_without_screenshot_edit.setKeySequence("Right Ctrl+S")
 
                 saved = json.loads(path.read_text(encoding="utf-8"))
                 self.assertEqual(saved["language"], "zh")
@@ -652,7 +675,7 @@ class SettingsDialogTests(unittest.TestCase):
                 self.assertEqual(
                     saved["cosyvoice_prompt_text"], "Reference transcript"
                 )
-                self.assertEqual(saved["hotkey_send"], "Ctrl+Shift+S")
+                self.assertEqual(saved["hotkey_hold_without_screenshot"], "Right Ctrl+S")
             finally:
                 dialog.close()
 
@@ -936,11 +959,12 @@ class TrayControllerBrowserTests(unittest.TestCase):
 
             self.assertFalse(window.transcript_area.isHidden())
             self.assertTrue(window.subtitle_panel.isHidden())
-            self.assertEqual(window.transcript_area.toPlainText(), "")
+            self.assertEqual(window.transcript_area.toPlainText(), "Current subtitle\nNext subtitle")
         finally:
             window.close()
 
-    def test_subtitle_hover_expands_and_mouse_leave_collapses(self) -> None:
+    @patch("live_gpt.app.QCursor.pos", return_value=QPoint(-10000, -10000))
+    def test_subtitle_hover_expands_and_mouse_leave_collapses(self, _cursor) -> None:
         window = OverlayWindow()
         try:
             window.show()
@@ -996,6 +1020,40 @@ class TrayControllerBrowserTests(unittest.TestCase):
             self.assertTrue(window.subtitle_full_text.isHidden())
             self.assertEqual(window.subtitle_line_one.text(), "Question")
             self.assertEqual(window.subtitle_line_two.text(), "Writing…")
+        finally:
+            window.close()
+
+    @patch("live_gpt.app.QCursor.pos", return_value=QPoint(-10000, -10000))
+    def test_dragged_subtitle_keeps_new_position_after_update_and_collapse(self, _cursor) -> None:
+        window = OverlayWindow()
+        try:
+            window.show()
+            window.move(40, 300)
+            window.begin_response_display("Question")
+            window.set_response_update("Writing…", "Reply text. " * 40)
+            QApplication.processEvents()
+            base = QRect(window.geometry())
+            window._expand_subtitle()
+            self.assertEqual(window._subtitle_collapsed_geometry, base)
+            before_drag = window.pos()
+            saved = []
+            window.geometry_changed.connect(saved.append)
+            window.pet.begin_drag(window.frameGeometry().topLeft() + QPoint(20, 20))
+            window.move(before_drag + QPoint(30, 40))
+            delta = window.pos() - before_drag
+            expected = base.translated(delta)
+            self.assertEqual(window._subtitle_collapsed_geometry, expected)
+            self.assertEqual(saved[-1], expected)
+            during_drag = QRect(window.geometry())
+            window.set_response_update("Writing…", "More reply text. " * 60)
+            window._collapse_subtitle_if_outside()
+            self.assertTrue(window._subtitle_expanded)
+            self.assertEqual(window.geometry(), during_drag)
+            window.pet._finish_drag()
+            window._fit_expanded_subtitle_height()
+            self.assertEqual(window._subtitle_collapsed_geometry, expected)
+            window._collapse_subtitle()
+            self.assertEqual(window.geometry(), expected)
         finally:
             window.close()
 
@@ -1080,7 +1138,7 @@ class TrayControllerBrowserTests(unittest.TestCase):
         finally:
             window.close()
 
-    def test_subtitle_starts_in_two_line_mode_on_pointer_enter(self) -> None:
+    def test_subtitle_expands_on_overlay_hover(self) -> None:
         window = OverlayWindow()
         try:
             window.show()
@@ -1094,10 +1152,11 @@ class TrayControllerBrowserTests(unittest.TestCase):
 
             QApplication.processEvents()
 
-            self.assertFalse(window._subtitle_expanded)
-            self.assertFalse(window.subtitle_line_one.isHidden())
-            self.assertFalse(window.subtitle_line_two.isHidden())
-            self.assertTrue(window.subtitle_full_text.isHidden())
+            window._track_pointer(window.frameGeometry().center())
+            self.assertTrue(window._subtitle_expanded)
+            self.assertTrue(window.subtitle_line_one.isHidden())
+            self.assertTrue(window.subtitle_line_two.isHidden())
+            self.assertFalse(window.subtitle_full_text.isHidden())
         finally:
             window.close()
 
@@ -1397,7 +1456,7 @@ class TrayControllerBrowserTests(unittest.TestCase):
             )
             self.assertEqual(window.send_button.text(), "With Screenshot")
             self.assertLess(
-                window.auto_send_button.geometry().left(),
+                window.clear_button.geometry().left(),
                 window.send_without_screenshot_button.geometry().left(),
             )
             window.send_without_screenshot_button.click()
@@ -1406,42 +1465,6 @@ class TrayControllerBrowserTests(unittest.TestCase):
         finally:
             window.close()
 
-    def test_auto_send_uses_current_screenshot_selection(self) -> None:
-        window = OverlayWindow()
-        source = CaptureSource(
-            "display:1",
-            "Screenshot desktop",
-            "display",
-            0,
-            0,
-            1920,
-            1080,
-        )
-        requests: list[tuple[str, object]] = []
-        window.send_requested.connect(
-            lambda text, selected: requests.append((text, selected))
-        )
-        try:
-            window.set_chatgpt_tabs(
-                [{"id": "tab", "title": "ChatGPT", "url": "https://chatgpt.com"}]
-            )
-            window.set_capture_sources([source])
-            window.set_transcript("First dictated prompt")
-
-            window.request_auto_send()
-            window.set_transcript("Second dictated prompt")
-            window.capture_source_combo.setCurrentIndex(1)
-            window.request_auto_send()
-
-            self.assertEqual(
-                requests,
-                [
-                    ("First dictated prompt", None),
-                    ("Second dictated prompt", source),
-                ],
-            )
-        finally:
-            window.close()
 
     def test_selected_screenshot_can_be_sent_without_text(self) -> None:
         window = OverlayWindow()
@@ -1490,7 +1513,8 @@ class TrayControllerBrowserTests(unittest.TestCase):
         finally:
             window.close()
 
-    def test_auto_hide_reveals_for_activity_and_hides_afterwards(self) -> None:
+    @patch("live_gpt.app.QCursor.pos", return_value=QPoint(-10000, -10000))
+    def test_auto_hide_reveals_for_activity_and_hides_afterwards(self, _cursor) -> None:
         window = OverlayWindow()
         try:
             window.set_chatgpt_tabs([{"id": "tab", "title": "ChatGPT", "url": "https://chatgpt.com"}])
@@ -1678,7 +1702,7 @@ class TrayControllerBrowserTests(unittest.TestCase):
         controller.browser_monitor.request_start_dictation.assert_called_once_with(
             "selected-tab"
         )
-        controller.window.dismiss_subtitle_mode.assert_called_once_with()
+        controller.window.clear_transcript.assert_called_once_with()
         controller.browser_monitor.request_finish_dictation.assert_called_once_with(
             "selected-tab"
         )
@@ -1700,7 +1724,7 @@ class TrayControllerBrowserTests(unittest.TestCase):
         )
 
     @patch("live_gpt.app.capture_webp", return_value=b"hold-screenshot")
-    def test_auto_send_screenshot_is_uploaded_after_half_second_hold(
+    def test_screenshot_is_uploaded_after_half_second_hold(
         self,
         capture: Mock,
     ) -> None:
@@ -1726,7 +1750,6 @@ class TrayControllerBrowserTests(unittest.TestCase):
         )
         controller = TrayController.__new__(TrayController)
         controller.window = Mock()
-        controller.window.auto_send_enabled = True
         controller.window.capture_source_combo.currentData.return_value = (
             release_source
         )
@@ -1784,10 +1807,9 @@ class TrayControllerBrowserTests(unittest.TestCase):
         )
         self.assertIsNone(controller._dictation_attachment_tab_id)
 
-    def test_record_hotkey_stops_playback_and_forces_auto_send(self) -> None:
+    def test_record_hotkey_stops_playback_and_retains_dictation(self) -> None:
         controller = TrayController.__new__(TrayController)
         controller.window = Mock()
-        controller.window.auto_send_enabled = False
         controller.window.transcript_area.is_showing_response = False
         controller.browser_monitor = Mock()
         controller.selected_chatgpt_tab_id = "selected-tab"
@@ -1800,7 +1822,6 @@ class TrayControllerBrowserTests(unittest.TestCase):
         controller._local_speech_thread = playback
 
         controller.start_dictation(
-            force_auto_send=True,
             include_screenshot=False,
         )
 
@@ -1815,7 +1836,7 @@ class TrayControllerBrowserTests(unittest.TestCase):
         controller._dictation_input_held = False
         controller._on_dictation_finished(True, "Dictated text", "Finished")
 
-        controller.window.request_auto_send.assert_called_once_with()
+        controller.window.send_requested.emit.assert_not_called()
 
     def test_interrupted_reply_does_not_restart_voice_during_recording(self) -> None:
         controller = TrayController.__new__(TrayController)
@@ -1836,13 +1857,11 @@ class TrayControllerBrowserTests(unittest.TestCase):
     ) -> None:
         controller = TrayController.__new__(TrayController)
         controller.window = Mock()
-        controller.window.auto_send_enabled = False
         controller.browser_monitor = Mock()
         controller.selected_chatgpt_tab_id = "selected-tab"
         controller._dictation_press_generation = 3
         controller._dictation_input_held = True
         controller._dictation_state = "listening"
-        controller._dictation_force_auto_send = True
         controller._dictation_include_screenshot = False
 
         controller._upload_dictation_screenshot_after_hold(3)
@@ -1854,7 +1873,6 @@ class TrayControllerBrowserTests(unittest.TestCase):
     def test_cancelled_hold_does_not_upload_a_screenshot(self, capture: Mock) -> None:
         controller = TrayController.__new__(TrayController)
         controller.window = Mock()
-        controller.window.auto_send_enabled = True
         controller.browser_monitor = Mock()
         controller.selected_chatgpt_tab_id = "selected-tab"
         controller._dictation_press_generation = 2
@@ -1886,6 +1904,7 @@ class TrayControllerBrowserTests(unittest.TestCase):
         )
         controller.browser_monitor.request_finish_dictation.assert_not_called()
         self.assertEqual(controller._dictation_state, "cancelling")
+        controller.window.clear_transcript.assert_not_called()
 
     def test_release_before_browser_listens_cancels_when_ready(self) -> None:
         controller = TrayController.__new__(TrayController)
@@ -1956,7 +1975,6 @@ class TrayControllerBrowserTests(unittest.TestCase):
     def test_finished_dictation_populates_app_input(self) -> None:
         controller = TrayController.__new__(TrayController)
         controller.window = Mock()
-        controller.window.auto_send_enabled = False
 
         controller._on_dictation_finished(
             True,
@@ -1975,10 +1993,9 @@ class TrayControllerBrowserTests(unittest.TestCase):
         controller.window.show_for_auto_hide.assert_called_once_with()
         controller.window.schedule_auto_hide.assert_not_called()
 
-    def test_finished_dictation_auto_sends_when_enabled(self) -> None:
+    def test_finished_dictation_waits_for_manual_send(self) -> None:
         controller = TrayController.__new__(TrayController)
         controller.window = Mock()
-        controller.window.auto_send_enabled = True
         controller._dictation_input_held = False
 
         controller._on_dictation_finished(
@@ -1990,13 +2007,37 @@ class TrayControllerBrowserTests(unittest.TestCase):
         controller.window.set_transcript.assert_called_once_with(
             "Text recognized by ChatGPT"
         )
-        controller.window.request_auto_send.assert_called_once_with()
-        controller.window.show_for_auto_hide.assert_not_called()
+        controller.window.send_requested.emit.assert_not_called()
+        controller.window.show_for_auto_hide.assert_called_once_with()
+        controller.window.request_send_from_hotkey.assert_not_called()
+
+    def test_only_valid_hotkey_dictation_sends_automatically(self) -> None:
+        for send_on_finish, screenshot, text, success, state, expected in (
+            (True, True, "Hello", True, "finishing", True),
+            (True, False, "Hello", True, "finishing", True),
+            (False, True, "Hello", True, "finishing", False),
+            (True, True, "A", True, "finishing", False),
+            (True, True, "", True, "finishing", False),
+            (True, True, "Hello", False, "finishing", False),
+            (True, True, "Hello", True, "cancelling", False),
+        ):
+            with self.subTest(send_on_finish=send_on_finish, screenshot=screenshot, text=text, success=success, state=state):
+                controller = TrayController.__new__(TrayController)
+                controller.window = Mock()
+                controller.browser_monitor = Mock()
+                controller._dictation_send_on_finish = send_on_finish
+                controller._dictation_include_screenshot = screenshot
+                controller._dictation_input_held = False
+                controller._dictation_state = state
+                controller._on_dictation_finished(success, text, "Finished")
+                if expected:
+                    controller.window.request_send_from_hotkey.assert_called_once_with(screenshot)
+                else:
+                    controller.window.request_send_from_hotkey.assert_not_called()
 
     def test_one_character_voice_result_is_not_sent(self) -> None:
         controller = TrayController.__new__(TrayController)
         controller.window = Mock()
-        controller.window.auto_send_enabled = True
         controller._dictation_input_held = False
 
         controller._on_dictation_finished(
@@ -2006,7 +2047,7 @@ class TrayControllerBrowserTests(unittest.TestCase):
         )
 
         controller.window.set_transcript.assert_called_once_with("A")
-        controller.window.request_auto_send.assert_not_called()
+        controller.window.send_requested.emit.assert_not_called()
         controller.window.show_for_auto_hide.assert_called_once_with()
         controller.window.set_microphone_state.assert_called_once_with(
             "saved",
@@ -2014,15 +2055,14 @@ class TrayControllerBrowserTests(unittest.TestCase):
         )
         self.assertEqual(controller._short_voice_text, "A")
 
-    def test_two_character_voice_result_can_auto_send(self) -> None:
+    def test_two_character_voice_result_waits_for_manual_send(self) -> None:
         controller = TrayController.__new__(TrayController)
         controller.window = Mock()
-        controller.window.auto_send_enabled = True
         controller._dictation_input_held = False
 
         controller._on_dictation_finished(True, "OK", "Finished")
 
-        controller.window.request_auto_send.assert_called_once_with()
+        controller.window.send_requested.emit.assert_not_called()
         self.assertIsNone(controller._short_voice_text)
 
     def test_unchanged_one_character_voice_result_cannot_be_sent(self) -> None:

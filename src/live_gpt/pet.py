@@ -32,6 +32,18 @@ def default_pet_path() -> Path:
     return Path(sys.prefix) / "share/live-gpt/pets/feibi-jiubi"
 
 
+def available_pets() -> list[tuple[str, str]]:
+    pets = []
+    for manifest in sorted(default_pet_path().parent.glob("*/pet.json")):
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8-sig"))
+            if isinstance(data, dict):
+                pets.append((str(data.get("displayName") or manifest.parent.name), str(manifest.parent)))
+        except (OSError, ValueError):
+            continue
+    return pets
+
+
 class PetWidget(QWidget):
     pointer_tracked = Signal(QPoint)
 
@@ -50,6 +62,9 @@ class PetWidget(QWidget):
         self._locked = False
         self._elapsed = 0
         self._last_tick = time.monotonic()
+        self.idle_mode = "always"
+        self.idle_seconds = 10
+        self._idle_started = self._last_tick
         self._last_pointer_position: QPoint | None = None
         self._last_pointer_movement = self._last_tick
         self.load_pet(path or default_pet_path())
@@ -76,6 +91,18 @@ class PetWidget(QWidget):
         self.frame = 0
         self.look_direction = None
         self._elapsed = 0
+        self._idle_started = time.monotonic()
+        self.update()
+
+    def set_idle_behavior(self, mode: str, seconds: int = 10) -> None:
+        if mode not in ("always", "never", "timed") or not 1 <= seconds <= 3600:
+            raise ValueError("Invalid idle animation settings")
+        self.idle_mode = mode
+        self.idle_seconds = seconds
+        self._idle_started = time.monotonic()
+        if self.animation == "idle":
+            self.frame = 0
+            self._elapsed = 0
         self.update()
 
     def set_state(self, state: str) -> None:
@@ -90,6 +117,8 @@ class PetWidget(QWidget):
             self.animation = animation
             self.frame = 0
             self._elapsed = 0
+            if animation == "idle":
+                self._idle_started = time.monotonic()
         self.look_direction = None
         self.update()
 
@@ -127,6 +156,12 @@ class PetWidget(QWidget):
         while self._elapsed >= durations[self.frame]:
             self._elapsed -= durations[self.frame]
             self.frame = (self.frame + 1) % len(durations)
+        if self.animation == "idle" and (
+            self.idle_mode == "never" or
+            (self.idle_mode == "timed" and now - self._idle_started >= self.idle_seconds)
+        ):
+            self.frame = 0
+            self._elapsed = 0
         position = QCursor.pos()
         self.update_look(position)
         self.pointer_tracked.emit(position)

@@ -16,21 +16,16 @@ logger = Logger.get_logger(__name__)
 DEFAULT_CONFIG: dict[str, Any] = {
     "version": 1,
     "language": "en",
-    "hotkey_hold": "CapsLock",
-    "hotkey_hold_without_screenshot": "Shift",
-    "hotkey_send": "Ctrl+S",
-    "hotkey_send_without_screenshot": "Ctrl+D",
-    "hotkey_hold_enabled": True,
-    "hotkey_hold_without_screenshot_enabled": False,
-    "hotkey_send_enabled": False,
-    "hotkey_send_without_screenshot_enabled": False,
-    "auto_send": False,
+    "hotkey_hold": "Right Alt",
+    "hotkey_hold_without_screenshot": "Right Ctrl",
     "auto_hide": False,
     "capture_source": "",
     "chatgpt_window": "",
     "window_geometry": [],
     "window_locked": False,
     "pet_path": "",
+    "pet_idle_mode": "always",
+    "pet_idle_seconds": 10,
     "recording_backend": "web",
     "playing_backend": "web",
     "pypi_mirror": "default",
@@ -76,6 +71,10 @@ def default_config_path() -> Path:
 def _valid_value(key: str, value: Any, default: Any) -> bool:
     if type(value) is not type(default):
         return False
+    if key == "pet_idle_mode":
+        return value in ("always", "never", "timed")
+    if key == "pet_idle_seconds":
+        return 1 <= value <= 3600
     if key == "version":
         return value == DEFAULT_CONFIG["version"]
     if key == "language":
@@ -142,7 +141,7 @@ def _valid_value(key: str, value: Any, default: Any) -> bool:
             "all_zh", "all_ja", "all_yue", "all_ko",
         )
     if key.startswith("hotkey_") and not key.endswith("_enabled"):
-        return bool(value.strip())
+        return True
     if key == "window_geometry":
         return value == [] or (
             len(value) == 4
@@ -166,6 +165,20 @@ class Config(dict[str, Any]):
         self.file_existed = self.path.is_file()
         loaded = self._read_file()
         migrated = False
+        if isinstance(loaded, dict) and "hotkey_send" in loaded:
+            # Update the old defaults while preserving customized recording keys.
+            for key, old_default in (
+                ("hotkey_hold", "CapsLock"),
+                ("hotkey_hold_without_screenshot", "Shift"),
+            ):
+                if loaded.get(key) == old_default:
+                    loaded[key] = DEFAULT_CONFIG[key]
+                    migrated = True
+        if isinstance(loaded, dict):
+            for key in ("hotkey_hold", "hotkey_hold_without_screenshot"):
+                if loaded.get(key + "_enabled") is False:
+                    loaded[key] = ""
+                    migrated = True
         if isinstance(loaded, dict) and "voice_backend" in loaded:
             loaded = dict(loaded)
             legacy_backend = loaded.pop("voice_backend")

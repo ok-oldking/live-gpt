@@ -10,6 +10,8 @@ from PySide6.QtGui import QKeySequence  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from live_gpt.hotkeys import (  # noqa: E402
+    HotkeyEdit,
+    SIDED_MODIFIERS,
     GlobalHotkeyMonitor,
     HotkeyBinding,
     VK_CAPITAL,
@@ -113,6 +115,77 @@ class GlobalHotkeyMonitorTests(unittest.TestCase):
         self.assertEqual(binding.text, "Ctrl+S")
         self.assertEqual(binding.virtual_key, ord("S"))
         self.assertTrue(binding.control)
+
+    def test_each_modifier_side_is_independent(self) -> None:
+        for name, vk in SIDED_MODIFIERS.items():
+            with self.subTest(name=name):
+                binding = HotkeyBinding.from_sequence(name)
+                aggregate = {0xA0: 0x10, 0xA1: 0x10, 0xA2: 0x11,
+                             0xA3: 0x11, 0xA4: 0x12, 0xA5: 0x12}[vk]
+                down = {vk, aggregate}
+                self.assertTrue(binding.is_pressed(lambda key: 0x8000 if key in down else 0))
+                down = {vk ^ 1, aggregate}
+                self.assertFalse(binding.is_pressed(lambda key: 0x8000 if key in down else 0))
+
+    def test_right_alt_accepts_windows_altgr_control_state(self) -> None:
+        down = {0xA5, 0x12, 0x11, 0xA2}
+        state = lambda key: 0x8000 if key in down else 0
+        self.assertTrue(HotkeyBinding.from_sequence("Right Alt").is_pressed(state))
+        self.assertFalse(HotkeyBinding.from_sequence("Right Ctrl").is_pressed(state))
+
+    def test_sided_modifier_combination(self) -> None:
+        binding = HotkeyBinding.from_sequence("Right Ctrl+A")
+        down = {0xA3, 0x11, ord("A")}
+        self.assertTrue(binding.is_pressed(lambda key: 0x8000 if key in down else 0))
+        down = {0xA2, 0x11, ord("A")}
+        self.assertFalse(binding.is_pressed(lambda key: 0x8000 if key in down else 0))
+
+    def test_editor_captures_native_modifier_sides(self) -> None:
+        from PySide6.QtCore import QEvent, Qt
+        from PySide6.QtGui import QKeyEvent
+        editor = HotkeyEdit("Right Alt")
+        for name, vk in SIDED_MODIFIERS.items():
+            qt_key = {"Shift": Qt.Key.Key_Shift, "Ctrl": Qt.Key.Key_Control,
+                      "Alt": Qt.Key.Key_Alt}[name.split()[1]]
+            for event_type in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease):
+                event = QKeyEvent(event_type, qt_key, Qt.KeyboardModifier.NoModifier, 0, vk, 0)
+                self.application.sendEvent(editor, event)
+            self.assertEqual(editor.keySequence(), name)
+        editor.close()
+
+    def test_editor_captures_extended_windows_alt_and_control(self) -> None:
+        from PySide6.QtCore import QEvent, Qt
+        from PySide6.QtGui import QKeyEvent
+        for key, vk, scan, native_modifiers, expected in (
+            (Qt.Key.Key_Alt, 0x12, 0xE038, 0, "Right Alt"),
+            (Qt.Key.Key_Control, 0x11, 0xE01D, 0, "Right Ctrl"),
+            (Qt.Key.Key_Alt, 0x12, 0x138, 0, "Right Alt"),
+            (Qt.Key.Key_Alt, 0x12, 0x38, 0x01000000, "Right Alt"),
+            (Qt.Key.Key_AltGr, 0x12, 0x38, 0, "Right Alt"),
+            (Qt.Key.Key_Alt, 0x12, 0x38, 0, "Left Alt"),
+            (Qt.Key.Key_Control, 0x11, 0x1D, 0, "Left Ctrl"),
+        ):
+            with self.subTest(scan=scan, expected=expected):
+                editor = HotkeyEdit("")
+                event = QKeyEvent(QEvent.Type.KeyPress, key,
+                                  Qt.KeyboardModifier.NoModifier, scan, vk, native_modifiers)
+                self.application.sendEvent(editor, event)
+                self.assertEqual(editor.keySequence(), expected)
+                editor.close()
+
+    def test_clear_button_disables_binding_and_allows_reassignment(self) -> None:
+        editor = HotkeyEdit("Right Alt")
+        changes = []
+        editor.keySequenceChanged.connect(changes.append)
+        editor.clear_button.click()
+        binding = HotkeyBinding.from_sequence(editor.keySequence())
+        self.assertFalse(binding.is_pressed(lambda key: 0x8000))
+        self.assertEqual(changes, [""])
+        self.assertTrue(editor.clear_button.isHidden())
+        editor.setKeySequence("Left Alt")
+        self.assertEqual(editor.keySequence(), "Left Alt")
+        self.assertFalse(editor.clear_button.isHidden())
+        editor.close()
 
     def test_disabled_shortcuts_do_not_trigger_and_can_be_enabled(self) -> None:
         events = []
