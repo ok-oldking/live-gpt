@@ -56,6 +56,12 @@ class SpeechToTextModel:
     required_files: tuple[str, ...]
 
     @property
+    def supported_languages(self) -> tuple[str, ...]:
+        if self.kind == "offline_sense_voice":
+            return ("auto", "zh", "en")
+        return ("zh",) if self.language == "Chinese / Mandarin" else ("en",)
+
+    @property
     def description(self) -> str:
         return (
             f"{self.mode} · {self.accuracy} · 5-sec compute {self.compute} · "
@@ -110,7 +116,7 @@ STT_MODELS: dict[str, SpeechToTextModel] = {
         ("model.int8.onnx", "tokens.txt"),
     ),
     "zh_sense_voice_small_int8": SpeechToTextModel(
-        "zh_sense_voice_small_int8", "SenseVoiceSmall INT8", "Chinese / Mandarin", "Offline",
+        "zh_sense_voice_small_int8", "SenseVoiceSmall INT8", "Chinese / English / Japanese / Korean / Cantonese", "Offline",
         "~3% class", "~500 ms", "~230 MB", "~450–550 MB", "Multilingual / emotion",
         "offline_sense_voice",
         _asset(_ASR_RELEASE, "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09.tar.bz2",
@@ -177,7 +183,7 @@ class SherpaSttProvider:
             default_config_path().parent / "models" / "sherpa-onnx"
         )
         self._recognizer_lock = threading.RLock()
-        self._recognizers: dict[str, Any] = {}
+        self._recognizers: dict[tuple[str, str], Any] = {}
         self._verified_models: set[str] = set()
 
     @staticmethod
@@ -421,11 +427,11 @@ class SherpaSttProvider:
         return np.interp(np.linspace(0, len(source) - 1, target_length),
                          np.arange(len(source)), source).astype(np.float32)
 
-    def transcribe(self, model_key: str, samples: Any, sample_rate: int) -> str:
+    def transcribe(self, model_key: str, samples: Any, sample_rate: int, language: str | None = None) -> str:
         selected = STT_MODELS[model_key]
         samples = self._resample(samples, sample_rate)
         if selected.kind == "online_zipformer_ctc":
-            recognizer = self._get_recognizer(model_key, verify=False)
+            recognizer = self._get_recognizer(model_key, language, verify=False)
             stream = recognizer.create_stream()
             stream.accept_waveform(16_000, samples)
             stream.input_finished()
@@ -433,13 +439,13 @@ class SherpaSttProvider:
                 recognizer.decode_stream(stream)
             return str(recognizer.get_result(stream)).strip()
 
-        recognizer = self._get_recognizer(model_key, verify=False)
+        recognizer = self._get_recognizer(model_key, language, verify=False)
         stream = recognizer.create_stream()
         stream.accept_waveform(16_000, samples)
         recognizer.decode_stream(stream)
         return str(stream.result.text).strip()
 
-    def _create_recognizer(self, model_key: str) -> Any:
+    def _create_recognizer(self, model_key: str, language: str) -> Any:
         """Construct a recognizer. Callers must hold ``_recognizer_lock``."""
         import sherpa_onnx
 
@@ -480,7 +486,7 @@ class SherpaSttProvider:
         elif selected.kind == "offline_sense_voice":
             recognizer = sherpa_onnx.OfflineRecognizer.from_sense_voice(
                 model=str(root / "model.int8.onnx"),
-                language="auto",
+                language=language,
                 use_itn=True,
                 **common,
             )
@@ -494,60 +500,68 @@ class SherpaSttProvider:
             )
         return recognizer
 
-    def _get_recognizer(self, model_key: str, *, verify: bool) -> Any:
+    def _get_recognizer(self, model_key: str, language: str | None = None, *, verify: bool) -> Any:
         if model_key not in STT_MODELS:
             raise ValueError(f"Unknown STT model {model_key!r}")
+        language = language or STT_MODELS[model_key].supported_languages[0]
+        if language not in STT_MODELS[model_key].supported_languages:
+            raise ValueError(f"Model {model_key!r} does not support language {language!r}")
+        cache_key = (model_key, language)
         with self._recognizer_lock:
             if verify and model_key not in self._verified_models:
                 ok, message = self.model_status("stt", model_key)
                 if not ok:
                     raise RuntimeError(message)
                 self._verified_models.add(model_key)
-            cached = self._recognizers.get(model_key)
+            cached = self._recognizers.get(cache_key)
             if cached is not None:
                 return cached
 
-            recognizer = self._create_recognizer(model_key)
-            self._recognizers[model_key] = recognizer
+            recognizer = self._create_recognizer(model_key, language)
+            self._recognizers[cache_key] = recognizer
             return recognizer
 
     def _invalidate_model(self, model_key: str) -> None:
         with self._recognizer_lock:
-            self._recognizers.pop(model_key, None)
+            for cache_key in list(self._recognizers):
+                if cache_key[0] == model_key:
+                    del self._recognizers[cache_key]
             self._verified_models.discard(model_key)
 
-    def prepare(self, model_key: str) -> Any:
+    def prepare(self, model_key: str, language: str | None = None) -> Any:
         """Verify and load a model once, then reuse its recognizer."""
         # Import PortAudio during background preload, but do not open the input
         # device until recording actually starts.
         import sounddevice  # noqa: F401
 
-        return self._get_recognizer(model_key, verify=True)
+        return self._get_recognizer(model_key, language, verify=True)
 
-    def preload(self, model_key: str) -> str:
+    def preload(self, model_key: str, language: str | None = None) -> str:
+        language = language or STT_MODELS[model_key].supported_languages[0]
         started = time.perf_counter()
         with self._recognizer_lock:
-            already_loaded = model_key in self._recognizers
-            self.prepare(model_key)
+            already_loaded = (model_key, language) in self._recognizers
+            self.prepare(model_key, language)
         label = STT_MODELS[model_key].label
         if already_loaded:
             return f"{label} is already preloaded"
         return f"{label} preloaded in {time.perf_counter() - started:.1f} s"
 
-    def create_streaming_recognizer(self, model_key: str) -> Any:
+    def create_streaming_recognizer(self, model_key: str, language: str | None = None) -> Any:
         """Return the reusable Sherpa online recognizer for a streaming model."""
         selected = STT_MODELS[model_key]
         if selected.kind != "online_zipformer_ctc":
             raise ValueError(f"{selected.label} is not a streaming model")
-        return self._get_recognizer(model_key, verify=False)
+        return self._get_recognizer(model_key, language, verify=False)
 
 
 class LocalDictationSession:
     """Record microphone samples until stopped, then transcribe locally."""
 
-    def __init__(self, manager: SherpaSttProvider, stt_model: str) -> None:
+    def __init__(self, manager: SherpaSttProvider, stt_model: str, language: str | None = None) -> None:
         self.manager = manager
         self.stt_model = stt_model
+        self.language = language or STT_MODELS[stt_model].supported_languages[0]
         self._created_at = time.perf_counter()
         self._stop = threading.Event()
         self._cancelled = False
@@ -585,7 +599,7 @@ class LocalDictationSession:
                     return pending
 
             streaming = STT_MODELS[self.stt_model].mode == "Streaming"
-            prepared_recognizer = self.manager.prepare(self.stt_model)
+            prepared_recognizer = self.manager.prepare(self.stt_model, self.language)
             recognizer = prepared_recognizer if streaming else None
             stream = recognizer.create_stream() if recognizer is not None else None
             with sd.InputStream(
@@ -654,7 +668,7 @@ class LocalDictationSession:
                     partial(text)
             else:
                 text = self.manager.transcribe(
-                    self.stt_model, np.concatenate(take_chunks()), 16_000
+                    self.stt_model, np.concatenate(take_chunks()), 16_000, self.language
                 )
             latency_ms = (time.perf_counter() - inference_at) * 1000
             duration = inference_at - started_at

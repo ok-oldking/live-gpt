@@ -7,6 +7,19 @@ from live_gpt.config import Config, DEFAULT_CONFIG
 
 
 class ConfigTests(unittest.TestCase):
+    def test_recording_language_migration_and_model_compatibility(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            for model, expected in (("en_moonshine_tiny_int8", "en"), ("zh_sense_voice_small_int8", "auto")):
+                path.write_text(json.dumps({"stt_model": model}), encoding="utf-8")
+                config = Config(path)
+                self.assertEqual(config["stt_language"], expected)
+                self.assertEqual(config["stt_model"], model)
+            path.write_text(json.dumps({"stt_model": "en_moonshine_tiny_int8", "stt_language": "auto"}), encoding="utf-8")
+            config = Config(path)
+            self.assertEqual(config["stt_model"], "zh_sense_voice_small_int8")
+            self.assertEqual(Config(path)["stt_language"], "auto")
+
     def test_disabled_legacy_shortcut_becomes_empty(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"

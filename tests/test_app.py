@@ -350,6 +350,23 @@ class SettingsDialogTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.application = QApplication.instance() or QApplication([])
 
+    def test_recording_language_filters_models_and_preserves_supported_selection(self) -> None:
+        dialog = HotkeyConfigDialog("Right Alt")
+        try:
+            for language, expected_count in (("auto", 1), ("en", 6), ("zh", 5)):
+                dialog.stt_language_combo.setCurrentIndex(dialog.stt_language_combo.findData(language))
+                self.assertEqual(dialog.stt_model_combo.count(), expected_count)
+                keys = [dialog.stt_model_combo.itemData(i) for i in range(expected_count)]
+                self.assertIn("zh_sense_voice_small_int8", keys)
+                self.assertEqual(dialog.stt_model(), "zh_sense_voice_small_int8")
+            dialog.stt_model_combo.setCurrentIndex(0)
+            dialog.stt_language_combo.setCurrentIndex(dialog.stt_language_combo.findData("en"))
+            self.assertNotIn("zh_zipformer_ctc_int8_2025_07_03", [
+                dialog.stt_model_combo.itemData(i) for i in range(dialog.stt_model_combo.count())
+            ])
+        finally:
+            dialog.close()
+
     def test_settings_use_navigation_and_selectable_language_preview(self) -> None:
         dialog = HotkeyConfigDialog(
             QKeySequence("CapsLock"),
@@ -396,7 +413,7 @@ class SettingsDialogTests(unittest.TestCase):
             dialog.recording_nav_button.click()
             self.assertEqual(dialog.settings_pages.currentIndex(), 2)
             self.assertEqual(dialog.recording_backend(), "web")
-            self.assertEqual(dialog.stt_model_combo.count(), 10)
+            self.assertEqual(dialog.stt_model_combo.count(), 5)
             self.assertIn("[Offline]", dialog.stt_model_combo.itemText(0))
             streaming_index = dialog.stt_model_combo.findData(
                 "zh_streaming_zipformer_small_ctc_int8_2025_04_01"
@@ -627,6 +644,7 @@ class SettingsDialogTests(unittest.TestCase):
                     dialog.recording_pypi_mirror_combo.currentData(),
                     "ali",
                 )
+                dialog.stt_language_combo.setCurrentIndex(dialog.stt_language_combo.findData("en"))
                 dialog.stt_model_combo.setCurrentIndex(
                     dialog.stt_model_combo.findData("en_moonshine_tiny_int8")
                 )
@@ -658,6 +676,7 @@ class SettingsDialogTests(unittest.TestCase):
                 self.assertEqual(saved["recording_backend"], "sherpa")
                 self.assertEqual(saved["playing_backend"], "qwen")
                 self.assertEqual(saved["pypi_mirror"], "ali")
+                self.assertEqual(saved["stt_language"], "en")
                 self.assertEqual(saved["stt_model"], "en_moonshine_tiny_int8")
                 self.assertEqual(
                     saved["tts_model"], "qwen3_tts_1_7b_custom_voice"
@@ -694,7 +713,7 @@ class TrayControllerBrowserTests(unittest.TestCase):
         controller._stt_preload_thread.join(timeout=2)
 
         controller.stt_manager.preload.assert_called_once_with(
-            "en_moonshine_tiny_int8"
+            "en_moonshine_tiny_int8", "en"
         )
 
     def test_qwen_model_preloads_in_background_when_selected(self) -> None:

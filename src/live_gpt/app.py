@@ -782,6 +782,7 @@ class HotkeyConfigDialog(QDialog):
         language: str = "en",
         recording_backend: str = "web",
         playing_backend: str = "web",
+        stt_language: str | None = None,
         stt_model: str = "zh_zipformer_ctc_int8_2025_07_03",
         tts_model: str = "qwen3_tts_0_6b_custom_voice",
         tts_speaker: str = "Vivian",
@@ -1093,16 +1094,19 @@ class HotkeyConfigDialog(QDialog):
         recording_runtime_row.addStretch()
         recording_sherpa_layout.addLayout(recording_runtime_row)
 
+        recording_sherpa_layout.addWidget(QLabel("Recording language"))
+        self.stt_language_combo = QComboBox()
+        self.stt_language_combo.setObjectName("voiceCombo")
+        for label, code in (("Auto (multiple languages)", "auto"), ("Chinese (zh)", "zh"), ("English (en)", "en")):
+            self.stt_language_combo.addItem(label, code)
+        self.stt_language_combo.setCurrentIndex(self.stt_language_combo.findData(
+            stt_language or STT_MODELS[stt_model].supported_languages[0]
+        ))
+        recording_sherpa_layout.addWidget(self.stt_language_combo)
+        recording_sherpa_layout.addWidget(QLabel("Recording model"))
         self.stt_model_combo = QComboBox()
         self.stt_model_combo.setObjectName("voiceCombo")
-        for model in STT_MODELS.values():
-            size_mb = round(model.asset.size / 1024 / 1024)
-            self.stt_model_combo.addItem(
-                f"[{model.mode}] {model.language} · {model.label} · {size_mb} MB",
-                model.key,
-            )
-        stt_index = self.stt_model_combo.findData(stt_model)
-        self.stt_model_combo.setCurrentIndex(max(stt_index, 0))
+        self._populate_stt_models(stt_model)
         recording_sherpa_layout.addWidget(self.stt_model_combo)
         self.stt_model_description = QLabel()
         self.stt_model_description.setObjectName("settingsNote")
@@ -1528,6 +1532,7 @@ class HotkeyConfigDialog(QDialog):
         )
         self.recording_cancel_button.clicked.connect(self._cancel_voice_operation)
         self.playing_cancel_button.clicked.connect(self._cancel_voice_operation)
+        self.stt_language_combo.currentIndexChanged.connect(self._stt_language_changed)
         self.stt_model_combo.currentIndexChanged.connect(self._stt_model_changed)
         self.tts_model_combo.currentIndexChanged.connect(self._tts_model_changed)
         self.cosyvoice_model_combo.currentIndexChanged.connect(
@@ -2130,6 +2135,27 @@ class HotkeyConfigDialog(QDialog):
         finally:
             target.blockSignals(False)
 
+    def _populate_stt_models(self, selected: str) -> None:
+        self.stt_model_combo.blockSignals(True)
+        self.stt_model_combo.clear()
+        for model in STT_MODELS.values():
+            if self.stt_language() in model.supported_languages:
+                size_mb = round(model.asset.size / 1024 / 1024)
+                self.stt_model_combo.addItem(
+                    f"[{model.mode}] {model.label} · {size_mb} MB", model.key
+                )
+        self.stt_model_combo.setCurrentIndex(max(self.stt_model_combo.findData(selected), 0))
+        self.stt_model_combo.blockSignals(False)
+
+    def _stt_language_changed(self) -> None:
+        self._populate_stt_models(self.stt_model())
+        self._stt_model_changed()
+        if self.config is not None:
+            self.config.update({"stt_language": self.stt_language(), "stt_model": self.stt_model()})
+
+    def stt_language(self) -> str:
+        return str(self.stt_language_combo.currentData() or "auto")
+
     def _stt_model_changed(self) -> None:
         model = STT_MODELS[self.stt_model()]
         self.stt_model_description.setText(model.description)
@@ -2438,6 +2464,7 @@ class HotkeyConfigDialog(QDialog):
         self.playing_backend_combo.setEnabled(not busy)
         self.recording_pypi_mirror_combo.setEnabled(not busy)
         self.playing_pypi_mirror_combo.setEnabled(not busy)
+        self.stt_language_combo.setEnabled(not busy)
         self.stt_model_combo.setEnabled(not busy)
         self.tts_model_combo.setEnabled(not busy)
         self.cosyvoice_model_combo.setEnabled(not busy)
@@ -2478,7 +2505,7 @@ class HotkeyConfigDialog(QDialog):
         self.recording_status.setText("Starting the microphone…")
         self._refresh_voice_status_style(self.recording_status)
         worker = _LocalDictationThread(
-            LocalDictationSession(self.stt_manager, self.stt_model())
+            LocalDictationSession(self.stt_manager, self.stt_model(), self.stt_language())
         )
         self._voice_record_thread = worker
         worker.listening.connect(self._voice_record_listening)
@@ -4802,6 +4829,7 @@ class TrayController:
                 language=str(self.config["language"]),
                 recording_backend=str(self.config["recording_backend"]),
                 playing_backend=str(self.config["playing_backend"]),
+                stt_language=str(self.config["stt_language"]),
                 stt_model=str(self.config["stt_model"]),
                 tts_model=str(self.config["tts_model"]),
                 tts_speaker=str(self.config["tts_speaker"]),
@@ -5056,10 +5084,11 @@ class TrayController:
         if existing is not None and existing.is_alive():
             return
         model_key = str(self.config["stt_model"])
+        language = self.config.get("stt_language", STT_MODELS[model_key].supported_languages[0])
 
         def preload() -> None:
             try:
-                message = self.stt_manager.preload(model_key)
+                message = self.stt_manager.preload(model_key, language)
                 logger.info(f"Sherpa background preload complete: {message}")
             except Exception as error:
                 logger.warning(
@@ -5242,7 +5271,7 @@ class TrayController:
             "recording",
             "Starting the local microphone…",
         )
-        session = LocalDictationSession(self.stt_manager, stt_model)
+        session = LocalDictationSession(self.stt_manager, stt_model, self.config["stt_language"])
         worker = _LocalDictationThread(session)
         self._local_dictation_thread = worker
         worker.listening.connect(

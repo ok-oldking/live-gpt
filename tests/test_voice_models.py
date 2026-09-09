@@ -856,6 +856,22 @@ class VoiceModelManagerTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "unsafe path"):
                 SherpaSttProvider._safe_extract(archive, root / "extract")
 
+    def test_sense_voice_language_reaches_factory_and_partitions_cache(self) -> None:
+        factory = Mock(side_effect=lambda **kwargs: object())
+        fake_sherpa = SimpleNamespace(OfflineRecognizer=SimpleNamespace(from_sense_voice=factory))
+        with tempfile.TemporaryDirectory() as directory, patch.dict(sys.modules, {"sherpa_onnx": fake_sherpa}):
+            manager = SherpaSttProvider(directory)
+            for language in ("auto", "zh", "en"):
+                first = manager._get_recognizer("zh_sense_voice_small_int8", language, verify=False)
+                second = manager._get_recognizer("zh_sense_voice_small_int8", language, verify=False)
+                self.assertIs(first, second)
+            self.assertEqual([c.kwargs["language"] for c in factory.call_args_list], ["auto", "zh", "en"])
+            manager._invalidate_model("zh_sense_voice_small_int8")
+            self.assertEqual(manager._recognizers, {})
+            for language in ("auto", "zh", "invalid"):
+                with self.assertRaisesRegex(ValueError, "does not support language"):
+                    manager._get_recognizer("en_moonshine_tiny_int8", language, verify=False)
+
     def test_offline_transcribe_uses_public_model_factories(self) -> None:
         cases = (
             ("zh_zipformer_ctc_int8_2025_07_03", "from_zipformer_ctc"),
@@ -941,7 +957,7 @@ class VoiceModelManagerTests(unittest.TestCase):
             "stt", "en_moonshine_tiny_int8"
         )
         manager._create_recognizer.assert_called_once_with(
-            "en_moonshine_tiny_int8"
+            "en_moonshine_tiny_int8", "en"
         )
 
     def test_streaming_session_emits_partial_text_before_final_result(self) -> None:

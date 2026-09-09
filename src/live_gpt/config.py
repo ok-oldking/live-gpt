@@ -31,6 +31,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "pypi_mirror": "default",
     "qwen_model_source": "huggingface",
     "cosyvoice_model_source": "huggingface",
+    "stt_language": "zh",
     "stt_model": "zh_zipformer_ctc_int8_2025_07_03",
     "tts_model": "qwen3_tts_0_6b_custom_voice",
     "tts_speaker": "Vivian",
@@ -89,6 +90,8 @@ def _valid_value(key: str, value: Any, default: Any) -> bool:
         return value in ("huggingface", "modelscope")
     if key == "cosyvoice_model_source":
         return value in ("huggingface", "modelscope")
+    if key == "stt_language":
+        return value in ("auto", "zh", "en")
     if key == "stt_model":
         return value in (
             "zh_zipformer_ctc_int8_2025_07_03",
@@ -219,6 +222,18 @@ class Config(dict[str, Any]):
                 value = copy.deepcopy(default)
                 modified = True
             verified[key] = value
+        if "stt_language" in verified and "stt_model" in verified:
+            from .voice.sherpa_stt import STT_MODELS
+
+            model = STT_MODELS[verified["stt_model"]]
+            if "stt_language" not in loaded:
+                verified["stt_language"] = model.supported_languages[0]
+            if verified["stt_language"] not in model.supported_languages:
+                verified["stt_model"] = next(
+                    key for key, candidate in STT_MODELS.items()
+                    if verified["stt_language"] in candidate.supported_languages
+                )
+                modified = True
         return verified, modified
 
     def save_file(self) -> None:
