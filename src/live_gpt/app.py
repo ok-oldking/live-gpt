@@ -72,6 +72,7 @@ from .browser import (
 )
 from .config import Config, DEFAULT_CONFIG
 from .pet import PetWidget, available_pets, default_pet_path
+from .pet_download import download_pet, pet_source
 from .logger import Logger, config_logger, shutdown_logger
 from .hotkeys import GlobalHotkeyMonitor, HotkeyBinding, HotkeyEdit, shortcut_text
 from .screen_capture import CaptureSource, capture_webp, list_capture_sources
@@ -765,6 +766,20 @@ class _QueuedLocalSpeechThread(QThread):
                 except Exception:
                     pass
             self._output = None
+
+
+class _PetDownloadThread(QThread):
+    completed = Signal(bool, str)
+
+    def __init__(self, url: str, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.url = url
+
+    def run(self) -> None:
+        try:
+            self.completed.emit(True, str(download_pet(self.url)))
+        except Exception as error:
+            self.completed.emit(False, str(error))
 
 
 class HotkeyConfigDialog(QDialog):
@@ -2000,7 +2015,7 @@ class HotkeyConfigDialog(QDialog):
         title = QLabel("Pet")
         title.setObjectName("settingsPageTitle")
         layout.addWidget(title)
-        description = QLabel("Choose a pet from assets/pets. Changes are saved and applied immediately.")
+        description = QLabel("Choose a pet or download one from GitHub. Changes are saved and applied immediately.")
         description.setObjectName("settingsPageDescription")
         description.setWordWrap(True)
         layout.addWidget(description)
@@ -2023,30 +2038,35 @@ class HotkeyConfigDialog(QDialog):
             QListWidget::item:selected:!active { color: #f5f7ff; background: #20445b; border-color: #4cc9f0; }
         """)
         values = self.config if self.config is not None else DEFAULT_CONFIG
-        selected_path = Path(str(values["pet_path"] or default_pet_path())).resolve()
-        if selected_path.name == "pet.json":
-            selected_path = selected_path.parent
-        pets = available_pets()
-        if not any(Path(path).resolve() == selected_path for _, path in pets):
-            pets.append((selected_path.name, str(selected_path)))
-        for label, path in pets:
-            item = QListWidgetItem(label)
-            item.setData(Qt.ItemDataRole.UserRole, path)
-            item.setToolTip(path)
-            item.setSizeHint(QSize(200, 70))
-            try:
-                probe = PetWidget(path)
-                item.setIcon(QIcon(probe.sheet.copy(0, 0, 192, 208)))
-                probe.deleteLater()
-            except (OSError, ValueError, TypeError, KeyError):
-                item.setIcon(QIcon(str(PET_ICON_PATH)))
-            self.pet_list.addItem(item)
-            if Path(path).resolve() == selected_path:
-                self.pet_list.setCurrentItem(item)
-        # Fit the visible rows rather than expanding into unused card space.
-        # Longer collections remain scrollable.
-        self.pet_list.setFixedHeight(min(260, max(78, self.pet_list.count() * 78)))
+        self._refresh_pet_list(str(values["pet_path"] or default_pet_path()))
         pet_layout.addWidget(self.pet_list)
+        self._pet_download_thread: _PetDownloadThread | None = None
+        download_row = QHBoxLayout()
+        self.pet_url_edit = QLineEdit()
+        self.pet_url_edit.setObjectName("voiceTestText")
+        self.pet_url_edit.setAccessibleName("Pet GitHub folder URL")
+        self.pet_url_edit.setPlaceholderText("https://github.com/owner/repo/tree/main/pets/name")
+        self.pet_url_edit.setToolTip("Paste a GitHub pet folder URL using /tree/ or /blob/.")
+        self.pet_download_button = QPushButton("Download pet")
+        self.pet_download_button.setObjectName("voiceActionButton")
+        download_row.addWidget(self.pet_url_edit, 1)
+        download_row.addWidget(self.pet_download_button)
+        pet_layout.addLayout(download_row)
+        self.pet_download_tip = QLabel(
+            'Find pets at <a href="https://github.com/legeling/awesome-codex-pet" '
+            'style="color: #4cc9f0;">awesome-codex-pet</a>. '
+            'Copy a pet folder link and paste it above.'
+        )
+        self.pet_download_tip.setObjectName("settingsNote")
+        self.pet_download_tip.setOpenExternalLinks(True)
+        self.pet_download_tip.setWordWrap(True)
+        pet_layout.addWidget(self.pet_download_tip)
+        self.pet_download_status = QLabel("Download pet.json and spritesheet.webp to download/pets, then switch to the pet.")
+        self.pet_download_status.setObjectName("settingsNote")
+        self.pet_download_status.setWordWrap(True)
+        pet_layout.addWidget(self.pet_download_status)
+        self.pet_download_button.clicked.connect(self._start_pet_download)
+        self.pet_url_edit.returnPressed.connect(self._start_pet_download)
         layout.addWidget(pet_card)
         layout.addSpacing(18)
         card = QFrame()
@@ -2086,6 +2106,68 @@ class HotkeyConfigDialog(QDialog):
         self.pet_list.currentRowChanged.connect(self._save_pet_settings)
         self.pet_idle_combo.currentIndexChanged.connect(self._save_pet_settings)
         self.pet_idle_seconds.valueChanged.connect(self._save_pet_settings)
+
+    def _refresh_pet_list(self, selected: str) -> None:
+        self.pet_list.blockSignals(True)
+        self.pet_list.clear()
+        selected_path = Path(selected).resolve()
+        if selected_path.name == "pet.json":
+            selected_path = selected_path.parent
+        pets = available_pets()
+        if not any(Path(path).resolve() == selected_path for _, path in pets):
+            pets.append((selected_path.name, str(selected_path)))
+        for label, path in pets:
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, path)
+            item.setToolTip(path)
+            item.setSizeHint(QSize(200, 70))
+            try:
+                probe = PetWidget(path)
+                item.setIcon(QIcon(probe.sheet.copy(0, 0, 192, 208)))
+                probe.deleteLater()
+            except (OSError, ValueError, TypeError, KeyError):
+                item.setIcon(QIcon(str(PET_ICON_PATH)))
+            self.pet_list.addItem(item)
+            if Path(path).resolve() == selected_path:
+                self.pet_list.setCurrentItem(item)
+        # Fit the visible rows rather than expanding into unused card space.
+        # Longer collections remain scrollable.
+        self.pet_list.setFixedHeight(min(260, max(78, self.pet_list.count() * 78)))
+        self.pet_list.blockSignals(False)
+
+    def _start_pet_download(self) -> None:
+        if self._pet_download_thread is not None:
+            return
+        url = self.pet_url_edit.text().strip()
+        try:
+            pet_source(url)
+        except ValueError as error:
+            self.pet_download_status.setText(str(error))
+            return
+        self.pet_download_button.setEnabled(False)
+        self.pet_url_edit.setEnabled(False)
+        self.pet_download_status.setText("Downloading and checking the pet…")
+        worker = _PetDownloadThread(url, self)
+        self._pet_download_thread = worker
+        worker.completed.connect(self._pet_download_completed)
+        worker.finished.connect(self._pet_download_finished)
+        worker.start()
+
+    def _pet_download_completed(self, success: bool, message: str) -> None:
+        if not success:
+            self.pet_download_status.setText(f"Could not download pet: {message}")
+            return
+        self._refresh_pet_list(message)
+        self._save_pet_settings()
+        self.pet_download_status.setText(f"Pet ready and selected: {Path(message).name}")
+
+    def _pet_download_finished(self) -> None:
+        worker = self._pet_download_thread
+        self._pet_download_thread = None
+        self.pet_download_button.setEnabled(True)
+        self.pet_url_edit.setEnabled(True)
+        if worker is not None:
+            worker.deleteLater()
 
     def _save_pet_settings(self) -> None:
         item = self.pet_list.currentItem()
@@ -2746,6 +2828,9 @@ class HotkeyConfigDialog(QDialog):
         return bindings
 
     def accept(self) -> None:
+        if self._pet_download_thread is not None:
+            self.pet_download_status.setText("Please wait for the pet download to finish.")
+            return
         if self._voice_worker is not None or self._voice_test_running():
             QMessageBox.information(
                 self,
@@ -2761,6 +2846,9 @@ class HotkeyConfigDialog(QDialog):
         super().accept()
 
     def reject(self) -> None:
+        if self._pet_download_thread is not None:
+            self.pet_download_status.setText("Please wait for the pet download to finish.")
+            return
         if self._voice_worker is not None:
             QMessageBox.information(
                 self,

@@ -262,3 +262,15 @@ HTTP(S) links open in the default browser. Holding the microphone for at least
 Hover anywhere over the overlay to expand the input vertically to fit its
 content. Expansion is limited to the screen's usable height, with scrolling
 for longer text. Moving away restores the compact window size.
+
+## Download pets
+
+In **Configure → Pet**, paste a public GitHub folder URL (for example,
+`https://github.com/legeling/awesome-codex-pet/tree/main/pets/citlali--zaytsevzy`)
+and click **Download pet**. The folder must contain `pet.json` and
+`spritesheet.webp`. Both `/tree/` and `/blob/` folder URLs are supported.
+Find pet folder links in [awesome-codex-pet](https://github.com/legeling/awesome-codex-pet).
+After validation, the pet is saved under
+`download/pets/<folder-name>`, added to the list, and selected immediately.
+Downloaded pets remain available after restarting. Existing valid downloads
+are reused; failed downloads leave the selected pet unchanged.

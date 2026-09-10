@@ -11,6 +11,8 @@ from PySide6.QtCore import QPoint, QRect, QTimer, Qt, Signal
 from PySide6.QtGui import QCursor, QPainter, QPixmap
 from PySide6.QtWidgets import QApplication, QWidget
 
+from .pet_download import downloaded_pets_path
+
 
 ANIMATIONS = {
     "idle": (0, (280, 110, 110, 140, 140, 320)),
@@ -34,7 +36,9 @@ def default_pet_path() -> Path:
 
 def available_pets() -> list[tuple[str, str]]:
     pets = []
-    for manifest in sorted(default_pet_path().parent.glob("*/pet.json")):
+    manifests = set(default_pet_path().parent.glob("*/pet.json"))
+    manifests.update(downloaded_pets_path().glob("*/pet.json"))
+    for manifest in sorted(manifests):
         try:
             data = json.loads(manifest.read_text(encoding="utf-8-sig"))
             if isinstance(data, dict):
