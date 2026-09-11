@@ -33,6 +33,84 @@ class BrowserDiscoveryTests(unittest.TestCase):
 
 
 class BrowserMonitorTests(unittest.TestCase):
+    def test_response_timeout_retries_then_completes_after_stability_window(self):
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+        for browser_voice in (True, False):
+            with self.subTest(browser_voice=browser_voice):
+                monitor = BrowserMonitor()
+                monitor.set_use_browser_voice(browser_voice)
+                response = _ActiveResponse(
+                    page=Mock(), turn_marker_before="old", started_at=90,
+                    last_text="Reply", last_text_changed_at=95,
+                    completion_candidate_at=95,
+                )
+                state = _MonitorState(active_response=response)
+                finished, voice_updates = [], []
+                monitor.response_finished.connect(lambda *args: finished.append(args))
+                monitor.local_voice_updated.connect(lambda *args: voice_updates.append(args))
+                snapshot = _ResponseSnapshot(True, False, True, "Reply", "Finishing reply…")
+                with (
+                    patch.object(monitor, "_response_snapshot", side_effect=[
+                        PlaywrightTimeoutError("Locator.inner_text: Timeout 1000ms exceeded"),
+                        snapshot, snapshot,
+                    ]),
+                    patch.object(monitor, "_click_read_aloud", return_value=True) as read,
+                    patch("live_gpt.browser.time.monotonic", return_value=100) as clock,
+                ):
+                    monitor._poll_active_response(state)
+                    self.assertIs(state.active_response, response)
+                    self.assertEqual(response.last_text, "Reply")
+                    self.assertIsNone(response.completion_candidate_at)
+                    self.assertEqual(finished, [])
+                    self.assertEqual(voice_updates, [])
+                    clock.return_value = 101
+                    monitor._poll_active_response(state)
+                    self.assertIs(state.active_response, response)
+                    read.assert_not_called()
+                    clock.return_value = 103.1
+                    monitor._poll_active_response(state)
+                self.assertIsNone(state.active_response)
+                self.assertEqual(read.call_count, int(browser_voice))
+                if not browser_voice:
+                    self.assertEqual(voice_updates, [("Reply", True)])
+
+    def test_missing_turn_preserves_text_and_response_deadline(self):
+        monitor = BrowserMonitor()
+        monitor.set_use_browser_voice(False)
+        response = _ActiveResponse(
+            page=Mock(), turn_marker_before="old", started_at=0,
+            last_text="Partial reply", completion_candidate_at=10,
+        )
+        state = _MonitorState(active_response=response)
+        finished, changes = [], []
+        monitor.response_finished.connect(lambda *args: finished.append(args))
+        monitor.response_changed.connect(lambda *args: changes.append(args))
+        with (
+            patch.object(monitor, "_response_snapshot", return_value=
+                         _ResponseSnapshot(False, False, False, "", "Waiting")) as snapshot,
+            patch("live_gpt.browser.time.monotonic", return_value=599) as clock,
+        ):
+            monitor._poll_active_response(state)
+            self.assertEqual(response.last_text, "Partial reply")
+            self.assertEqual(changes, [])
+            self.assertIsNone(response.completion_candidate_at)
+            clock.return_value = 600
+            monitor._poll_active_response(state)
+            snapshot.assert_called_once()
+        self.assertIsNone(state.active_response)
+        self.assertEqual(finished, [(False, "Timed out while waiting for ChatGPT's reply")])
+
+    def test_non_timeout_response_error_still_fails(self):
+        monitor = BrowserMonitor()
+        state = _MonitorState(active_response=_ActiveResponse(page=Mock(), turn_marker_before=None))
+        finished = []
+        monitor.response_finished.connect(lambda *args: finished.append(args))
+        with patch.object(monitor, "_response_snapshot", side_effect=RuntimeError("Page closed")):
+            monitor._poll_active_response(state)
+        self.assertIsNone(state.active_response)
+        self.assertEqual(finished, [(False, "Could not read ChatGPT's reply: Page closed")])
+
     def test_response_snapshot_keeps_named_http_links_without_changing_text(self):
         turn = Mock()
         turn.get_attribute.return_value = "new-turn"
@@ -918,7 +996,7 @@ class BrowserMonitorTests(unittest.TestCase):
         turn = Mock()
         turn.inner_text.return_value = "Visible assistant reply"
         turn.get_attribute.side_effect = (
-            lambda attribute: "new-turn"
+            lambda attribute, **kwargs: "new-turn"
             if attribute == "data-turn-id"
             else "conversation-turn-6"
         )

@@ -38,6 +38,27 @@ CHATGPT_COMPOSER_SELECTOR = (
     '#prompt-textarea[contenteditable="true"]:visible, '
     'textarea[name="prompt-textarea"]:visible'
 )
+
+
+def _label_selectors(element: str, *labels: str) -> str:
+    """Match localized controls when ChatGPT exposes no stable test ID."""
+    return ", ".join(f'{element}[aria-label="{label}"]' for label in labels)
+
+
+MORE_ACTIONS_SELECTOR = _label_selectors(
+    "button", "More actions", "更多操作"
+)
+READ_ALOUD_SELECTOR = (
+    'button[data-testid="voice-play-turn-action-button"], '
+    + _label_selectors("button", "Read aloud", "朗读", "朗讀")
+)
+READ_ALOUD_MENU_SELECTOR = ", ".join(
+    # Menu text lives in nested spans/divs; text-is on the role element
+    # misses it. Filter visibility before .last to exclude stale menus.
+    f'[role="{role}"]:visible:has-text("{label}")'
+    for role in ("menuitem", "menuitemradio")
+    for label in ("Read aloud", "朗读", "朗讀")
+)
 DICTATION_RESULT_TIMEOUT_MS = 20_000
 DICTATION_RESULT_POLL_INTERVAL_MS = 200
 DICTATION_RESULT_POLL_COUNT = (
@@ -52,6 +73,11 @@ DICTATION_END_SELECTORS = (
     'button[data-testid="composer-dictation-done-button"]',
     'button[data-testid="dictation-done-button"]',
     'button:text-is("Done")',
+    _label_selectors(
+        "button", "提交听写", "提交聽寫", "完成", "停止听写", "停止聽寫",
+        "结束听写", "結束聽寫", "停止录音", "停止錄音",
+    ),
+    'form button:text-is("完成")',
 )
 DICTATION_CANCEL_SELECTORS = (
     'button[aria-label="Cancel dictation"]',
@@ -62,6 +88,10 @@ DICTATION_CANCEL_SELECTORS = (
     'button[data-testid="dictation-cancel-button"]',
     'button[data-testid*="dictation"][data-testid*="cancel"]',
     'form button:text-is("Cancel")',
+    _label_selectors(
+        "button", "取消听写", "取消聽寫", "取消录音", "取消錄音"
+    ),
+    'form button:text-is("取消")',
 )
 _MEDIA_TRACKER_SCRIPT = """
 () => {
@@ -769,8 +799,20 @@ class BrowserMonitor(QThread):
             self.send_finished.emit(True, request.text, "Sent to ChatGPT")
 
     def _poll_active_response(self, state: _MonitorState) -> None:
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
         response = state.active_response
         if response is None:
+            return
+
+        # Apply the deadline even when every DOM read fails or the virtualized
+        # turn stays unmounted. Transient failures must not extend it forever.
+        now = time.monotonic()
+        if now - response.started_at >= 600:
+            if not self._use_browser_voice and response.last_text:
+                self.local_voice_updated.emit(response.last_text, True)
+            self.response_finished.emit(False, "Timed out while waiting for ChatGPT's reply")
+            state.active_response = None
             return
 
         try:
@@ -778,6 +820,12 @@ class BrowserMonitor(QThread):
                 response.page,
                 response.turn_marker_before,
             )
+        except PlaywrightTimeoutError:
+            # ChatGPT can replace/unmount the turn between locator calls.
+            # Keep the last text and retry on the next worker-loop poll.
+            response.completion_candidate_at = None
+            logger.debug("ChatGPT response DOM read timed out; retrying next poll")
+            return
         except Exception as error:
             logger.error("Unable to read the ChatGPT response", error)
             if not self._use_browser_voice and response.last_text:
@@ -789,7 +837,10 @@ class BrowserMonitor(QThread):
             state.active_response = None
             return
 
-        now = time.monotonic()
+        if not snapshot.has_new_turn:
+            response.completion_candidate_at = None
+            return
+
         text_changed = snapshot.text != response.last_text
         if text_changed:
             logger.debug(
@@ -841,14 +892,6 @@ class BrowserMonitor(QThread):
             and response_age >= 2.0
         )
         if not is_complete:
-            if response_age >= 600:
-                if not self._use_browser_voice and response.last_text:
-                    self.local_voice_updated.emit(response.last_text, True)
-                self.response_finished.emit(
-                    False,
-                    "Timed out while waiting for ChatGPT's reply",
-                )
-                state.active_response = None
             return
 
         if not self._use_browser_voice:
@@ -1040,6 +1083,11 @@ class BrowserMonitor(QThread):
             'button[aria-label="Remove file"], '
             'button[aria-label="Remove attachment"], '
             'button[aria-label="Remove image"], '
+            + _label_selectors(
+                "button", "移除文件", "删除文件", "移除附件", "删除附件",
+                "移除图片", "删除图片", "移除檔案", "刪除檔案",
+                "刪除附件", "移除圖片", "刪除圖片",
+            ) + ', '
             'button[data-testid*="remove"][data-testid*="file"], '
             'button[data-testid*="remove"][data-testid*="attachment"]'
         )
@@ -1097,6 +1145,7 @@ class BrowserMonitor(QThread):
             page,
             (
                 'button[aria-label="Start dictation"]',
+                _label_selectors("button", "开始听写", "開始聽寫"),
                 'button[data-testid="composer-speech-button"]',
                 'button[data-testid="dictation-button"]',
             ),
@@ -1268,7 +1317,7 @@ class BrowserMonitor(QThread):
         turn_count = int(turns.count())
         stop_button = page.locator(
             'button[data-testid="stop-button"], '
-            'button[aria-label="Stop generating"]'
+            + _label_selectors("button", "Stop generating", "停止生成", "停止產生")
         ).first
         is_generating = cls._locator_is_visible(stop_button)
 
@@ -1283,8 +1332,8 @@ class BrowserMonitor(QThread):
 
         turn = turns.last
         turn_marker = (
-            turn.get_attribute("data-turn-id")
-            or turn.get_attribute("data-testid")
+            turn.get_attribute("data-turn-id", timeout=1_000)
+            or turn.get_attribute("data-testid", timeout=1_000)
         )
         if turn_marker == turn_marker_before:
             return _ResponseSnapshot(
@@ -1305,8 +1354,9 @@ class BrowserMonitor(QThread):
             else cls._response_text_from_turn(turn_text)
         )
         completion_controls = turn.locator(
-            'button[aria-label="Copy response"], '
-            'button[aria-label="More actions"]'
+            'button[data-testid="copy-turn-action-button"], '
+            + _label_selectors("button", "Copy response", "复制回复", "複製回覆")
+            + ', ' + MORE_ACTIONS_SELECTOR
         )
         anchors = turn.locator("a[href]").evaluate_all(
             "elements => elements.map(a => [a.innerText, a.href])"
@@ -1332,6 +1382,16 @@ class BrowserMonitor(QThread):
             "share",
             "switch model",
             "more actions",
+            "chatgpt 说：",
+            "chatgpt 說：",
+            "复制回复",
+            "複製回覆",
+            "评价回复",
+            "評價回覆",
+            "分享",
+            "切换模型",
+            "切換模型",
+            "更多操作",
         }
         lines = [
             line
@@ -1351,6 +1411,8 @@ class BrowserMonitor(QThread):
                     '[data-testid="webpage-citation-card"]',
                     '[data-content-reference-start]',
                     'button[aria-label="Copy table"]',
+                    'button[aria-label="复制表格"]',
+                    'button[aria-label="複製表格"]',
                     'svg',
                     '.sr-only'
                 ].join(',')).forEach(item => item.remove());
@@ -1374,6 +1436,8 @@ class BrowserMonitor(QThread):
             "reading",
             "analyzing",
             "thinking",
+            "搜索", "搜尋", "浏览", "瀏覽", "查找",
+            "阅读", "閱讀", "分析", "思考",
         )
         for line in turn_text.splitlines():
             label = line.strip()
@@ -1470,10 +1534,7 @@ class BrowserMonitor(QThread):
                 f"turn_count={turn_count} turn_marker={turn_marker!r}"
             )
 
-            direct_buttons = turn.locator(
-                'button[data-testid="voice-play-turn-action-button"], '
-                'button[aria-label="Read aloud"]'
-            )
+            direct_buttons = turn.locator(READ_ALOUD_SELECTOR)
             direct_count = int(direct_buttons.count())
             direct_button = direct_buttons.last
             direct_visible = (
@@ -1492,9 +1553,7 @@ class BrowserMonitor(QThread):
                 )
                 click_path = "direct"
             else:
-                more_action_buttons = turn.locator(
-                    'button[aria-label="More actions"]'
-                )
+                more_action_buttons = turn.locator(MORE_ACTIONS_SELECTOR)
                 more_count = int(more_action_buttons.count())
                 more_actions = more_action_buttons.last
                 more_visible = (
@@ -1515,10 +1574,7 @@ class BrowserMonitor(QThread):
                     "More actions",
                     expanded_control=True,
                 )
-                read_aloud = page.locator(
-                    '[role="menuitem"]:has-text("Read aloud"), '
-                    '[role="menuitemradio"]:has-text("Read aloud")'
-                ).last
+                read_aloud = page.locator(READ_ALOUD_MENU_SELECTOR).last
                 try:
                     read_aloud.wait_for(state="visible", timeout=5_000)
                 except Exception:
