@@ -62,7 +62,7 @@ class LocalSpeechThreadTests(unittest.TestCase):
         )
         worker = _LocalSpeechThread(
             manager,
-            "qwen3_tts_0_6b_custom_voice",
+            "test-model",
             "First. Second.",
             "Ryan",
         )
@@ -80,14 +80,14 @@ class LocalSpeechThreadTests(unittest.TestCase):
             worker.run()
 
         manager.synthesize_stream.assert_called_once_with(
-            "qwen3_tts_0_6b_custom_voice",
+            "test-model",
             "First. Second.",
             "Ryan",
-            "Auto",
+            "auto",
         )
         manager.synthesize.assert_not_called()
         self.assertEqual(len(writes), 2)
-        self.assertEqual(started, ["Playing with streaming Qwen3-TTS…"])
+        self.assertEqual(started, ["Playing with streaming local TTS…"])
         self.assertEqual(progress[-1], {"text": "First. Second.", "fraction": 1.0})
         self.assertTrue(completed[0][0])
         self.assertIn("First audio in", completed[0][1])
@@ -139,7 +139,7 @@ class LocalSpeechThreadTests(unittest.TestCase):
             ([0.0, 1.0, 0.0], 1, ""),
             ([], 1, "test"),
         )
-        worker = _LocalSpeechThread(manager, "cosy", "test")
+        worker = _LocalSpeechThread(manager, "test-model", "test")
 
         with patch.dict(
             "sys.modules",
@@ -346,6 +346,42 @@ class TranscriptEditorTests(unittest.TestCase):
 
 
 class SettingsDialogTests(unittest.TestCase):
+    def test_sovits_pair_blocks_incomplete_settings_and_saves_both(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = Config(root / "config.json")
+            ckpt, pth = root / "voice.ckpt", root / "voice.pth"
+            ckpt.touch()
+            pth.touch()
+            dialog = HotkeyConfigDialog("Right Alt", playing_backend="sovits", config=config)
+            try:
+                dialog.sovits_ckpt_edit.setText(str(ckpt))
+                self.assertFalse(dialog.voice_play_button.isEnabled())
+                self.assertFalse(dialog.playing_check_button.isEnabled())
+                self.assertEqual(config["sovits_ckpt_path"], "")
+                with patch("live_gpt.app._LocalSpeechThread") as worker:
+                    dialog._start_voice_play_test()
+                    worker.assert_not_called()
+                dialog.sovits_pth_edit.setText(str(pth))
+                self.assertTrue(dialog.voice_play_button.isEnabled())
+                saved = Config(config.path)
+                self.assertEqual(saved["sovits_ckpt_path"], str(ckpt))
+                self.assertEqual(saved["sovits_pth_path"], str(pth))
+                provider = dialog._voice_provider("tts")
+                self.assertEqual(provider.ckpt_path, str(ckpt.resolve()))
+                self.assertEqual(provider.pth_path, str(pth.resolve()))
+                dialog.sovits_ckpt_edit.clear()
+                self.assertFalse(dialog.voice_play_button.isEnabled())
+                dialog.sovits_pth_edit.clear()
+                self.assertTrue(dialog.voice_play_button.isEnabled())
+                self.assertEqual(config["sovits_ckpt_path"], "")
+                self.assertEqual(config["sovits_pth_path"], "")
+                dialog._voice_status_checked["tts"] = True
+                dialog._set_voice_busy(False)
+                self.assertTrue(dialog._voice_status_checked["tts"])
+            finally:
+                dialog.close()
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.application = QApplication.instance() or QApplication([])
@@ -428,26 +464,10 @@ class SettingsDialogTests(unittest.TestCase):
             dialog.playing_nav_button.click()
             self.assertEqual(dialog.settings_pages.currentIndex(), 3)
             self.assertEqual(dialog.playing_backend(), "web")
-            self.assertEqual(dialog.playing_backend_combo.count(), 4)
-            self.assertEqual(dialog.tts_model_combo.count(), 2)
-            self.assertEqual(dialog.tts_language_combo.count(), 11)
-            self.assertEqual(dialog.tts_language(), "Auto")
-            self.assertEqual(dialog.qwen_model_source_combo.count(), 2)
-            self.assertEqual(dialog.qwen_model_source(), "huggingface")
-            qwen_layout = dialog.playing_qwen_card.layout()
-            model_index = qwen_layout.indexOf(dialog.tts_model_combo)
-            download_row = qwen_layout.itemAt(model_index + 1).layout()
-            self.assertIs(
-                download_row.itemAt(0).widget(),
-                dialog.qwen_model_source_combo,
-            )
-            self.assertIs(
-                download_row.itemAt(1).widget(),
-                dialog.tts_download_button,
-            )
+            self.assertEqual(dialog.playing_backend_combo.count(), 2)
             self.assertEqual(dialog.voice_record_button.text(), "Record microphone")
             self.assertEqual(dialog.voice_play_button.text(), "Play text")
-            self.assertTrue(dialog.playing_qwen_card.isHidden())
+            self.assertTrue(dialog.playing_local_card.isHidden())
             self.assertTrue(dialog.recording_install_log.isHidden())
             self.assertTrue(dialog.playing_install_log.isHidden())
             self.assertEqual(dialog.recording_pypi_mirror_combo.count(), 3)
@@ -509,64 +529,6 @@ class SettingsDialogTests(unittest.TestCase):
         finally:
             chinese_dialog.close()
 
-        local_dialog = HotkeyConfigDialog(
-            QKeySequence("CapsLock"),
-            QKeySequence("Ctrl+S"),
-            QKeySequence("Ctrl+D"),
-            recording_backend="sherpa",
-            playing_backend="qwen",
-            stt_model="en_moonshine_tiny_int8",
-            tts_model="qwen3_tts_1_7b_custom_voice",
-            tts_speaker="Ryan",
-            tts_language="English",
-            pypi_mirror="ali",
-            qwen_model_source="modelscope",
-        )
-        try:
-            self.assertEqual(local_dialog.recording_backend(), "sherpa")
-            self.assertEqual(local_dialog.playing_backend(), "qwen")
-            self.assertEqual(local_dialog.stt_model(), "en_moonshine_tiny_int8")
-            self.assertEqual(
-                local_dialog.tts_model(), "qwen3_tts_1_7b_custom_voice"
-            )
-            self.assertEqual(local_dialog.tts_speaker(), "Ryan")
-            self.assertEqual(local_dialog.tts_language(), "English")
-            self.assertEqual(local_dialog.pypi_mirror(), "ali")
-            self.assertEqual(local_dialog.qwen_model_source(), "modelscope")
-            self.assertFalse(local_dialog.recording_sherpa_card.isHidden())
-            self.assertFalse(local_dialog.playing_qwen_card.isHidden())
-        finally:
-            local_dialog.close()
-
-        cosy_dialog = HotkeyConfigDialog(
-            QKeySequence("CapsLock"),
-            QKeySequence("Ctrl+S"),
-            QKeySequence("Ctrl+D"),
-            playing_backend="cosyvoice",
-            cosyvoice_model_source="modelscope",
-            cosyvoice_prompt_audio="E:/voices/reference.wav",
-            cosyvoice_prompt_text="My reference transcript",
-        )
-        try:
-            self.assertEqual(cosy_dialog.playing_backend(), "cosyvoice")
-            self.assertFalse(cosy_dialog.playing_qwen_card.isHidden())
-            self.assertFalse(cosy_dialog.cosyvoice_model_combo.isHidden())
-            self.assertTrue(cosy_dialog.tts_model_combo.isHidden())
-            self.assertEqual(
-                cosy_dialog.cosyvoice_model(), "fun_cosyvoice3_0_5b_2512"
-            )
-            self.assertEqual(cosy_dialog.cosyvoice_model_source(), "modelscope")
-            self.assertEqual(
-                cosy_dialog.cosyvoice_prompt_audio(),
-                "E:/voices/reference.wav",
-            )
-            self.assertEqual(
-                cosy_dialog.cosyvoice_prompt_text(),
-                "My reference transcript",
-            )
-        finally:
-            cosy_dialog.close()
-
         sovits_dialog = HotkeyConfigDialog(
             QKeySequence("CapsLock"),
             QKeySequence("Ctrl+S"),
@@ -594,7 +556,7 @@ class SettingsDialogTests(unittest.TestCase):
                 sovits_dialog.sovits_text_lang_label.text(),
                 "Output language",
             )
-            layout = sovits_dialog.playing_qwen_card.layout()
+            layout = sovits_dialog.playing_local_card.layout()
             self.assertLess(
                 layout.indexOf(sovits_dialog.sovits_reference_title),
                 layout.indexOf(sovits_dialog.sovits_output_title),
@@ -635,7 +597,7 @@ class SettingsDialogTests(unittest.TestCase):
                     dialog.recording_backend_combo.findData("sherpa")
                 )
                 dialog.playing_backend_combo.setCurrentIndex(
-                    dialog.playing_backend_combo.findData("qwen")
+                    dialog.playing_backend_combo.findData("sovits")
                 )
                 dialog.playing_pypi_mirror_combo.setCurrentIndex(
                     dialog.playing_pypi_mirror_combo.findData("ali")
@@ -648,53 +610,15 @@ class SettingsDialogTests(unittest.TestCase):
                 dialog.stt_model_combo.setCurrentIndex(
                     dialog.stt_model_combo.findData("en_moonshine_tiny_int8")
                 )
-                dialog.tts_model_combo.setCurrentIndex(
-                    dialog.tts_model_combo.findData(
-                        "qwen3_tts_1_7b_custom_voice"
-                    )
-                )
-                dialog.tts_speaker_combo.setCurrentIndex(
-                    dialog.tts_speaker_combo.findData("Ryan")
-                )
-                dialog.tts_language_combo.setCurrentIndex(
-                    dialog.tts_language_combo.findData("English")
-                )
-                dialog.qwen_model_source_combo.setCurrentIndex(
-                    dialog.qwen_model_source_combo.findData("modelscope")
-                )
-                dialog.cosyvoice_model_source_combo.setCurrentIndex(
-                    dialog.cosyvoice_model_source_combo.findData("modelscope")
-                )
-                dialog.cosyvoice_prompt_audio_edit.setText(
-                    "E:/voices/reference.wav"
-                )
-                dialog.cosyvoice_prompt_text_edit.setText("Reference transcript")
                 dialog.hold_without_screenshot_edit.setKeySequence("Right Ctrl+S")
 
                 saved = json.loads(path.read_text(encoding="utf-8"))
                 self.assertEqual(saved["language"], "zh")
                 self.assertEqual(saved["recording_backend"], "sherpa")
-                self.assertEqual(saved["playing_backend"], "qwen")
+                self.assertEqual(saved["playing_backend"], "sovits")
                 self.assertEqual(saved["pypi_mirror"], "ali")
                 self.assertEqual(saved["stt_language"], "en")
                 self.assertEqual(saved["stt_model"], "en_moonshine_tiny_int8")
-                self.assertEqual(
-                    saved["tts_model"], "qwen3_tts_1_7b_custom_voice"
-                )
-                self.assertEqual(saved["tts_speaker"], "Ryan")
-                self.assertEqual(saved["tts_language"], "English")
-                self.assertEqual(saved["qwen_model_source"], "modelscope")
-                self.assertEqual(
-                    saved["cosyvoice_model_source"], "modelscope"
-                )
-                self.assertEqual(
-                    saved["cosyvoice_prompt_audio"],
-                    "E:/voices/reference.wav",
-                )
-                self.assertEqual(
-                    saved["cosyvoice_prompt_text"], "Reference transcript"
-                )
-                self.assertEqual(saved["hotkey_hold_without_screenshot"], "Right Ctrl+S")
             finally:
                 dialog.close()
 
@@ -716,45 +640,49 @@ class TrayControllerBrowserTests(unittest.TestCase):
             "en_moonshine_tiny_int8", "en"
         )
 
-    def test_qwen_model_preloads_in_background_when_selected(self) -> None:
+    def test_sovits_model_preloads_in_background_when_selected(self) -> None:
         controller = TrayController.__new__(TrayController)
         controller.config = {
-            "playing_backend": "qwen",
-            "tts_model": "qwen3_tts_0_6b_custom_voice",
-            "qwen_model_source": "huggingface",
+            "playing_backend": "sovits",
+            "sovits_installation": "test-model",
+            "sovits_prompt_text": "", "sovits_prompt_lang": "auto",
+            "sovits_ref_audio_path": "", "sovits_text_lang": "auto",
+            "sovits_ckpt_path": "", "sovits_pth_path": "",
         }
-        controller.tts_manager = Mock()
-        controller.tts_manager.dependency_status.return_value = (
+        controller.sovits_manager = Mock()
+        controller.sovits_manager.dependency_status.return_value = (
             True,
             "runtime verified",
         )
-        controller._qwen_preload_thread = None
+        controller._local_tts_preload_thread = None
 
-        controller._start_qwen_preload()
-        controller._qwen_preload_thread.join(timeout=2)
+        controller._start_local_tts_preload()
+        controller._local_tts_preload_thread.join(timeout=2)
 
-        controller.tts_manager.preload.assert_called_once_with(
-            "qwen3_tts_0_6b_custom_voice"
+        controller.sovits_manager.preload.assert_called_once_with(
+            "test-model"
         )
 
-    def test_invalid_qwen_runtime_is_not_preloaded_or_locked(self) -> None:
+    def test_invalid_sovits_runtime_is_not_preloaded_or_locked(self) -> None:
         controller = TrayController.__new__(TrayController)
         controller.config = {
-            "playing_backend": "qwen",
-            "tts_model": "qwen3_tts_0_6b_custom_voice",
-            "qwen_model_source": "huggingface",
+            "playing_backend": "sovits",
+            "sovits_installation": "test-model",
+            "sovits_prompt_text": "", "sovits_prompt_lang": "auto",
+            "sovits_ref_audio_path": "", "sovits_text_lang": "auto",
+            "sovits_ckpt_path": "", "sovits_pth_path": "",
         }
-        controller.tts_manager = Mock()
-        controller.tts_manager.dependency_status.return_value = (
+        controller.sovits_manager = Mock()
+        controller.sovits_manager.dependency_status.return_value = (
             False,
             "torch is not installed",
         )
-        controller._qwen_preload_thread = None
+        controller._local_tts_preload_thread = None
 
-        controller._start_qwen_preload()
-        controller._qwen_preload_thread.join(timeout=2)
+        controller._start_local_tts_preload()
+        controller._local_tts_preload_thread.join(timeout=2)
 
-        controller.tts_manager.preload.assert_not_called()
+        controller.sovits_manager.preload.assert_not_called()
 
     def test_overlay_is_fifty_percent_wider(self) -> None:
         window = OverlayWindow()

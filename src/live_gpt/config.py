@@ -29,17 +29,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "recording_backend": "web",
     "playing_backend": "web",
     "pypi_mirror": "default",
-    "qwen_model_source": "huggingface",
-    "cosyvoice_model_source": "huggingface",
     "stt_language": "zh",
     "stt_model": "zh_zipformer_ctc_int8_2025_07_03",
-    "tts_model": "qwen3_tts_0_6b_custom_voice",
-    "tts_speaker": "Vivian",
-    "tts_language": "Auto",
-    "cosyvoice_model": "fun_cosyvoice3_0_5b_2512",
-    "cosyvoice_prompt_audio": "",
-    "cosyvoice_prompt_text": "",
     "sovits_installation": "",
+    "sovits_ckpt_path": "",
+    "sovits_pth_path": "",
     "sovits_text_lang": "auto",
     "sovits_ref_audio_path": "",
     "sovits_prompt_text": "",
@@ -83,13 +77,9 @@ def _valid_value(key: str, value: Any, default: Any) -> bool:
     if key == "recording_backend":
         return value in ("web", "sherpa")
     if key == "playing_backend":
-        return value in ("web", "qwen", "cosyvoice", "sovits")
+        return value in ("web", "sovits")
     if key == "pypi_mirror":
         return value in ("default", "ali", "sjtug")
-    if key == "qwen_model_source":
-        return value in ("huggingface", "modelscope")
-    if key == "cosyvoice_model_source":
-        return value in ("huggingface", "modelscope")
     if key == "stt_language":
         return value in ("auto", "zh", "en")
     if key == "stt_model":
@@ -105,39 +95,6 @@ def _valid_value(key: str, value: Any, default: Any) -> bool:
             "en_moonshine_base_int8",
             "en_paraformer_int8",
         )
-    if key == "tts_model":
-        return value in (
-            "qwen3_tts_0_6b_custom_voice",
-            "qwen3_tts_1_7b_custom_voice",
-        )
-    if key == "tts_speaker":
-        return value in (
-            "Vivian",
-            "Serena",
-            "Uncle_Fu",
-            "Dylan",
-            "Eric",
-            "Ryan",
-            "Aiden",
-            "Ono_Anna",
-            "Sohee",
-        )
-    if key == "tts_language":
-        return value in (
-            "Auto",
-            "Chinese",
-            "English",
-            "Japanese",
-            "Korean",
-            "German",
-            "French",
-            "Russian",
-            "Portuguese",
-            "Spanish",
-            "Italian",
-        )
-    if key == "cosyvoice_model":
-        return value == "fun_cosyvoice3_0_5b_2512"
     if key in ("sovits_text_lang", "sovits_prompt_lang"):
         return value in (
             "auto", "auto_yue", "zh", "en", "ja", "yue", "ko",
@@ -188,12 +145,12 @@ class Config(dict[str, Any]):
             loaded.setdefault("recording_backend", legacy_backend)
             loaded.setdefault(
                 "playing_backend",
-                "qwen" if legacy_backend == "sherpa" else "web",
+                "web",
             )
             migrated = True
         if isinstance(loaded, dict) and loaded.get("playing_backend") == "sherpa":
             loaded = dict(loaded)
-            loaded["playing_backend"] = "qwen"
+            loaded["playing_backend"] = "web"
             migrated = True
         verified, modified = self._verify(loaded)
         dict.__init__(self, verified)
@@ -234,6 +191,10 @@ class Config(dict[str, Any]):
                     if verified["stt_language"] in candidate.supported_languages
                 )
                 modified = True
+        if bool(verified.get("sovits_ckpt_path", "").strip()) != bool(verified.get("sovits_pth_path", "").strip()):
+            verified["sovits_ckpt_path"] = ""
+            verified["sovits_pth_path"] = ""
+            modified = True
         return verified, modified
 
     def save_file(self) -> None:
@@ -253,6 +214,9 @@ class Config(dict[str, Any]):
                 pass
 
     def __setitem__(self, key: str, value: Any) -> None:
+        if key in ("sovits_ckpt_path", "sovits_pth_path"):
+            self.update({key: value})
+            return
         if key not in self.default:
             logger.warning(f"Ignoring unknown config key {key!r}")
             return
@@ -266,6 +230,14 @@ class Config(dict[str, Any]):
 
     def update(self, *args: Any, **kwargs: Any) -> None:
         updates = dict(*args, **kwargs)
+        weight_keys = ("sovits_ckpt_path", "sovits_pth_path")
+        if any(key in updates for key in weight_keys):
+            pair = [updates.get(key, self.get(key, "")) for key in weight_keys]
+            if (not all(isinstance(value, str) for value in pair)
+                    or bool(pair[0].strip()) != bool(pair[1].strip())):
+                logger.warning("Ignoring incomplete GPT-SoVITS model paths; set both or neither")
+                for key in weight_keys:
+                    updates.pop(key, None)
         changed = False
         for key, value in updates.items():
             if key not in self.default:

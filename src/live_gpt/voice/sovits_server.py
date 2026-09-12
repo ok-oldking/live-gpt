@@ -32,11 +32,22 @@ parser.add_argument("--port", type=int, required=True)
 parser.add_argument(
     "--config", default="GPT_SoVITS/configs/tts_infer.yaml"
 )
+parser.add_argument("--ckpt", default="")
+parser.add_argument("--pth", default="")
 args = parser.parse_args()
+if bool(args.ckpt) != bool(args.pth):
+    parser.error("--ckpt and --pth must both be supplied or both omitted")
+for value, extension in ((args.ckpt, ".ckpt"), (args.pth, ".pth")):
+    if value and (not value.lower().endswith(extension) or not os.path.isfile(value)):
+        parser.error(f"Expected an existing {extension} model file: {value}")
 
 # Construction loads and retains all model weights. TTS itself retains the
 # semantic prompt and reference spectrogram when the same reference is reused.
-pipeline = TTS(TTS_Config(args.config))
+config = TTS_Config(args.config)
+if args.ckpt:
+    config.t2s_weights_path = os.path.abspath(args.ckpt)
+    config.vits_weights_path = os.path.abspath(args.pth)
+pipeline = TTS(config)
 pipeline_lock = threading.Lock()
 app = FastAPI()
 

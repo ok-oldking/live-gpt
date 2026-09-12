@@ -27,6 +27,39 @@ class BrowserLocalizationTests(unittest.TestCase):
         self.page = self.browser.new_page()
         self.addCleanup(self.page.close)
 
+    def test_send_uses_active_chinese_composer_and_waits_until_enabled(self):
+        for attribute in ('data-testid="send-button"', 'id="composer-submit-button"'):
+            with self.subTest(attribute=attribute):
+                self.page.set_content(f'''
+                    <form hidden onsubmit="window.wrongSent=true; return false">
+                        <div id="prompt-textarea" contenteditable="true"></div>
+                        <button data-testid="send-button" type="submit">发送</button>
+                    </form>
+                    <form onsubmit="window.wrongSent=true; return false">
+                        <button data-testid="send-button" type="submit">Other form</button>
+                    </form>
+                    <div role="dialog">
+                      <form onsubmit="window.sentText=document.querySelector('#active').innerText;
+                                      window.sendCount++; return false">
+                        <div data-composer-surface="true">
+                          <div id="active" contenteditable="true" role="textbox" oninput="
+                            setTimeout(() => document.querySelector('#real-send').removeAttribute('aria-disabled'), 100)"></div>
+                        </div>
+                        <div hidden><button type="submit" data-testid="send-button">Hidden copy</button></div>
+                        <span id="real-send" aria-disabled="true">
+                          <button {attribute} type="submit" aria-label="发送提示">发送</button>
+                        </span>
+                        <button type="button" aria-label="启动语音功能"
+                                onclick="window.wrongSent=true">语音</button>
+                      </form>
+                    </div>
+                ''')
+                self.page.evaluate("window.wrongSent=false; window.sendCount=0; window.sentText=''")
+                BrowserMonitor._send_to_chatgpt_page(self.page, "请读这条消息", preserve_attachments=True)
+                self.assertEqual(self.page.evaluate("window.sentText"), "请读这条消息")
+                self.assertEqual(self.page.evaluate("window.sendCount"), 1)
+                self.assertFalse(self.page.evaluate("window.wrongSent"))
+
     def test_completion_and_read_aloud_menu_in_each_language(self):
         for copy, more, read in (
             ("Copy response", "More actions", "Read aloud"),

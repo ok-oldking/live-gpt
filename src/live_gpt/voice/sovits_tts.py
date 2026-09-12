@@ -31,6 +31,8 @@ class SovitsTtsProvider:
     def __init__(self) -> None:
         self.prompt_text = ""
         self.prompt_lang = "auto"
+        self._weights = ("", "")
+        self._server_weights: tuple[str, str] | None = None
         self._process: subprocess.Popen[bytes] | None = None
         self._installation: Path | None = None
         self._server_installation: Path | None = None
@@ -38,9 +40,38 @@ class SovitsTtsProvider:
         self._lock = threading.RLock()
         atexit.register(self.close)
 
-    def configure(self, prompt_text: str = "", prompt_lang: str = "auto") -> None:
+    @staticmethod
+    def validate_weights(ckpt_path: str, pth_path: str) -> tuple[str, str]:
+        paths = (ckpt_path.strip(), pth_path.strip())
+        if bool(paths[0]) != bool(paths[1]):
+            raise ValueError("Select both the .ckpt and .pth model files, or leave both blank")
+        if not paths[0]:
+            return "", ""
+        resolved = []
+        for value, extension in zip(paths, (".ckpt", ".pth")):
+            path = Path(value).expanduser().resolve()
+            if path.suffix.lower() != extension:
+                raise ValueError(f"Expected a {extension} model file: {value}")
+            if not path.is_file():
+                raise ValueError(f"Model file does not exist: {value}")
+            resolved.append(str(path))
+        return resolved[0], resolved[1]
+
+    def configure(self, prompt_text: str = "", prompt_lang: str = "auto",
+                  ckpt_path: str = "", pth_path: str = "") -> None:
+        weights = self.validate_weights(ckpt_path, pth_path)
         self.prompt_text = prompt_text.strip()
         self.prompt_lang = prompt_lang.lower()
+        # Update the pair together without blocking the UI on server warmup.
+        self._weights = weights
+
+    @property
+    def ckpt_path(self) -> str:
+        return self._weights[0]
+
+    @property
+    def pth_path(self) -> str:
+        return self._weights[1]
 
     @staticmethod
     def _paths(installation: str | Path) -> tuple[Path, Path, Path]:
@@ -92,10 +123,12 @@ class SovitsTtsProvider:
     def _ensure_server(self, installation: str) -> None:
         root, python, config = self._paths(installation)
         with self._lock:
+            weights = self.validate_weights(*self._weights)
             if (
                 self._process is not None
                 and self._process.poll() is None
                 and self._server_installation == root
+                and self._server_weights == weights
             ):
                 self._health()
                 return
@@ -109,17 +142,21 @@ class SovitsTtsProvider:
             shutil.copy2(source, destination)
             self._port = self._free_port()
             creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            self._process = subprocess.Popen(
-                [
+            command = [
                     str(python), "-u", str(destination), "--port", str(self._port),
                     "--config", str(config),
-                ],
+                ]
+            if weights[0]:
+                command.extend(["--ckpt", weights[0], "--pth", weights[1]])
+            self._process = subprocess.Popen(
+                command,
                 cwd=root,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 creationflags=creationflags,
             )
             self._server_installation = root
+            self._server_weights = weights
             deadline = time.monotonic() + 180
             while time.monotonic() < deadline:
                 if self._process.poll() is not None:
@@ -139,6 +176,7 @@ class SovitsTtsProvider:
         self._process = None
         self._port = None
         self._server_installation = None
+        self._server_weights = None
         if process is not None and process.poll() is None:
             process.terminate()
             try:

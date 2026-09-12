@@ -7,6 +7,34 @@ from live_gpt.config import Config, DEFAULT_CONFIG
 
 
 class ConfigTests(unittest.TestCase):
+    def test_weight_paths_are_saved_atomically_and_incomplete_pair_is_repaired(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            config = Config(path)
+            config["sovits_ckpt_path"] = "voice.ckpt"
+            self.assertEqual(config["sovits_ckpt_path"], "")
+            config.update(sovits_ckpt_path="voice.ckpt", sovits_pth_path="voice.pth")
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual((saved["sovits_ckpt_path"], saved["sovits_pth_path"]),
+                             ("voice.ckpt", "voice.pth"))
+            config["sovits_pth_path"] = ""
+            self.assertEqual(config["sovits_pth_path"], "voice.pth")
+            config.update(sovits_ckpt_path="", sovits_pth_path="")
+            self.assertEqual(Config(path)["sovits_ckpt_path"], "")
+            saved["sovits_pth_path"] = ""
+            path.write_text(json.dumps(saved), encoding="utf-8")
+            repaired = Config(path)
+            self.assertEqual((repaired["sovits_ckpt_path"], repaired["sovits_pth_path"]), ("", ""))
+
+    def test_removed_playback_engines_migrate_to_browser(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            for engine in ("qwen", "cosyvoice"):
+                path.write_text(json.dumps({"playing_backend": engine, "tts_model": "old"}), encoding="utf-8")
+                config = Config(path)
+                self.assertEqual(config["playing_backend"], "web")
+                self.assertNotIn("tts_model", config)
+
     def test_recording_language_migration_and_model_compatibility(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"
@@ -126,16 +154,8 @@ class ConfigTests(unittest.TestCase):
             config["recording_backend"] = "sherpa"
             config["playing_backend"] = "qwen"
             config["pypi_mirror"] = "sjtug"
-            config["qwen_model_source"] = "modelscope"
             config["stt_model"] = "en_moonshine_tiny_int8"
-            config["tts_model"] = "qwen3_tts_1_7b_custom_voice"
-            config["tts_speaker"] = "Ryan"
-            config["tts_language"] = "English"
             config["playing_backend"] = "cosyvoice"
-            config["cosyvoice_model_source"] = "modelscope"
-            config["cosyvoice_model"] = "fun_cosyvoice3_0_5b_2512"
-            config["cosyvoice_prompt_audio"] = "E:/voices/reference.wav"
-            config["cosyvoice_prompt_text"] = "Reference speech"
             config["playing_backend"] = "sovits"
             config["sovits_installation"] = "E:/tts/GPT-SoVITS"
             config["sovits_text_lang"] = "zh"
@@ -145,30 +165,12 @@ class ConfigTests(unittest.TestCase):
             config["recording_backend"] = "unknown"
             config["playing_backend"] = "unknown"
             config["pypi_mirror"] = "unknown"
-            config["qwen_model_source"] = "unknown"
             config["stt_model"] = "unknown"
-            config["tts_model"] = "unknown"
-            config["tts_speaker"] = "unknown"
-            config["tts_language"] = "unknown"
 
             self.assertEqual(config["recording_backend"], "sherpa")
             self.assertEqual(config["playing_backend"], "sovits")
             self.assertEqual(config["pypi_mirror"], "sjtug")
-            self.assertEqual(config["qwen_model_source"], "modelscope")
             self.assertEqual(config["stt_model"], "en_moonshine_tiny_int8")
-            self.assertEqual(config["tts_model"], "qwen3_tts_1_7b_custom_voice")
-            self.assertEqual(config["tts_speaker"], "Ryan")
-            self.assertEqual(config["tts_language"], "English")
-            self.assertEqual(config["cosyvoice_model_source"], "modelscope")
-            self.assertEqual(
-                config["cosyvoice_model"], "fun_cosyvoice3_0_5b_2512"
-            )
-            self.assertEqual(
-                config["cosyvoice_prompt_audio"], "E:/voices/reference.wav"
-            )
-            self.assertEqual(
-                config["cosyvoice_prompt_text"], "Reference speech"
-            )
             self.assertEqual(config["sovits_installation"], "E:/tts/GPT-SoVITS")
             self.assertEqual(config["sovits_text_lang"], "zh")
             self.assertEqual(config["sovits_ref_audio_path"], "E:/voices/sovits.wav")
@@ -187,13 +189,13 @@ class ConfigTests(unittest.TestCase):
             config = Config(path)
 
             self.assertEqual(config["recording_backend"], "sherpa")
-            self.assertEqual(config["playing_backend"], "qwen")
+            self.assertEqual(config["playing_backend"], "web")
             self.assertNotIn("voice_backend", config)
             saved = json.loads(path.read_text(encoding="utf-8"))
             self.assertNotIn("voice_backend", saved)
             self.assertEqual(saved["recording_backend"], "sherpa")
 
-    def test_removed_sherpa_playback_migrates_to_qwen(self) -> None:
+    def test_removed_sherpa_playback_migrates_to_browser(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"
             old = dict(DEFAULT_CONFIG)
@@ -202,10 +204,10 @@ class ConfigTests(unittest.TestCase):
 
             config = Config(path)
 
-            self.assertEqual(config["playing_backend"], "qwen")
+            self.assertEqual(config["playing_backend"], "web")
             self.assertEqual(
                 json.loads(path.read_text(encoding="utf-8"))["playing_backend"],
-                "qwen",
+                "web",
             )
 
     def test_removed_pypi_mirror_migrates_to_default(self) -> None:

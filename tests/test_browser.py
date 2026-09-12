@@ -279,6 +279,7 @@ class BrowserMonitorTests(unittest.TestCase):
         composer_locator = Mock(first=composer)
         send_button = Mock()
         send_button_locator = Mock(first=send_button)
+        composer.locator.return_value.locator.return_value = send_button_locator
         attachment_locator = Mock()
         attachment_locator.count.return_value = 0
         previous_turn = Mock()
@@ -349,6 +350,8 @@ class BrowserMonitorTests(unittest.TestCase):
 
         page = Mock()
 
+        composer.locator.return_value.locator.return_value = Mock(first=send_button)
+
         def locate(selector: str) -> Mock:
             if selector == CHATGPT_COMPOSER_SELECTOR:
                 return Mock(first=composer)
@@ -381,6 +384,7 @@ class BrowserMonitorTests(unittest.TestCase):
     def test_preuploaded_attachment_is_preserved_when_sending(self) -> None:
         composer = Mock()
         send_button = Mock()
+        composer.locator.return_value.locator.return_value = Mock(first=send_button)
         page = Mock()
 
         def locate(selector: str) -> Mock:

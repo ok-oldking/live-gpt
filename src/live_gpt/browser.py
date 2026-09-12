@@ -1071,8 +1071,12 @@ class BrowserMonitor(QThread):
         if screenshot_webp is not None:
             cls._paste_screenshot(page, screenshot_webp)
 
-        send_button = page.locator(
-            'button[data-testid="send-button"]'
+        # Project side panes can coexist with a background composer. Resolve
+        # the submit control from the form we filled, excluding hidden copies.
+        form = composer.locator('xpath=ancestor::form[1]')
+        send_button = form.locator(
+            'button[data-testid="send-button"]:visible, '
+            'button#composer-submit-button[type="submit"]:visible'
         ).first
         send_button.wait_for(state="visible", timeout=5_000)
         send_button.click(timeout=15_000)

@@ -73,93 +73,30 @@ Chinese can be selected as a preview, but the selection does not change the UI
 yet. Every valid change is saved immediately, so the styled title-bar close
 button is the only dismissal control and there is no separate Save Changes step.
 Recording independently chooses the browser or local Sherpa-ONNX, while
-Playing independently chooses the browser or local
-[Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS), or local
-[CosyVoice 3](https://github.com/FunAudioLLM/CosyVoice), or an existing
+Playing independently chooses browser playback or an existing
 [GPT-SoVITS](https://github.com/RVC-Boss/GPT-SoVITS) installation with its
-embedded Python runtime. Local controls
-stay hidden when the corresponding web engine is selected. The STT catalog
-includes five Mandarin and five English options. Playback offers Qwen3-TTS
-CustomVoice 0.6B and 1.7B models with nine named Chinese, English, Japanese,
-and Korean speakers. CosyVoice offers the Fun-CosyVoice3 0.5B 2512 streaming
-model with zero-shot voice cloning: choose a reference WAV and enter its exact
-transcript, or leave both blank to use the official example voice. Local Qwen
-and CosyVoice playback require a detected NVIDIA GPU and are
-blocked when CUDA-enabled PyTorch is unavailable. Runtime repair installs a
-matched CUDA 12.6 PyTorch/Torchaudio build from PyTorch's NVIDIA wheel index;
-the selected PyPI mirror is added as the dependency index for that installation.
-Repair preserves matching PyTorch files so Windows never needs to overwrite a
-CUDA extension currently loaded by the running app; only missing or mismatched
-packages are changed.
-GPT-SoVITS is not installed or modified by Live GPT apart from copying
-`sovits_server.py` into the selected installation. Live GPT launches that file
-with `runtime/python.exe`, warms the configured model once, reuses GPT-SoVITS's
-reference-audio feature cache, and consumes native streaming audio. Its text
-language is configurable; reference audio, reference transcript, and prompt
-language are saved as optional settings (reference audio is required when
-synthesis is requested).
-Qwen playback generates a first natural text chunk immediately, then uses a
-two-chunk lookahead buffer while later chunks are generated concurrently with
-current audio playback. Deterministic decoding keeps the speaker timbre steadier;
-generated edge silence is trimmed and short fades soften chunk joins. Playback
-language can be selected explicitly from Qwen's ten languages or left on the
-saved Auto default. The selected local model is preloaded in a background thread
-at startup so model initialization is normally complete before the first reply
-is played. Invalid or incomplete runtimes are never preloaded, leaving their
-binary files unlocked so Install / Repair can recover them. CUDA loading enables BF16/FP16, optimized SDPA
-kernels, and TF32 where applicable. Install / Repair also installs the official
+embedded Python runtime. Local controls stay hidden when browser playback is selected.
+Old Qwen3 and CosyVoice playback selections fall back to browser playback.
 
-For every local TTS backend, Live GPT sends the first complete sentence to the
-model while ChatGPT is still generating. Later complete sentences are added to
-the same synthesis queue, generated ahead of playback, and written through one
-persistent audio stream until the final response remainder has played.
+For GPT-SoVITS, select the installation folder and reference audio, and optionally
+set the reference transcript and reference/output languages. You can provide a
+GPT `.ckpt` model and a SoVITS `.pth` model. Both paths must point to existing
+files, or both must be blank to use the installation's configured models.
+Incomplete pairs are not saved and cannot be checked or played. Changing the
+pair restarts the local server before the next synthesis; clearing both restores
+the installation defaults.
 
-Install / Repair also installs the official
-FlashAttention build prerequisites, attempts `flash-attn --no-build-isolation`
-with four build jobs, retries official PyPI when the selected mirror cannot
-provide the source package, extracts the unusually deep source tree through a
-temporary drive-root or mapped-drive path to avoid the Windows 260-character
-limit, verifies the PyPI archive's SHA-256 digest, and omits the AMD-only
-Composable Kernel subtree before the NVIDIA build. On Windows it installs and
-locates NVIDIA's CUDA 12.6 NVCC, runtime, and CCCL wheels for the build. The
-selected PyPI mirror is used first, with official PyPI as fallback. Successful
-repair also removes known
-invalid `~orch`-style pip backups left by an interrupted reinstall. If the experimental
-Windows build is unavailable, the logged error identifies the cause and Qwen
-continues with optimized SDPA.
-If CPU PyTorch was already loaded by an earlier playback attempt, restart Live
-GPT after the repair. It installs each provider's pinned runtime and related
-dependencies through the current Python interpreter only when requested,
-verifies package versions and wheel integrity, and builds local SHA-256 model
-manifests. Qwen and CosyVoice models can be downloaded from Hugging Face (the
-default) or ModelScope; each source selection is saved immediately. CosyVoice
-repair installs and integrity-checks the official recursive Git checkout,
-reuses a valid checkout on later repairs, and safely removes Windows read-only
-Git objects from old runtime backups. Models and the CosyVoice runtime are stored under
-the working directory's `models` folder and loaded from that local path.
-If the selected hub client is missing, Download installs and verifies it through
-the selected PyPI mirror before fetching the model. Installer output is
-streamed into the app log, with its latest two lines visible beneath setup
-progress. Pip's progress stream is forced on for GUI installs and rendered as
-a download-description line followed by a live bar with downloaded size,
-transfer speed, and ETA. Repeated progress samples update that bottom line in
-place. The exact pip and
-model-download commands are logged before execution. Active
-dependency installs
-and model downloads can be cancelled from the settings row; this terminates the
-child process and removes temporary model staging files.
-The install rows can use official PyPI, Aliyun, or Shanghai Jiao Tong
-University's SJTUG mirror without changing the user's global pip configuration;
-the mirror choice is shared by Recording and Playing and saved in the app
-configuration. Aliyun and SJTUG modes also download CUDA PyTorch from their
-dedicated `pytorch-wheels/cu126` mirrors. Aliyun publishes these CUDA wheels
-under plain version labels, so the installer uses `2.11.0` there instead of the
-`2.11.0+cu126` label used by the official and SJTUG indexes.
-**Record
-microphone** tests the selected STT model, and **Play text** tests the selected
-Qwen model and speaker. Offline and streaming STT models are labeled explicitly.
-Streaming recording models decode microphone chunks continuously and update the
-test transcript in real time. Each test reports its inference or generation latency.
+Live GPT copies `sovits_server.py` into the selected installation and runs it with
+`runtime/python.exe`. It preloads the model, reuses reference-audio features, and
+streams speech through one audio output. Complete sentences enter the synthesis
+queue while ChatGPT is still generating its reply.
+
+The STT catalog includes Mandarin and English models. Recording settings can
+install the Sherpa runtime and download models into the working directory's
+`models` folder. Installation supports official PyPI, Aliyun, and SJTUG without
+changing global pip settings. **Record microphone** tests transcription;
+**Play text** tests GPT-SoVITS playback.
+
 Hotkey defaults are
 **Right Alt** (record and send with the selected screenshot) and
 **Right Ctrl** (record and send without a screenshot).
@@ -180,8 +117,7 @@ Preferences are stored as JSON in `%APPDATA%\Live GPT\config.json`. The file is
 updated automatically when a preference changes and includes the language,
 hotkeys, auto-hide state, selected screenshot source, selected
 ChatGPT conversation, independent recording/playback backends, local STT/TTS
-models, Qwen/CosyVoice download sources, Qwen speaker and playback language,
-CosyVoice reference-audio path and transcript, GPT-SoVITS installation,
+models, GPT-SoVITS installation, paired model paths,
 languages, reference-audio path and transcript, overlay position
 and size, and
 position-lock state. A

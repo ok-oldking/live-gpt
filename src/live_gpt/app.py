@@ -79,16 +79,6 @@ from .screen_capture import CaptureSource, capture_webp, list_capture_sources
 from .window_focus import ForegroundWindowRestorer
 from .voice.base import ModelProvider, TextToSpeechProvider
 from .voice.dependencies import OperationCancelled, PYPI_MIRRORS
-from .voice.cosyvoice_tts import (
-    COSYVOICE_TTS_MODELS,
-    CosyVoiceTtsProvider,
-)
-from .voice.qwen_tts import (
-    MODEL_DOWNLOAD_SOURCES,
-    QwenTtsProvider,
-    TTS_LANGUAGES,
-    TTS_MODELS,
-)
 from .voice.sherpa_stt import LocalDictationSession, SherpaSttProvider, STT_MODELS
 from .voice.sovits_tts import SOVITS_LANGUAGES, SovitsTtsProvider
 
@@ -159,7 +149,6 @@ class _VoiceOperationThread(QThread):
         model_type: str = "",
         model_key: str = "",
         mirror: str = "default",
-        model_source: str = "huggingface",
     ) -> None:
         super().__init__()
         self.manager = manager
@@ -167,7 +156,6 @@ class _VoiceOperationThread(QThread):
         self.model_type = model_type
         self.model_key = model_key
         self.mirror = mirror
-        self.model_source = model_source
         self._cancel_event = threading.Event()
 
     def cancel_operation(self) -> None:
@@ -177,16 +165,9 @@ class _VoiceOperationThread(QThread):
         try:
             result: object = None
             if self.action == "status":
-                if self.model_type == "tts" and isinstance(
-                    self.manager, (QwenTtsProvider, CosyVoiceTtsProvider)
-                ):
-                    dependency_ok, dependency_message = (
-                        self.manager.dependency_status(self.model_source)
-                    )
-                else:
-                    dependency_ok, dependency_message = (
-                        self.manager.dependency_status()
-                    )
+                dependency_ok, dependency_message = (
+                    self.manager.dependency_status()
+                )
                 model_ok, model_message = self.manager.model_status(
                     self.model_type, self.model_key
                 )
@@ -194,7 +175,7 @@ class _VoiceOperationThread(QThread):
                     self.model_type == "tts"
                     and isinstance(
                         self.manager,
-                        (QwenTtsProvider, CosyVoiceTtsProvider, SovitsTtsProvider),
+                        SovitsTtsProvider,
                     )
                     and dependency_ok
                     and model_ok
@@ -213,50 +194,20 @@ class _VoiceOperationThread(QThread):
                 }
                 message = dependency_message
             elif self.action == "install":
-                if self.model_type == "tts" and isinstance(
-                    self.manager, (QwenTtsProvider, CosyVoiceTtsProvider)
-                ):
-                    message = self.manager.install_dependencies(
-                        self.progress.emit,
-                        self.log_line.emit,
-                        self.mirror,
-                        self._cancel_event,
-                        source=self.model_source,
-                    )
-                else:
-                    message = self.manager.install_dependencies(
-                        self.progress.emit,
-                        self.log_line.emit,
-                        self.mirror,
-                        self._cancel_event,
-                    )
+                message = self.manager.install_dependencies(
+                    self.progress.emit,
+                    self.log_line.emit,
+                    self.mirror,
+                    self._cancel_event,
+                )
             elif self.action == "download":
-                if self.model_type == "tts" and isinstance(
-                    self.manager, (QwenTtsProvider, CosyVoiceTtsProvider)
-                ):
-                    self.manager.ensure_download_client(
-                        self.progress.emit,
-                        self.log_line.emit,
-                        self.mirror,
-                        self._cancel_event,
-                        source=self.model_source,
-                    )
-                    message = self.manager.download_model(
-                        self.model_type,
-                        self.model_key,
-                        self.progress.emit,
-                        self.log_line.emit,
-                        self._cancel_event,
-                        source=self.model_source,
-                    )
-                else:
-                    message = self.manager.download_model(
-                        self.model_type,
-                        self.model_key,
-                        self.progress.emit,
-                        self.log_line.emit,
-                        self._cancel_event,
-                    )
+                message = self.manager.download_model(
+                    self.model_type,
+                    self.model_key,
+                    self.progress.emit,
+                    self.log_line.emit,
+                    self._cancel_event,
+                )
             else:
                 raise RuntimeError(f"Unknown voice operation {self.action!r}")
             self.completed.emit(True, message, result)
@@ -301,8 +252,8 @@ class _LocalSpeechThread(QThread):
         manager: TextToSpeechProvider,
         tts_model: str,
         text: str,
-        speaker: str = "Vivian",
-        language: str = "Auto",
+        speaker: str = "",
+        language: str = "auto",
     ) -> None:
         super().__init__()
         self.manager = manager
@@ -325,9 +276,9 @@ class _LocalSpeechThread(QThread):
         try:
             import sounddevice as sd
 
-            provider_name = getattr(self.manager, "display_name", "Qwen3-TTS")
+            provider_name = getattr(self.manager, "display_name", "local TTS")
             if not isinstance(provider_name, str):
-                provider_name = "Qwen3-TTS"
+                provider_name = "local TTS"
             synthesis_started = time.perf_counter()
             stream_synthesis = getattr(self.manager, "synthesize_stream", None)
             if callable(stream_synthesis):
@@ -445,9 +396,9 @@ class _LocalSpeechThread(QThread):
                 )
             buffered_audio_seconds += len(samples) / max(1, sample_rate)
         first_latency_ms = (time.perf_counter() - synthesis_started) * 1000
-        provider_name = getattr(self.manager, "display_name", "Qwen3-TTS")
+        provider_name = getattr(self.manager, "display_name", "local TTS")
         if not isinstance(provider_name, str):
-            provider_name = "Qwen3-TTS"
+            provider_name = "local TTS"
         self.started.emit(f"Playing with streaming {provider_name}…")
         self.progress.emit({"text": self.text, "fraction": 0.0})
         spoken_characters = 0
@@ -799,31 +750,21 @@ class HotkeyConfigDialog(QDialog):
         playing_backend: str = "web",
         stt_language: str | None = None,
         stt_model: str = "zh_zipformer_ctc_int8_2025_07_03",
-        tts_model: str = "qwen3_tts_0_6b_custom_voice",
-        tts_speaker: str = "Vivian",
-        tts_language: str = "Auto",
         pypi_mirror: str = "default",
-        qwen_model_source: str = "huggingface",
-        cosyvoice_model_source: str = "huggingface",
-        cosyvoice_model: str = "fun_cosyvoice3_0_5b_2512",
-        cosyvoice_prompt_audio: str = "",
-        cosyvoice_prompt_text: str = "",
         sovits_installation: str = "",
+        sovits_ckpt_path: str = "",
+        sovits_pth_path: str = "",
         sovits_text_lang: str = "auto",
         sovits_ref_audio_path: str = "",
         sovits_prompt_text: str = "",
         sovits_prompt_lang: str = "auto",
         config: Config | None = None,
         stt_manager: SherpaSttProvider | None = None,
-        tts_manager: QwenTtsProvider | None = None,
-        cosyvoice_manager: CosyVoiceTtsProvider | None = None,
         sovits_manager: SovitsTtsProvider | None = None,
     ) -> None:
         super().__init__(parent)
         self._title_drag_offset: QPoint | None = None
         self.stt_manager = stt_manager or SherpaSttProvider()
-        self.tts_manager = tts_manager or QwenTtsProvider()
-        self.cosyvoice_manager = cosyvoice_manager or CosyVoiceTtsProvider()
         self.sovits_manager = sovits_manager or SovitsTtsProvider()
         self.config = config
         self._voice_worker: _VoiceOperationThread | None = None
@@ -1192,12 +1133,6 @@ class HotkeyConfigDialog(QDialog):
         self.playing_backend_combo.setObjectName("voiceCombo")
         self.playing_backend_combo.addItem("Web built-in (browser)", "web")
         self.playing_backend_combo.addItem(
-            "Qwen3-TTS (local · NVIDIA GPU required)", "qwen"
-        )
-        self.playing_backend_combo.addItem(
-            "CosyVoice 3 (local · zero-shot voice cloning)", "cosyvoice"
-        )
-        self.playing_backend_combo.addItem(
             "GPT-SoVITS (existing local installation)", "sovits"
         )
         playing_backend_index = self.playing_backend_combo.findData(
@@ -1207,14 +1142,14 @@ class HotkeyConfigDialog(QDialog):
         playing_backend_layout.addWidget(self.playing_backend_combo)
         playing_layout.addWidget(playing_backend_card)
 
-        self.playing_qwen_card = QFrame()
-        self.playing_qwen_card.setObjectName("settingsCard")
-        playing_qwen_layout = QVBoxLayout(self.playing_qwen_card)
-        playing_qwen_layout.setContentsMargins(18, 16, 18, 16)
-        playing_qwen_layout.setSpacing(10)
-        self.playing_local_title = QLabel("Local Qwen3 text to speech")
+        self.playing_local_card = QFrame()
+        self.playing_local_card.setObjectName("settingsCard")
+        playing_local_layout = QVBoxLayout(self.playing_local_card)
+        playing_local_layout.setContentsMargins(18, 16, 18, 16)
+        playing_local_layout.setSpacing(10)
+        self.playing_local_title = QLabel("GPT-SoVITS text to speech")
         self.playing_local_title.setObjectName("settingsCardTitle")
-        playing_qwen_layout.addWidget(self.playing_local_title)
+        playing_local_layout.addWidget(self.playing_local_title)
         playing_runtime_row = QHBoxLayout()
         playing_runtime_row.setSpacing(8)
         self.playing_check_button = QPushButton("Check")
@@ -1246,128 +1181,31 @@ class HotkeyConfigDialog(QDialog):
         self.playing_cancel_button.hide()
         playing_runtime_row.addWidget(self.playing_cancel_button)
         playing_runtime_row.addStretch()
-        playing_qwen_layout.addLayout(playing_runtime_row)
+        playing_local_layout.addLayout(playing_runtime_row)
 
-        self.tts_model_combo = QComboBox()
-        self.tts_model_combo.setObjectName("voiceCombo")
-        for model in TTS_MODELS.values():
-            self.tts_model_combo.addItem(
-                f"[Local] {model.label} · {model.download_size / 1024**3:.2f} GB",
-                model.key,
-            )
-        tts_index = self.tts_model_combo.findData(tts_model)
-        self.tts_model_combo.setCurrentIndex(max(tts_index, 0))
-        playing_qwen_layout.addWidget(self.tts_model_combo)
-
-        self.cosyvoice_model_combo = QComboBox()
-        self.cosyvoice_model_combo.setObjectName("voiceCombo")
-        for model in COSYVOICE_TTS_MODELS.values():
-            self.cosyvoice_model_combo.addItem(
-                f"[Bi-streaming] {model.label} · "
-                f"~{model.download_size / 1024**3:.2f} GB",
-                model.key,
-            )
-        cosyvoice_index = self.cosyvoice_model_combo.findData(cosyvoice_model)
-        self.cosyvoice_model_combo.setCurrentIndex(max(cosyvoice_index, 0))
-
-        tts_download_row = QHBoxLayout()
-        tts_download_row.setSpacing(8)
-        self.qwen_model_source_combo = QComboBox()
-        self.qwen_model_source_combo.setObjectName("voiceCombo")
-        self.qwen_model_source_combo.setToolTip(
-            "Service used to download the selected Qwen model"
-        )
-        for source_key, source_label in MODEL_DOWNLOAD_SOURCES.items():
-            self.qwen_model_source_combo.addItem(source_label, source_key)
-        source_index = self.qwen_model_source_combo.findData(qwen_model_source)
-        self.qwen_model_source_combo.setCurrentIndex(max(source_index, 0))
-        self.cosyvoice_model_source_combo = QComboBox()
-        self.cosyvoice_model_source_combo.setObjectName("voiceCombo")
-        self.cosyvoice_model_source_combo.setToolTip(
-            "Service used to download the selected CosyVoice model"
-        )
-        for source_key, source_label in MODEL_DOWNLOAD_SOURCES.items():
-            self.cosyvoice_model_source_combo.addItem(source_label, source_key)
-        cosyvoice_source_index = self.cosyvoice_model_source_combo.findData(
-            cosyvoice_model_source
-        )
-        self.cosyvoice_model_source_combo.setCurrentIndex(
-            max(cosyvoice_source_index, 0)
-        )
-        self.tts_download_button = QPushButton("Download TTS model")
-        self.tts_download_button.setObjectName("voiceActionButton")
-        tts_download_row.addWidget(self.qwen_model_source_combo)
-        tts_download_row.addWidget(self.tts_download_button)
-        tts_download_row.addStretch()
-        playing_qwen_layout.addLayout(tts_download_row)
-
-        self.tts_model_description = QLabel()
-        self.tts_model_description.setObjectName("settingsNote")
-        self.tts_model_description.setWordWrap(True)
-        playing_qwen_layout.addWidget(self.tts_model_description)
-
-        playing_qwen_layout.addWidget(self.cosyvoice_model_combo)
-        cosyvoice_download_row = QHBoxLayout()
-        cosyvoice_download_row.setSpacing(8)
-        self.cosyvoice_download_button = QPushButton("Download TTS model")
-        self.cosyvoice_download_button.setObjectName("voiceActionButton")
-        cosyvoice_download_row.addWidget(self.cosyvoice_model_source_combo)
-        cosyvoice_download_row.addWidget(self.cosyvoice_download_button)
-        cosyvoice_download_row.addStretch()
-        playing_qwen_layout.addLayout(cosyvoice_download_row)
-
-        self.cosyvoice_model_description = QLabel()
-        self.cosyvoice_model_description.setObjectName("settingsNote")
-        self.cosyvoice_model_description.setWordWrap(True)
-        playing_qwen_layout.addWidget(self.cosyvoice_model_description)
-
-        speaker_row = QHBoxLayout()
-        speaker_row.setSpacing(8)
-        self.tts_speaker_label = QLabel("Speaker")
-        self.tts_speaker_combo = QComboBox()
-        self.tts_speaker_combo.setObjectName("voiceCombo")
-        speaker_row.addWidget(self.tts_speaker_label)
-        speaker_row.addWidget(self.tts_speaker_combo, 1)
-        self.tts_language_label = QLabel("Language")
-        self.tts_language_combo = QComboBox()
-        self.tts_language_combo.setObjectName("voiceCombo")
-        self.tts_language_combo.setToolTip(
-            "Choose Qwen's synthesis language, or Auto for model detection"
-        )
-        for language_name in TTS_LANGUAGES:
-            self.tts_language_combo.addItem(language_name, language_name)
-        tts_language_index = self.tts_language_combo.findData(tts_language)
-        self.tts_language_combo.setCurrentIndex(max(tts_language_index, 0))
-        speaker_row.addWidget(self.tts_language_label)
-        speaker_row.addWidget(self.tts_language_combo, 1)
-        playing_qwen_layout.addLayout(speaker_row)
-
-        self.cosyvoice_prompt_audio_label = QLabel("Reference voice")
-        self.cosyvoice_prompt_audio_edit = QLineEdit(cosyvoice_prompt_audio)
-        self.cosyvoice_prompt_audio_edit.setObjectName("voiceTestText")
-        self.cosyvoice_prompt_audio_edit.setPlaceholderText(
-            "WAV path (blank uses the official CosyVoice sample)"
-        )
-        self.cosyvoice_prompt_browse_button = QPushButton("Browse…")
-        self.cosyvoice_prompt_browse_button.setObjectName("voiceActionButton")
-        cosyvoice_audio_row = QHBoxLayout()
-        cosyvoice_audio_row.setSpacing(8)
-        cosyvoice_audio_row.addWidget(self.cosyvoice_prompt_audio_label)
-        cosyvoice_audio_row.addWidget(self.cosyvoice_prompt_audio_edit, 1)
-        cosyvoice_audio_row.addWidget(self.cosyvoice_prompt_browse_button)
-        playing_qwen_layout.addLayout(cosyvoice_audio_row)
-
-        self.cosyvoice_prompt_text_label = QLabel("Reference transcript")
-        self.cosyvoice_prompt_text_edit = QLineEdit(cosyvoice_prompt_text)
-        self.cosyvoice_prompt_text_edit.setObjectName("voiceTestText")
-        self.cosyvoice_prompt_text_edit.setPlaceholderText(
-            "Exact transcript (blank uses the official sample transcript)"
-        )
-        cosyvoice_text_row = QHBoxLayout()
-        cosyvoice_text_row.setSpacing(8)
-        cosyvoice_text_row.addWidget(self.cosyvoice_prompt_text_label)
-        cosyvoice_text_row.addWidget(self.cosyvoice_prompt_text_edit, 1)
-        playing_qwen_layout.addLayout(cosyvoice_text_row)
+        self.sovits_weight_widgets = []
+        for suffix, label, value in (
+            ("ckpt", "GPT model (.ckpt)", sovits_ckpt_path),
+            ("pth", "SoVITS model (.pth)", sovits_pth_path),
+        ):
+            row = QHBoxLayout()
+            edit = QLineEdit(value)
+            edit.setObjectName("voiceTestText")
+            edit.setAccessibleName(label)
+            edit.setPlaceholderText("Optional — select both model files or leave both blank")
+            button = QPushButton("Browse…")
+            button.setObjectName("voiceActionButton")
+            button.clicked.connect(lambda _checked=False, ext=suffix: self._browse_sovits_weight(ext))
+            setattr(self, f"sovits_{suffix}_edit", edit)
+            self.sovits_weight_widgets.extend((edit, button))
+            row.addWidget(QLabel(label))
+            row.addWidget(edit, 1)
+            row.addWidget(button)
+            playing_local_layout.addLayout(row)
+        self.sovits_weights_status = QLabel()
+        self.sovits_weights_status.setObjectName("settingsNote")
+        self.sovits_weights_status.setWordWrap(True)
+        playing_local_layout.addWidget(self.sovits_weights_status)
 
         self.sovits_installation_label = QLabel("Installation folder")
         self.sovits_installation_edit = QLineEdit(sovits_installation)
@@ -1382,7 +1220,7 @@ class HotkeyConfigDialog(QDialog):
         sovits_installation_row.addWidget(self.sovits_installation_label)
         sovits_installation_row.addWidget(self.sovits_installation_edit, 1)
         sovits_installation_row.addWidget(self.sovits_installation_browse_button)
-        playing_qwen_layout.addLayout(sovits_installation_row)
+        playing_local_layout.addLayout(sovits_installation_row)
 
         self.sovits_reference_title = QLabel("Reference voice")
         self.sovits_reference_title.setObjectName("voiceFieldGroupTitle")
@@ -1391,8 +1229,8 @@ class HotkeyConfigDialog(QDialog):
         )
         self.sovits_reference_description.setObjectName("settingsNote")
         self.sovits_reference_description.setWordWrap(True)
-        playing_qwen_layout.addWidget(self.sovits_reference_title)
-        playing_qwen_layout.addWidget(self.sovits_reference_description)
+        playing_local_layout.addWidget(self.sovits_reference_title)
+        playing_local_layout.addWidget(self.sovits_reference_description)
 
         self.sovits_text_lang_label = QLabel("Output language")
         self.sovits_text_lang_combo = QComboBox()
@@ -1429,7 +1267,7 @@ class HotkeyConfigDialog(QDialog):
         sovits_ref_row.addWidget(self.sovits_ref_audio_label)
         sovits_ref_row.addWidget(self.sovits_ref_audio_edit, 1)
         sovits_ref_row.addWidget(self.sovits_ref_audio_browse_button)
-        playing_qwen_layout.addLayout(sovits_ref_row)
+        playing_local_layout.addLayout(sovits_ref_row)
 
         self.sovits_prompt_text_label = QLabel("Reference transcript")
         self.sovits_prompt_text_edit = QLineEdit(sovits_prompt_text)
@@ -1439,13 +1277,13 @@ class HotkeyConfigDialog(QDialog):
         sovits_prompt_row.setSpacing(8)
         sovits_prompt_row.addWidget(self.sovits_prompt_text_label)
         sovits_prompt_row.addWidget(self.sovits_prompt_text_edit, 1)
-        playing_qwen_layout.addLayout(sovits_prompt_row)
+        playing_local_layout.addLayout(sovits_prompt_row)
 
         sovits_reference_language_row = QHBoxLayout()
         sovits_reference_language_row.setSpacing(8)
         sovits_reference_language_row.addWidget(self.sovits_prompt_lang_label)
         sovits_reference_language_row.addWidget(self.sovits_prompt_lang_combo, 1)
-        playing_qwen_layout.addLayout(sovits_reference_language_row)
+        playing_local_layout.addLayout(sovits_reference_language_row)
 
         self.sovits_output_title = QLabel("Generated speech")
         self.sovits_output_title.setObjectName("voiceFieldGroupTitle")
@@ -1454,13 +1292,13 @@ class HotkeyConfigDialog(QDialog):
         )
         self.sovits_output_description.setObjectName("settingsNote")
         self.sovits_output_description.setWordWrap(True)
-        playing_qwen_layout.addWidget(self.sovits_output_title)
-        playing_qwen_layout.addWidget(self.sovits_output_description)
+        playing_local_layout.addWidget(self.sovits_output_title)
+        playing_local_layout.addWidget(self.sovits_output_description)
         sovits_output_language_row = QHBoxLayout()
         sovits_output_language_row.setSpacing(8)
         sovits_output_language_row.addWidget(self.sovits_text_lang_label)
         sovits_output_language_row.addWidget(self.sovits_text_lang_combo, 1)
-        playing_qwen_layout.addLayout(sovits_output_language_row)
+        playing_local_layout.addLayout(sovits_output_language_row)
 
         self.voice_test_text = QLineEdit()
         self.voice_test_text.setObjectName("voiceTestText")
@@ -1471,19 +1309,19 @@ class HotkeyConfigDialog(QDialog):
         self.voice_play_button.setObjectName("voiceActionButton")
         tts_action_row.addWidget(self.voice_play_button)
         tts_action_row.addStretch()
-        playing_qwen_layout.addWidget(self.voice_test_text)
-        playing_qwen_layout.addLayout(tts_action_row)
+        playing_local_layout.addWidget(self.voice_test_text)
+        playing_local_layout.addLayout(tts_action_row)
         self.playing_progress = QProgressBar()
         self.playing_progress.setObjectName("voiceProgress")
         self.playing_progress.setRange(0, 100)
         self.playing_progress.hide()
-        playing_qwen_layout.addWidget(self.playing_progress)
+        playing_local_layout.addWidget(self.playing_progress)
         self.playing_status = QLabel(
             "Select Check to validate the runtime and selected playback model."
         )
         self.playing_status.setObjectName("voiceStatus")
         self.playing_status.setWordWrap(True)
-        playing_qwen_layout.addWidget(self.playing_status)
+        playing_local_layout.addWidget(self.playing_status)
         self.playing_install_log = QLabel()
         self.playing_install_log.setObjectName("voiceInstallLog")
         self.playing_install_log.setWordWrap(False)
@@ -1491,8 +1329,8 @@ class HotkeyConfigDialog(QDialog):
             QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
         )
         self.playing_install_log.hide()
-        playing_qwen_layout.addWidget(self.playing_install_log)
-        playing_layout.addWidget(self.playing_qwen_card)
+        playing_local_layout.addWidget(self.playing_install_log)
+        playing_layout.addWidget(self.playing_local_card)
         playing_layout.addStretch()
 
         self.recording_scroll = QScrollArea()
@@ -1549,19 +1387,6 @@ class HotkeyConfigDialog(QDialog):
         self.playing_cancel_button.clicked.connect(self._cancel_voice_operation)
         self.stt_language_combo.currentIndexChanged.connect(self._stt_language_changed)
         self.stt_model_combo.currentIndexChanged.connect(self._stt_model_changed)
-        self.tts_model_combo.currentIndexChanged.connect(self._tts_model_changed)
-        self.cosyvoice_model_combo.currentIndexChanged.connect(
-            self._cosyvoice_model_changed
-        )
-        self.qwen_model_source_combo.currentIndexChanged.connect(
-            self._qwen_model_source_changed
-        )
-        self.cosyvoice_model_source_combo.currentIndexChanged.connect(
-            self._cosyvoice_model_source_changed
-        )
-        self.cosyvoice_prompt_browse_button.clicked.connect(
-            self._browse_cosyvoice_prompt_audio
-        )
         self.sovits_installation_browse_button.clicked.connect(
             self._browse_sovits_installation
         )
@@ -1583,21 +1408,15 @@ class HotkeyConfigDialog(QDialog):
         self.stt_download_button.clicked.connect(
             lambda: self._start_voice_operation("download", "stt")
         )
-        self.tts_download_button.clicked.connect(
-            lambda: self._start_voice_operation("download", "tts")
-        )
-        self.cosyvoice_download_button.clicked.connect(
-            lambda: self._start_voice_operation("download", "tts")
-        )
         self.voice_record_button.clicked.connect(self._toggle_voice_record_test)
         self.voice_play_button.clicked.connect(self._start_voice_play_test)
-        self._pending_tts_speaker = tts_speaker
         self._stt_model_changed()
-        self._tts_model_changed()
-        self._cosyvoice_model_changed()
         self._sync_recording_controls()
         self._sync_playing_controls()
         self._connect_auto_save()
+        self.sovits_ckpt_edit.textChanged.connect(self._sovits_weights_changed)
+        self.sovits_pth_edit.textChanged.connect(self._sovits_weights_changed)
+        self._sovits_weights_changed()
         content_layout.addWidget(self.settings_pages, 1)
         body_layout.addWidget(content, 1)
         shell_layout.addWidget(body, 1)
@@ -1867,72 +1686,13 @@ class HotkeyConfigDialog(QDialog):
             self._check_voice_page_when_needed("stt")
 
     def _sync_playing_controls(self) -> None:
-        backend = self.playing_backend()
-        local_enabled = backend in ("qwen", "cosyvoice", "sovits")
-        qwen_enabled = backend == "qwen"
-        cosyvoice_enabled = backend == "cosyvoice"
-        sovits_enabled = backend == "sovits"
-        self.playing_qwen_card.setVisible(local_enabled)
-        title = "Local Qwen3 text to speech"
-        if cosyvoice_enabled:
-            title = "Local CosyVoice 3 text to speech"
-        elif sovits_enabled:
-            title = "GPT-SoVITS text to speech"
-        self.playing_local_title.setText(title)
-        self.playing_install_button.setVisible(not sovits_enabled)
-        self.playing_pypi_mirror_combo.setVisible(not sovits_enabled)
-        for widget in (
-            self.tts_model_combo,
-            self.qwen_model_source_combo,
-            self.tts_download_button,
-            self.tts_model_description,
-            self.tts_speaker_label,
-            self.tts_speaker_combo,
-            self.tts_language_label,
-            self.tts_language_combo,
-        ):
-            widget.setVisible(qwen_enabled)
-        for widget in (
-            self.cosyvoice_model_combo,
-            self.cosyvoice_model_source_combo,
-            self.cosyvoice_download_button,
-            self.cosyvoice_model_description,
-            self.cosyvoice_prompt_audio_label,
-            self.cosyvoice_prompt_audio_edit,
-            self.cosyvoice_prompt_browse_button,
-            self.cosyvoice_prompt_text_label,
-            self.cosyvoice_prompt_text_edit,
-        ):
-            widget.setVisible(cosyvoice_enabled)
-        for widget in (
-            self.sovits_installation_label,
-            self.sovits_installation_edit,
-            self.sovits_installation_browse_button,
-            self.sovits_reference_title,
-            self.sovits_reference_description,
-            self.sovits_text_lang_label,
-            self.sovits_text_lang_combo,
-            self.sovits_prompt_lang_label,
-            self.sovits_prompt_lang_combo,
-            self.sovits_ref_audio_label,
-            self.sovits_ref_audio_edit,
-            self.sovits_ref_audio_browse_button,
-            self.sovits_prompt_text_label,
-            self.sovits_prompt_text_edit,
-            self.sovits_output_title,
-            self.sovits_output_description,
-        ):
-            widget.setVisible(sovits_enabled)
-        if qwen_enabled:
-            self.voice_test_text.setText(TTS_MODELS[self.tts_model()].test_text)
-        elif cosyvoice_enabled:
-            self.voice_test_text.setText(
-                COSYVOICE_TTS_MODELS[self.cosyvoice_model()].test_text
-            )
-        elif sovits_enabled:
-            self.voice_test_text.setText("Hello from GPT-SoVITS.")
+        enabled = self.playing_backend() == "sovits"
+        self.playing_local_card.setVisible(enabled)
+        self.playing_install_button.hide()
+        self.playing_pypi_mirror_combo.hide()
+        self.voice_test_text.setText("Hello from GPT-SoVITS.")
         self._voice_status_checked["tts"] = False
-        if local_enabled and self.settings_pages.currentIndex() == 3:
+        if enabled and self.settings_pages.currentIndex() == 3:
             self._check_voice_page_when_needed("tts")
 
     def _connect_auto_save(self) -> None:
@@ -1955,34 +1715,6 @@ class HotkeyConfigDialog(QDialog):
         )
         self.stt_model_combo.currentIndexChanged.connect(
             lambda: self._save_setting("stt_model", self.stt_model())
-        )
-        self.tts_model_combo.currentIndexChanged.connect(
-            lambda: self._save_setting("tts_model", self.tts_model())
-        )
-        self.tts_speaker_combo.currentIndexChanged.connect(
-            lambda: self._save_setting("tts_speaker", self.tts_speaker())
-        )
-        self.tts_language_combo.currentIndexChanged.connect(
-            lambda: self._save_setting("tts_language", self.tts_language())
-        )
-        self.qwen_model_source_combo.currentIndexChanged.connect(
-            lambda: self._save_setting(
-                "qwen_model_source", self.qwen_model_source()
-            )
-        )
-        self.cosyvoice_model_combo.currentIndexChanged.connect(
-            lambda: self._save_setting("cosyvoice_model", self.cosyvoice_model())
-        )
-        self.cosyvoice_model_source_combo.currentIndexChanged.connect(
-            lambda: self._save_setting(
-                "cosyvoice_model_source", self.cosyvoice_model_source()
-            )
-        )
-        self.cosyvoice_prompt_audio_edit.textChanged.connect(
-            lambda text: self._save_setting("cosyvoice_prompt_audio", text)
-        )
-        self.cosyvoice_prompt_text_edit.textChanged.connect(
-            lambda text: self._save_setting("cosyvoice_prompt_text", text)
         )
         self.sovits_installation_edit.textChanged.connect(
             lambda text: self._save_setting("sovits_installation", text)
@@ -2244,64 +1976,6 @@ class HotkeyConfigDialog(QDialog):
         self.stt_test_result.clear()
         self._voice_status_checked["stt"] = False
 
-    def _tts_model_changed(self) -> None:
-        model = TTS_MODELS[self.tts_model()]
-        self.tts_model_description.setText(
-            f"{model.description}\nStored in {self.tts_manager.model_root.resolve()}"
-        )
-        selected_speaker = getattr(self, "_pending_tts_speaker", "Vivian")
-        self.tts_speaker_combo.clear()
-        for speaker in model.speakers:
-            self.tts_speaker_combo.addItem(
-                f"{speaker.label} · {speaker.description}", speaker.key
-            )
-        speaker_index = self.tts_speaker_combo.findData(selected_speaker)
-        self.tts_speaker_combo.setCurrentIndex(max(speaker_index, 0))
-        self._pending_tts_speaker = "Vivian"
-        self.tts_speaker_combo.setEnabled(len(model.speakers) > 1)
-        self.voice_test_text.setText(model.test_text)
-        self._voice_status_checked["tts"] = False
-
-    def _qwen_model_source_changed(self) -> None:
-        self._voice_status_checked["tts"] = False
-        self.playing_status.setProperty("error", False)
-        self.playing_status.setText(
-            f"{MODEL_DOWNLOAD_SOURCES[self.qwen_model_source()]} selected for "
-            "Qwen model downloads. Select Check to validate its client."
-        )
-        self._refresh_voice_status_style(self.playing_status)
-
-    def _cosyvoice_model_changed(self) -> None:
-        model = COSYVOICE_TTS_MODELS[self.cosyvoice_model()]
-        self.cosyvoice_model_description.setText(
-            f"{model.description}\nStored in "
-            f"{self.cosyvoice_manager.model_root.resolve()}"
-        )
-        if self.playing_backend() == "cosyvoice":
-            self.voice_test_text.setText(model.test_text)
-        self._voice_status_checked["tts"] = False
-
-    def _cosyvoice_model_source_changed(self) -> None:
-        self._voice_status_checked["tts"] = False
-        if self.playing_backend() != "cosyvoice":
-            return
-        self.playing_status.setProperty("error", False)
-        self.playing_status.setText(
-            f"{MODEL_DOWNLOAD_SOURCES[self.cosyvoice_model_source()]} selected "
-            "for CosyVoice model downloads. Select Check to validate it."
-        )
-        self._refresh_voice_status_style(self.playing_status)
-
-    def _browse_cosyvoice_prompt_audio(self) -> None:
-        selected, _filter = QFileDialog.getOpenFileName(
-            self,
-            "Choose CosyVoice reference audio",
-            self.cosyvoice_prompt_audio_edit.text(),
-            "Wave audio (*.wav);;Audio files (*.wav *.flac *.mp3);;All files (*)",
-        )
-        if selected:
-            self.cosyvoice_prompt_audio_edit.setText(selected)
-
     def _browse_sovits_installation(self) -> None:
         selected = QFileDialog.getExistingDirectory(
             self,
@@ -2310,6 +1984,40 @@ class HotkeyConfigDialog(QDialog):
         )
         if selected:
             self.sovits_installation_edit.setText(selected)
+
+    def sovits_ckpt_path(self) -> str:
+        return self.sovits_ckpt_edit.text().strip()
+
+    def sovits_pth_path(self) -> str:
+        return self.sovits_pth_edit.text().strip()
+
+    def _browse_sovits_weight(self, extension: str) -> None:
+        edit = getattr(self, f"sovits_{extension}_edit")
+        selected, _ = QFileDialog.getOpenFileName(
+            self, f"Choose .{extension} model", edit.text(),
+            f"Model files (*.{extension})",
+        )
+        if selected:
+            edit.setText(selected)
+
+    def _sovits_weights_changed(self) -> None:
+        pair = (self.sovits_ckpt_path(), self.sovits_pth_path())
+        if pair != getattr(self, "_last_weight_inputs", None):
+            self._last_weight_inputs = pair
+            self._voice_status_checked["tts"] = False
+        try:
+            SovitsTtsProvider.validate_weights(*pair)
+        except ValueError as error:
+            self.sovits_weights_status.setText(str(error) + " Changes are not saved.")
+            self.playing_check_button.setEnabled(False)
+            self.voice_play_button.setEnabled(False)
+            return
+        self.sovits_weights_status.setText("Both paths are optional. Leave both blank to use the installation’s configured models.")
+        busy = self._voice_worker is not None or self._voice_test_running()
+        self.playing_check_button.setEnabled(not busy)
+        self.voice_play_button.setEnabled(not busy)
+        if self.config is not None:
+            self.config.update(sovits_ckpt_path=self.sovits_ckpt_path(), sovits_pth_path=self.sovits_pth_path())
 
     def _browse_sovits_ref_audio(self) -> None:
         selected, _filter = QFileDialog.getOpenFileName(
@@ -2329,45 +2037,20 @@ class HotkeyConfigDialog(QDialog):
         )
 
     def _is_local_voice_backend(self, model_type: str) -> bool:
-        backend = self._voice_backend(model_type)
-        return backend == "sherpa" if model_type == "stt" else backend in (
-            "qwen",
-            "cosyvoice",
-            "sovits",
-        )
+        return self._voice_backend(model_type) == ("sherpa" if model_type == "stt" else "sovits")
 
     def _voice_provider(self, model_type: str) -> ModelProvider:
         if model_type == "stt":
             return self.stt_manager
-        if self.playing_backend() == "sovits":
-            self.sovits_manager.configure(
-                self.sovits_prompt_text(), self.sovits_prompt_lang()
-            )
-            self.sovits_manager.model_status("tts", self.sovits_installation())
-            return self.sovits_manager
-        return (
-            self.cosyvoice_manager
-            if self.playing_backend() == "cosyvoice"
-            else self.tts_manager
+        self.sovits_manager.configure(
+            self.sovits_prompt_text(), self.sovits_prompt_lang(),
+            self.sovits_ckpt_path(), self.sovits_pth_path(),
         )
+        self.sovits_manager.model_status("tts", self.sovits_installation())
+        return self.sovits_manager
 
     def _active_tts_model(self) -> str:
-        if self.playing_backend() == "sovits":
-            return self.sovits_installation()
-        return (
-            self.cosyvoice_model()
-            if self.playing_backend() == "cosyvoice"
-            else self.tts_model()
-        )
-
-    def _active_tts_source(self) -> str:
-        if self.playing_backend() == "sovits":
-            return "existing"
-        return (
-            self.cosyvoice_model_source()
-            if self.playing_backend() == "cosyvoice"
-            else self.qwen_model_source()
-        )
+        return self.sovits_installation()
 
     def _voice_widgets(self, model_type: str) -> tuple[QLabel, QProgressBar]:
         if model_type == "stt":
@@ -2395,6 +2078,12 @@ class HotkeyConfigDialog(QDialog):
             return
         if not self._is_local_voice_backend(model_type):
             return
+        if model_type == "tts":
+            try:
+                SovitsTtsProvider.validate_weights(self.sovits_ckpt_path(), self.sovits_pth_path())
+            except ValueError:
+                self._sovits_weights_changed()
+                return
         if action == "status":
             self._voice_status_checked[model_type] = True
         self._set_voice_busy(True)
@@ -2430,7 +2119,6 @@ class HotkeyConfigDialog(QDialog):
             model_type,
             self.stt_model() if model_type == "stt" else self._active_tts_model(),
             self.pypi_mirror(),
-            self._active_tts_source(),
         )
         self._voice_worker = worker
         worker.progress.connect(self._voice_operation_progress)
@@ -2534,9 +2222,6 @@ class HotkeyConfigDialog(QDialog):
             self.playing_check_button,
             self.playing_install_button,
             self.stt_download_button,
-            self.tts_download_button,
-            self.cosyvoice_download_button,
-            self.cosyvoice_prompt_browse_button,
             self.voice_record_button,
             self.voice_play_button,
             self.close_button,
@@ -2548,21 +2233,15 @@ class HotkeyConfigDialog(QDialog):
         self.playing_pypi_mirror_combo.setEnabled(not busy)
         self.stt_language_combo.setEnabled(not busy)
         self.stt_model_combo.setEnabled(not busy)
-        self.tts_model_combo.setEnabled(not busy)
-        self.cosyvoice_model_combo.setEnabled(not busy)
-        self.qwen_model_source_combo.setEnabled(not busy)
-        self.cosyvoice_model_source_combo.setEnabled(not busy)
-        self.tts_speaker_combo.setEnabled(
-            not busy and len(TTS_MODELS[self.tts_model()].speakers) > 1
-        )
-        self.tts_language_combo.setEnabled(not busy)
-        self.cosyvoice_prompt_audio_edit.setEnabled(not busy)
-        self.cosyvoice_prompt_text_edit.setEnabled(not busy)
         self.sovits_installation_edit.setEnabled(not busy)
         self.sovits_text_lang_combo.setEnabled(not busy)
         self.sovits_ref_audio_edit.setEnabled(not busy)
         self.sovits_prompt_text_edit.setEnabled(not busy)
         self.sovits_prompt_lang_combo.setEnabled(not busy)
+        for widget in self.sovits_weight_widgets:
+            widget.setEnabled(not busy)
+        if not busy:
+            self._sovits_weights_changed()
         self.voice_test_text.setEnabled(not busy)
 
     def _voice_test_running(self) -> bool:
@@ -2634,14 +2313,14 @@ class HotkeyConfigDialog(QDialog):
     def _start_voice_play_test(self) -> None:
         if self._voice_worker is not None or self._voice_test_running():
             return
+        try:
+            SovitsTtsProvider.validate_weights(self.sovits_ckpt_path(), self.sovits_pth_path())
+        except ValueError:
+            self._sovits_weights_changed()
+            return
         text = self.voice_test_text.text().strip()
         if not text:
-            if self.playing_backend() == "cosyvoice":
-                text = COSYVOICE_TTS_MODELS[self.cosyvoice_model()].test_text
-            elif self.playing_backend() == "sovits":
-                text = "Hello from GPT-SoVITS."
-            else:
-                text = TTS_MODELS[self.tts_model()].test_text
+            text = "Hello from GPT-SoVITS."
             self.voice_test_text.setText(text)
         self._set_voice_busy(True)
         self.playing_progress.show()
@@ -2653,24 +2332,8 @@ class HotkeyConfigDialog(QDialog):
             self._voice_provider("tts"),
             self._active_tts_model(),
             text,
-            (
-                self.cosyvoice_prompt_audio()
-                if self.playing_backend() == "cosyvoice"
-                else (
-                    self.sovits_ref_audio_path()
-                    if self.playing_backend() == "sovits"
-                    else self.tts_speaker()
-                )
-            ),
-            (
-                self.cosyvoice_prompt_text()
-                if self.playing_backend() == "cosyvoice"
-                else (
-                    self.sovits_text_lang()
-                    if self.playing_backend() == "sovits"
-                    else self.tts_language()
-                )
-            ),
+            self.sovits_ref_audio_path(),
+            self.sovits_text_lang(),
         )
         self._voice_play_thread = worker
         worker.started.connect(self.playing_status.setText)
@@ -2763,44 +2426,11 @@ class HotkeyConfigDialog(QDialog):
             self.recording_pypi_mirror_combo.currentData() or "default"
         )
 
-    def qwen_model_source(self) -> str:
-        return str(
-            self.qwen_model_source_combo.currentData() or "huggingface"
-        )
-
-    def cosyvoice_model_source(self) -> str:
-        return str(
-            self.cosyvoice_model_source_combo.currentData() or "huggingface"
-        )
-
     def stt_model(self) -> str:
         return str(
             self.stt_model_combo.currentData()
             or "zh_zipformer_ctc_int8_2025_07_03"
         )
-
-    def tts_model(self) -> str:
-        return str(
-            self.tts_model_combo.currentData() or "qwen3_tts_0_6b_custom_voice"
-        )
-
-    def tts_speaker(self) -> str:
-        return str(self.tts_speaker_combo.currentData() or "Vivian")
-
-    def tts_language(self) -> str:
-        return str(self.tts_language_combo.currentData() or "Auto")
-
-    def cosyvoice_model(self) -> str:
-        return str(
-            self.cosyvoice_model_combo.currentData()
-            or "fun_cosyvoice3_0_5b_2512"
-        )
-
-    def cosyvoice_prompt_audio(self) -> str:
-        return self.cosyvoice_prompt_audio_edit.text().strip()
-
-    def cosyvoice_prompt_text(self) -> str:
-        return self.cosyvoice_prompt_text_edit.text().strip()
 
     def sovits_installation(self) -> str:
         return self.sovits_installation_edit.text().strip()
@@ -4678,8 +4308,6 @@ class TrayController:
         self.icon = QIcon(str(ICON_PATH))
         self.config = Config()
         self.stt_manager = SherpaSttProvider()
-        self.tts_manager = QwenTtsProvider()
-        self.cosyvoice_manager = CosyVoiceTtsProvider()
         self.sovits_manager = SovitsTtsProvider()
         self._local_dictation_thread: _LocalDictationThread | None = None
         self._local_speech_thread: (
@@ -4689,7 +4317,7 @@ class TrayController:
         self._local_voice_queued_sentences: list[str] = []
         self._local_voice_interrupted = False
         self._stt_preload_thread: threading.Thread | None = None
-        self._qwen_preload_thread: threading.Thread | None = None
+        self._local_tts_preload_thread: threading.Thread | None = None
         self._migrate_legacy_hotkeys()
         self.window = OverlayWindow(str(self.config["pet_path"]))
         self.window.pet.set_idle_behavior(str(self.config["pet_idle_mode"]), int(self.config["pet_idle_seconds"]))
@@ -4845,7 +4473,7 @@ class TrayController:
         logger.info("System tray icon is ready")
         self.show_window()
         self._start_stt_preload()
-        self._start_qwen_preload()
+        self._start_local_tts_preload()
 
     def _hotkey_enabled_states(self) -> dict[str, bool]:
         return {
@@ -4919,30 +4547,16 @@ class TrayController:
                 playing_backend=str(self.config["playing_backend"]),
                 stt_language=str(self.config["stt_language"]),
                 stt_model=str(self.config["stt_model"]),
-                tts_model=str(self.config["tts_model"]),
-                tts_speaker=str(self.config["tts_speaker"]),
-                tts_language=str(self.config["tts_language"]),
                 pypi_mirror=str(self.config["pypi_mirror"]),
-                qwen_model_source=str(self.config["qwen_model_source"]),
-                cosyvoice_model_source=str(
-                    self.config["cosyvoice_model_source"]
-                ),
-                cosyvoice_model=str(self.config["cosyvoice_model"]),
-                cosyvoice_prompt_audio=str(
-                    self.config["cosyvoice_prompt_audio"]
-                ),
-                cosyvoice_prompt_text=str(
-                    self.config["cosyvoice_prompt_text"]
-                ),
                 sovits_installation=str(self.config["sovits_installation"]),
+                sovits_ckpt_path=str(self.config["sovits_ckpt_path"]),
+                sovits_pth_path=str(self.config["sovits_pth_path"]),
                 sovits_text_lang=str(self.config["sovits_text_lang"]),
                 sovits_ref_audio_path=str(self.config["sovits_ref_audio_path"]),
                 sovits_prompt_text=str(self.config["sovits_prompt_text"]),
                 sovits_prompt_lang=str(self.config["sovits_prompt_lang"]),
                 config=self.config,
                 stt_manager=self.stt_manager,
-                tts_manager=self.tts_manager,
-                cosyvoice_manager=self.cosyvoice_manager,
                 sovits_manager=self.sovits_manager,
             )
             dialog.pet_settings_changed.connect(self._apply_pet_settings)
@@ -4955,7 +4569,7 @@ class TrayController:
                 self.config["playing_backend"] == "web"
             )
             self._start_stt_preload()
-            self._start_qwen_preload()
+            self._start_local_tts_preload()
             self.hotkey_monitor.update_bindings(
                 bindings["hold"],
                 hold_without_screenshot=bindings["hold_without_screenshot"],
@@ -4994,29 +4608,21 @@ class TrayController:
     def _local_tts_configuration(
         self,
     ) -> tuple[TextToSpeechProvider, str, str, str] | None:
-        backend = str(self.config["playing_backend"])
-        if backend not in ("qwen", "cosyvoice", "sovits"):
+        if self.config["playing_backend"] != "sovits":
             return None
-        if backend == "cosyvoice":
-            manager: TextToSpeechProvider = self.cosyvoice_manager
-            model_key = str(self.config["cosyvoice_model"])
-            speaker = str(self.config["cosyvoice_prompt_audio"])
-            language = str(self.config["cosyvoice_prompt_text"])
-        elif backend == "sovits":
-            manager = self.sovits_manager
+        manager = self.sovits_manager
+        try:
             manager.configure(
                 str(self.config["sovits_prompt_text"]),
                 str(self.config["sovits_prompt_lang"]),
+                str(self.config["sovits_ckpt_path"]),
+                str(self.config["sovits_pth_path"]),
             )
-            model_key = str(self.config["sovits_installation"])
-            speaker = str(self.config["sovits_ref_audio_path"])
-            language = str(self.config["sovits_text_lang"])
-        else:
-            manager = self.tts_manager
-            model_key = str(self.config["tts_model"])
-            speaker = str(self.config["tts_speaker"])
-            language = str(self.config["tts_language"])
-        return manager, model_key, speaker, language
+        except ValueError as error:
+            logger.warning(f"GPT-SoVITS playback configuration is invalid: {error}")
+            return None
+        return (manager, str(self.config["sovits_installation"]),
+                str(self.config["sovits_ref_audio_path"]), str(self.config["sovits_text_lang"]))
 
     @staticmethod
     def _completed_response_sentences(
@@ -5102,47 +4708,21 @@ class TrayController:
         """Compatibility entry point for a complete local-voice response."""
         self._update_local_voice(text, True)
 
-    def _start_qwen_preload(self) -> None:
+    def _start_local_tts_preload(self) -> None:
         """Warm the selected local model without delaying the settings or UI."""
-        backend = str(self.config["playing_backend"])
-        if backend not in ("qwen", "cosyvoice", "sovits"):
+        configuration = self._local_tts_configuration()
+        if configuration is None:
             return
-        existing = getattr(self, "_qwen_preload_thread", None)
+        existing = getattr(self, "_local_tts_preload_thread", None)
         if existing is not None and existing.is_alive():
             return
-        if backend == "cosyvoice":
-            manager = self.cosyvoice_manager
-            model_key = str(self.config["cosyvoice_model"])
-            model_source = str(
-                self.config.get("cosyvoice_model_source", "huggingface")
-            )
-            provider_name = "CosyVoice"
-        elif backend == "sovits":
-            manager = self.sovits_manager
-            manager.configure(
-                str(self.config["sovits_prompt_text"]),
-                str(self.config["sovits_prompt_lang"]),
-            )
-            model_key = str(self.config["sovits_installation"])
-            model_source = "existing"
-            provider_name = "GPT-SoVITS"
-        else:
-            manager = self.tts_manager
-            model_key = str(self.config["tts_model"])
-            model_source = str(
-                self.config.get("qwen_model_source", "huggingface")
-            )
-            provider_name = "Qwen"
+        manager, model_key, _speaker, _language = configuration
+        provider_name = "GPT-SoVITS"
 
         def preload() -> None:
             try:
-                if isinstance(manager, SovitsTtsProvider):
-                    manager.model_status("tts", model_key)
-                    runtime_ok, runtime_message = manager.dependency_status()
-                else:
-                    runtime_ok, runtime_message = manager.dependency_status(
-                        model_source
-                    )
+                manager.model_status("tts", model_key)
+                runtime_ok, runtime_message = manager.dependency_status()
                 if not runtime_ok:
                     logger.warning(
                         f"{provider_name} background preload skipped until "
@@ -5161,7 +4741,7 @@ class TrayController:
             name="local-tts-background-preload",
             daemon=True,
         )
-        self._qwen_preload_thread = worker
+        self._local_tts_preload_thread = worker
         worker.start()
 
     def _start_stt_preload(self) -> None:

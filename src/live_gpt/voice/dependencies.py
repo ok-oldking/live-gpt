@@ -340,7 +340,7 @@ def _isolated_check(payload: str) -> None:
             for index in range(torch.cuda.device_count())
         ]
         if not any("NVIDIA" in name.upper() for name in device_names):
-            raise RuntimeError("Qwen3-TTS requires an NVIDIA CUDA GPU")
+            raise RuntimeError("This runtime requires an NVIDIA CUDA GPU")
     _verify_requirements(requirements, parsed["extra_imports"])
 
 

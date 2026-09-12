@@ -6,7 +6,7 @@ import struct
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 
@@ -22,6 +22,50 @@ class _Response(io.BytesIO):
 
 
 class SovitsTtsProviderTests(unittest.TestCase):
+    def test_model_pair_validation(self):
+        self.assertEqual(SovitsTtsProvider.validate_weights("  ", ""), ("", ""))
+        with tempfile.TemporaryDirectory() as directory:
+            ckpt = Path(directory) / "中文 voice.ckpt"
+            pth = Path(directory) / "中文 voice.pth"
+            ckpt.touch()
+            pth.touch()
+            self.assertEqual(SovitsTtsProvider.validate_weights(str(ckpt), str(pth)),
+                             (str(ckpt.resolve()), str(pth.resolve())))
+            for pair in ((str(ckpt), ""), ("", str(pth)), (str(pth), str(ckpt)),
+                         (str(ckpt), str(pth.with_name("missing.pth")))):
+                with self.subTest(pair=pair), self.assertRaises(ValueError):
+                    SovitsTtsProvider.validate_weights(*pair)
+
+    def test_server_reloads_for_changed_pair_and_restores_defaults(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "runtime").mkdir()
+            (root / "runtime/python.exe").touch()
+            (root / "GPT_SoVITS/configs").mkdir(parents=True)
+            (root / "GPT_SoVITS/configs/tts_infer.yaml").touch()
+            ckpt, pth = root / "voice.ckpt", root / "voice.pth"
+            ckpt.touch()
+            pth.touch()
+            provider = SovitsTtsProvider()
+            self.addCleanup(provider.close)
+            processes = [Mock(poll=Mock(return_value=None)) for _ in range(3)]
+            with (patch("live_gpt.voice.sovits_tts.subprocess.Popen", side_effect=processes) as launch,
+                  patch.object(provider, "_health", return_value={"ready": True})):
+                provider.preload(str(root))
+                self.assertNotIn("--ckpt", launch.call_args.args[0])
+                provider.configure(ckpt_path=str(ckpt), pth_path=str(pth))
+                provider.preload(str(root))
+                processes[0].terminate.assert_called_once()
+                command = launch.call_args.args[0]
+                self.assertEqual(command[-4:], ["--ckpt", str(ckpt), "--pth", str(pth)])
+                provider.preload(str(root))
+                self.assertEqual(launch.call_count, 2)
+                provider.configure()
+                provider.preload(str(root))
+                processes[1].terminate.assert_called_once()
+                self.assertEqual(launch.call_count, 3)
+                self.assertNotIn("--ckpt", launch.call_args.args[0])
+
     def test_existing_embedded_runtime_is_validated(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
