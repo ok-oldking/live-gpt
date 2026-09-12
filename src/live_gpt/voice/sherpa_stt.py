@@ -5,10 +5,10 @@ import json
 import os
 import shutil
 import tarfile
-import tempfile
 import threading
 import time
 import urllib.request
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -286,6 +286,12 @@ class SherpaSttProvider:
             return True, f"{model.label} is downloaded and verified"
         except FileNotFoundError:
             return False, f"{model.label} has not been downloaded"
+        except PermissionError as error:
+            return False, (
+                f"Model files are not accessible: {error}. "
+                f"Restore inherited permissions on {directory} and its contents "
+                "so your normal Windows account can read them."
+            )
         except Exception as error:
             return False, f"Model verification failed: {error}"
 
@@ -310,10 +316,15 @@ class SherpaSttProvider:
 
         parent = self.model_root / model_type
         parent.mkdir(parents=True, exist_ok=True)
-        staging_parent = Path(tempfile.mkdtemp(prefix=f".{model.key}-", dir=parent))
+        # mkdtemp uses mode 0o700, which installs a private Windows ACL.
+        # Renaming its descendants into place preserves those permissions,
+        # potentially leaving an elevated download unreadable on normal launches.
+        # Use a unique directory with the model parent's inherited permissions.
+        staging_parent = parent / f".{model.key}-{uuid.uuid4().hex}"
+        staging_parent.mkdir()
         staging = staging_parent / model.key
-        staging.mkdir()
         try:
+            staging.mkdir()
             archive = staging_parent / asset.filename
             last_logged_percent = -5
 

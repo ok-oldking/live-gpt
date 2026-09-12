@@ -4,6 +4,7 @@ import contextlib
 import hashlib
 import io
 import json
+import os
 import sys
 import tarfile
 import tempfile
@@ -223,6 +224,45 @@ class VoiceModelManagerTests(unittest.TestCase):
 
             with self.assertRaisesRegex(RuntimeError, "unsafe path"):
                 SherpaSttProvider._safe_extract(archive, root / "extract")
+
+    def test_download_preserves_parent_permissions_and_verifies_model(self) -> None:
+        model = STT_MODELS["en_nemo_conformer_ctc_small"]
+
+        def download(asset, destination, progress, cancel_event):
+            with tarfile.open(destination, "w:bz2") as output:
+                for relative in model.required_files:
+                    payload = relative.encode("utf-8")
+                    info = tarfile.TarInfo(f"{asset.directory}/{relative}")
+                    info.size = len(payload)
+                    output.addfile(info, io.BytesIO(payload))
+
+        with tempfile.TemporaryDirectory() as directory:
+            manager = SherpaSttProvider(directory)
+            with (
+                patch.object(manager, "_download_asset", side_effect=download),
+                patch("os.mkdir", wraps=os.mkdir) as mkdir,
+            ):
+                manager.download_model("stt", model.key)
+            staging_calls = [
+                invocation for invocation in mkdir.call_args_list
+                if Path(invocation.args[0]).name.startswith(f".{model.key}-")
+            ]
+            self.assertEqual(len(staging_calls), 1)
+            self.assertEqual(staging_calls[0].args[1], 0o777)
+            self.assertTrue(manager.model_status("stt", model.key)[0])
+            self.assertEqual(
+                list((Path(directory) / "stt").iterdir()),
+                [manager.model_directory("stt", model.key)],
+            )
+
+    def test_model_permission_error_explains_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = SherpaSttProvider(directory)
+            with patch.object(Path, "read_text", side_effect=PermissionError("denied")):
+                ok, message = manager.model_status("stt", "zh_sense_voice_small_int8")
+            self.assertFalse(ok)
+            self.assertIn("Restore inherited permissions", message)
+            self.assertIn(str(manager.model_directory("stt", "zh_sense_voice_small_int8")), message)
 
     def test_sense_voice_language_reaches_factory_and_partitions_cache(self) -> None:
         factory = Mock(side_effect=lambda **kwargs: object())
