@@ -3727,8 +3727,7 @@ class OverlayWindow(QMainWindow):
     def _collapse_subtitle_if_outside(self) -> None:
         if not self._subtitle_expanded or self.pet._drag_offset is not None:
             return
-        position = self.mapFromGlobal(QCursor.pos())
-        if not self.rect().contains(position):
+        if not self._pointer_hover_bounds().contains(QCursor.pos()):
             self._collapse_subtitle()
             self.schedule_auto_hide(5_000)
 
@@ -4044,6 +4043,13 @@ class OverlayWindow(QMainWindow):
 
     def _pointer_hover_bounds(self) -> QRect:
         bounds = self.frameGeometry()
+        # Keep the original hover area reachable if expansion hits a screen
+        # edge and moves the window. Expansion and collapse share this region.
+        for collapsed in (
+            self._subtitle_collapsed_geometry, self._input_collapsed_geometry,
+        ):
+            if collapsed is not None:
+                bounds = bounds.united(collapsed)
         # Add 5% of the overlay dimensions on each side for border access.
         margin_x = max(1, round(bounds.width() * 0.05))
         margin_y = max(1, round(bounds.height() * 0.05))
@@ -4052,7 +4058,8 @@ class OverlayWindow(QMainWindow):
     def _track_pointer(self, position: QPoint) -> None:
         hovered = self._pointer_hover_bounds().contains(position)
         self._set_chrome_visible(hovered)
-        if self._fitting_hover_input or self._resize_edges or self.pet._drag_offset is not None:
+        if (self._fitting_hover_input or self._fitting_subtitle
+                or self._resize_edges or self.pet._drag_offset is not None):
             return
         if hovered:
             if self._subtitle_mode_active:

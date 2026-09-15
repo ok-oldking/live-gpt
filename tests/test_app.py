@@ -1041,6 +1041,41 @@ class TrayControllerBrowserTests(unittest.TestCase):
         finally:
             window.close()
 
+    @patch("live_gpt.app.QCursor.pos", return_value=QPoint(-10000, -10000))
+    def test_tall_response_stays_expanded_at_bottom_left_hover_margin(self, cursor) -> None:
+        window = OverlayWindow()
+        try:
+            window.show()
+            window.setGeometry(100, 300, 900, 240)
+            window.begin_response_display("Question")
+            window.set_response_update("Writing…", "Long reply text. " * 200)
+            QApplication.processEvents()
+            collapsed = QRect(window.geometry())
+            position = window.frameGeometry().bottomLeft() + QPoint(-5, 5)
+            self.assertFalse(window.frameGeometry().contains(position))
+            self.assertTrue(window._pointer_hover_bounds().contains(position))
+            cursor.return_value = position
+            window._track_pointer(position)
+            QApplication.processEvents()
+            expanded = QRect(window.geometry())
+            self.assertGreater(expanded.height(), collapsed.height())
+
+            for _ in range(5):
+                window._subtitle_outside_timer.timeout.emit()
+                self.assertTrue(window._subtitle_expanded)
+                self.assertEqual(window.geometry(), expanded)
+                window._track_pointer(position)
+                QApplication.processEvents()
+                self.assertTrue(window._subtitle_expanded)
+                self.assertEqual(window.geometry(), expanded)
+
+            cursor.return_value = QPoint(-10000, -10000)
+            window._subtitle_outside_timer.timeout.emit()
+            self.assertFalse(window._subtitle_expanded)
+            self.assertEqual(window.geometry(), collapsed)
+        finally:
+            window.close()
+
     def test_response_shows_prompt_and_status_until_read_aloud(self) -> None:
         window = OverlayWindow()
         try:
