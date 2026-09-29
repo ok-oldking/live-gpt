@@ -17,14 +17,31 @@ from .logger import Logger
 logger = Logger.get_logger(__name__)
 
 
-def open_remote_debugging_settings() -> str:
-    """Open and enable the default browser's remote-debugging settings."""
+def _preferred_open_browser() -> tuple[Path, int] | None:
+    """Choose the same visible browser for discovery and debugging setup."""
+    windows = _windows_browser_windows()
+    if not windows:
+        return None
     executable = windows_default_browser_executable()
+    return next(
+        ((path, handle) for path, handle in windows
+         if executable is not None and path.name.casefold() == executable.name.casefold()),
+        windows[0],
+    )
+
+
+def open_remote_debugging_settings() -> str:
+    """Open and enable debugging in an existing browser, or the default."""
+    selected = _preferred_open_browser()
+    if selected is not None:
+        executable, window_handle = selected
+    else:
+        executable = windows_default_browser_executable()
+        window_handle = None
     if executable is None:
         raise RuntimeError("Could not find the default browser executable")
     settings_url = _browser_settings_url(executable)
 
-    window_handle = _windows_browser_window(executable, timeout=0.25)
     create_new_tab = window_handle is not None
     if window_handle is None:
         subprocess.Popen(
@@ -133,9 +150,20 @@ def _extract_windows_executable(command: str) -> Path | None:
 
 
 def _windows_browser_window(executable: Path, timeout: float = 4.0) -> int | None:
-    """Find the front-most visible window owned by the browser executable."""
+    """Wait for a visible window owned by the browser executable."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        for path, handle in _windows_browser_windows():
+            if path.name.casefold() == executable.name.casefold():
+                return handle
+        time.sleep(0.1)
+    return None
+
+
+def _windows_browser_windows() -> list[tuple[Path, int]]:
+    """List visible supported browser windows in front-to-back order."""
     if sys.platform != "win32":
-        return None
+        return []
 
     import ctypes
     from ctypes import wintypes
@@ -175,49 +203,47 @@ def _windows_browser_window(executable: Path, timeout: float = 4.0) -> int | Non
     ]
     user32.GetWindowThreadProcessId.restype = wintypes.DWORD
 
-    expected_name = executable.name.casefold()
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        matches: list[int] = []
+    matches: list[tuple[Path, int]] = []
 
-        @enum_callback
-        def collect_window(hwnd: int, parameter: int) -> bool:
-            del parameter
-            if not user32.IsWindowVisible(hwnd):
-                return True
-            if user32.GetWindowTextLengthW(hwnd) <= 0:
-                return True
-
-            process_id = wintypes.DWORD()
-            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
-            process_handle = kernel32.OpenProcess(
-                process_query_limited_information,
-                False,
-                process_id.value,
-            )
-            if not process_handle:
-                return True
-            try:
-                path_buffer = ctypes.create_unicode_buffer(32_768)
-                path_length = wintypes.DWORD(len(path_buffer))
-                if not kernel32.QueryFullProcessImageNameW(
-                    process_handle,
-                    0,
-                    path_buffer,
-                    ctypes.byref(path_length),
-                ):
-                    return True
-                if Path(path_buffer.value).name.casefold() == expected_name:
-                    matches.append(int(hwnd))
-            finally:
-                kernel32.CloseHandle(process_handle)
+    @enum_callback
+    def collect_window(hwnd: int, parameter: int) -> bool:
+        del parameter
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        if user32.GetWindowTextLengthW(hwnd) <= 0:
             return True
 
-        user32.EnumWindows(collect_window, 0)
-        if matches:
-            return matches[0]
-        time.sleep(0.1)
-    return None
+        process_id = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
+        process_handle = kernel32.OpenProcess(
+            process_query_limited_information,
+            False,
+            process_id.value,
+        )
+        if not process_handle:
+            return True
+        try:
+            path_buffer = ctypes.create_unicode_buffer(32_768)
+            path_length = wintypes.DWORD(len(path_buffer))
+            if not kernel32.QueryFullProcessImageNameW(
+                process_handle,
+                0,
+                path_buffer,
+                ctypes.byref(path_length),
+            ):
+                return True
+            path = Path(path_buffer.value)
+            if path.name.casefold() in {
+                "chrome.exe", "msedge.exe", "chromium.exe", "brave.exe",
+                "vivaldi.exe", "opera.exe",
+            }:
+                matches.append((path, int(hwnd)))
+        finally:
+            kernel32.CloseHandle(process_handle)
+        return True
+
+    user32.EnumWindows(collect_window, 0)
+    return matches
 
 
 def _navigate_browser_window(
@@ -328,15 +354,22 @@ if ({create_new_tab_value}) {{
                 [System.Windows.Automation.AutomationElement]::NameProperty,
                 'New Tab'
             )
+        $buttonCondition = New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::Button
+        )
+        $namedButtonCondition = New-Object System.Windows.Automation.AndCondition(
+            $nameCondition, $buttonCondition
+        )
         $newTab = $root.FindFirst(
             [System.Windows.Automation.TreeScope]::Descendants,
-            $nameCondition
+            $namedButtonCondition
         )
     }}
-    if ($newTab) {{
-        $invoke = $newTab.GetCurrentPattern(
-            [System.Windows.Automation.InvokePattern]::Pattern
-        )
+    $invoke = $null
+    if ($newTab -and $newTab.TryGetCurrentPattern(
+        [System.Windows.Automation.InvokePattern]::Pattern, [ref]$invoke
+    )) {{
         $invoke.Invoke()
     }} else {{
         [void][LiveGptWindowMessages]::PostMessage(
@@ -366,9 +399,23 @@ if ({create_new_tab_value}) {{
     }}
     Start-Sleep -Milliseconds 250
 }}
-$addressCondition = New-Object System.Windows.Automation.PropertyCondition(
+$edgeAddressCondition = New-Object System.Windows.Automation.PropertyCondition(
     [System.Windows.Automation.AutomationElement]::AutomationIdProperty,
     'view_1021'
+)
+$chromeAddressCondition = New-Object System.Windows.Automation.PropertyCondition(
+    [System.Windows.Automation.AutomationElement]::AutomationIdProperty,
+    'view_1012'
+)
+$addressIdCondition = New-Object System.Windows.Automation.OrCondition(
+    $edgeAddressCondition, $chromeAddressCondition
+)
+$editCondition = New-Object System.Windows.Automation.PropertyCondition(
+    [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+    [System.Windows.Automation.ControlType]::Edit
+)
+$addressCondition = New-Object System.Windows.Automation.AndCondition(
+    $addressIdCondition, $editCondition
 )
 $deadline = [DateTime]::UtcNow.AddSeconds(3)
 $addressBar = $null

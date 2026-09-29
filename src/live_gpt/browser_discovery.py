@@ -110,7 +110,10 @@ def active_port_endpoints(
     user_data_directories: list[Path] | None = None,
 ) -> list[str]:
     """Return live DevToolsActivePort endpoints from known profile roots."""
-    directories = user_data_directories or current_user_data_directories()
+    directories = (
+        current_user_data_directories()
+        if user_data_directories is None else user_data_directories
+    )
     endpoints: list[str] = []
     for directory in directories:
         endpoint = active_port_endpoint(directory / "DevToolsActivePort")
@@ -122,6 +125,21 @@ def active_port_endpoints(
 def discover_cdp_endpoint() -> str | None:
     """Find a locally running Chromium browser with remote debugging enabled."""
     configured_endpoint = os.environ.get("LIVE_GPT_CDP_ENDPOINT", "").strip()
+    if configured_endpoint and _endpoint_is_available(configured_endpoint):
+        return configured_endpoint
+    if sys.platform == "win32":
+        # Imported lazily: browser_windows also uses the marker helpers here.
+        from .browser_windows import _preferred_open_browser
+
+        selected = _preferred_open_browser()
+        if selected is not None:
+            candidates = active_port_endpoints(browser_user_data_directories(selected[0]))
+            for endpoint in candidates:
+                if _endpoint_is_available(endpoint):
+                    return endpoint
+            # Let setup enable this browser rather than attach to a different
+            # browser's background process or stale DevToolsActivePort marker.
+            return None
     candidates = [configured_endpoint] if configured_endpoint else []
     candidates.extend(active_port_endpoints())
     for endpoint in dict.fromkeys(candidates):

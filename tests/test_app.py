@@ -965,7 +965,7 @@ class TrayControllerBrowserTests(unittest.TestCase):
             self.assertEqual(window.height(), collapsed_height)
             self.assertFalse(window.subtitle_line_one.isHidden())
             self.assertTrue(window.subtitle_full_text.isHidden())
-            self.assertEqual(window.subtitle_line_one.text(), "Question")
+            self.assertEqual(window.subtitle_line_one.text(), window._subtitle_lines()[0])
             self.assertEqual(window.subtitle_line_two.text(), "Writing…")
         finally:
             window.close()
@@ -1076,7 +1076,7 @@ class TrayControllerBrowserTests(unittest.TestCase):
         finally:
             window.close()
 
-    def test_response_shows_prompt_and_status_until_read_aloud(self) -> None:
+    def test_response_shows_streaming_text_and_status_until_read_aloud(self) -> None:
         window = OverlayWindow()
         try:
             window.show()
@@ -1090,7 +1090,7 @@ class TrayControllerBrowserTests(unittest.TestCase):
             lines = window._subtitle_lines()
 
             self.assertGreater(len(lines), 2)
-            self.assertEqual(window.subtitle_line_one.text(), "Sent question")
+            self.assertEqual(window.subtitle_line_one.text(), lines[0])
             self.assertEqual(
                 window.subtitle_line_two.text(),
                 "Searching websites…",

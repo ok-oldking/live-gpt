@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from live_gpt.browser import (
+    ASSISTANT_TURN_SELECTOR,
     CHATGPT_COMPOSER_SELECTOR,
     DICTATION_CANCEL_SELECTORS,
     DICTATION_RESULT_POLL_COUNT,
@@ -25,6 +26,44 @@ class FakePlaywrightError(Exception):
 
 
 class BrowserDiscoveryTests(unittest.TestCase):
+    @patch.dict("os.environ", {"LIVE_GPT_CDP_ENDPOINT": ""})
+    @patch("live_gpt.browser_discovery.sys.platform", "win32")
+    @patch("live_gpt.browser_windows._preferred_open_browser", return_value=(Path("C:/Chrome/chrome.exe"), 1234))
+    @patch("live_gpt.browser_discovery.browser_user_data_directories", return_value=[Path("chrome-profile")])
+    @patch("live_gpt.browser_discovery.active_port_endpoints")
+    @patch("live_gpt.browser_discovery._endpoint_is_available", return_value=True)
+    def test_discovery_uses_open_chrome_marker_instead_of_old_edge_marker(
+        self, available, markers, directories, selected,
+    ):
+        from live_gpt.browser_discovery import discover_cdp_endpoint
+        chrome = "ws://127.0.0.1:4422/devtools/browser/chrome"
+        edge = "ws://127.0.0.1:9222/devtools/browser/edge"
+        markers.side_effect = lambda roots=None: [chrome] if roots == [Path("chrome-profile")] else [edge, chrome]
+        self.assertEqual(discover_cdp_endpoint(), chrome)
+        available.assert_called_once_with(chrome)
+        markers.assert_called_once_with([Path("chrome-profile")])
+
+    @patch.dict("os.environ", {"LIVE_GPT_CDP_ENDPOINT": ""})
+    @patch("live_gpt.browser_discovery.sys.platform", "win32")
+    @patch("live_gpt.browser_windows._preferred_open_browser", return_value=(Path("C:/Chrome/chrome.exe"), 1234))
+    @patch("live_gpt.browser_discovery.browser_user_data_directories", return_value=[Path("chrome-profile")])
+    @patch("live_gpt.browser_discovery.active_port_endpoints", return_value=[])
+    @patch("live_gpt.browser_discovery._windows_remote_debug_ports")
+    def test_disabled_open_browser_requires_setup_not_other_browser_fallback(
+        self, ports, markers, directories, selected,
+    ):
+        from live_gpt.browser_discovery import discover_cdp_endpoint
+        self.assertIsNone(discover_cdp_endpoint())
+        ports.assert_not_called()
+
+    @patch.dict("os.environ", {"LIVE_GPT_CDP_ENDPOINT": "http://localhost:5555"})
+    @patch("live_gpt.browser_discovery._endpoint_is_available", return_value=True)
+    @patch("live_gpt.browser_windows._preferred_open_browser")
+    def test_explicit_endpoint_still_overrides_browser_selection(self, selected, available):
+        from live_gpt.browser_discovery import discover_cdp_endpoint
+        self.assertEqual(discover_cdp_endpoint(), "http://localhost:5555")
+        selected.assert_not_called()
+
     def test_chatgpt_url_requires_exact_https_host(self) -> None:
         self.assertTrue(is_chatgpt_url("https://chatgpt.com/c/conversation"))
         self.assertTrue(is_chatgpt_url("https://www.chatgpt.com/"))
@@ -33,6 +72,97 @@ class BrowserDiscoveryTests(unittest.TestCase):
 
 
 class BrowserMonitorTests(unittest.TestCase):
+    def test_stalled_browser_operation_interrupts_driver(self):
+        monitor = BrowserMonitor()
+        loop, stop_transport = Mock(), Mock()
+        loop.call_soon_threadsafe.side_effect = lambda callback: callback()
+        monitor._playwright_cancellation = (loop, stop_transport)
+        with patch("live_gpt.browser.threading.Timer") as timer:
+            with self.assertRaisesRegex(TimeoutError, "reconnecting"):
+                with monitor._browser_operation(10):
+                    timer.call_args.args[1]()
+        stop_transport.assert_called_once()
+        timer.return_value.cancel.assert_called_once()
+
+    def test_late_watchdog_callback_does_not_stop_healthy_driver(self):
+        monitor = BrowserMonitor()
+        loop, stop_transport = Mock(), Mock()
+        monitor._playwright_cancellation = (loop, stop_transport)
+        with patch("live_gpt.browser.threading.Timer") as timer:
+            with monitor._browser_operation(10):
+                timer.call_args.args[1]()
+            loop.call_soon_threadsafe.call_args.args[0]()
+        stop_transport.assert_not_called()
+
+    def test_send_during_browser_approval_fails_without_queueing(self):
+        monitor = BrowserMonitor()
+        results = []
+        monitor.send_finished.connect(lambda *args: results.append(args))
+        monitor._connection_pending.set()
+        monitor.request_send("old-window", "Keep my text")
+        self.assertTrue(monitor._send_requests.empty())
+        self.assertEqual(results, [(False, "Keep my text",
+                                   "Approve remote debugging in the browser before sending")])
+
+    def test_monitor_restarts_after_stalled_session_and_fails_queued_send(self):
+        monitor = BrowserMonitor()
+        results, tabs = [], []
+        monitor.send_finished.connect(lambda *args: results.append(args))
+        monitor.tabs_changed.connect(tabs.append)
+        monitor._wake_event = Mock()
+        new_page = {"id": "new-window", "title": "ChatGPT", "url": "https://chatgpt.com/"}
+
+        def session(_factory, _error, state):
+            if runner.call_count == 1:
+                state.browser = Mock()
+                state.last_tabs = [{"id": "old-window"}]
+                monitor.request_send("old-window", "Keep my text")
+                raise TimeoutError("stale connection")
+            self.assertIsNone(state.browser)
+            self.assertEqual(state.last_tabs, [])
+            monitor.tabs_changed.emit([new_page])
+            monitor.request_stop()
+
+        with patch.object(monitor, "_run_session", side_effect=session) as runner:
+            monitor.run()
+        self.assertEqual(runner.call_count, 2)
+        self.assertEqual(results, [(False, "Keep my text", "Browser is not connected")])
+        self.assertIn([new_page], tabs)
+
+    def test_queued_send_fails_before_waiting_for_browser_approval(self):
+        monitor = BrowserMonitor()
+        results = []
+        monitor.send_finished.connect(lambda *args: results.append(args))
+        monitor.request_send("old-window", "Keep my text")
+        playwright = Mock()
+
+        def connect(*args, **kwargs):
+            self.assertEqual(results, [(False, "Keep my text", "Browser is not connected")])
+            return Mock()
+
+        playwright.chromium.connect_over_cdp.side_effect = connect
+        with patch("live_gpt.browser.discover_cdp_endpoint", return_value="ws://localhost:9222"):
+            monitor._try_connect(playwright, FakePlaywrightError, _MonitorState())
+        playwright.chromium.connect_over_cdp.assert_called_once()
+
+    def test_stale_paused_media_uses_subtitle_timing_fallback(self):
+        monitor = BrowserMonitor()
+        page = Mock()
+        page.evaluate.return_value = {"playCount": 0, "paused": True, "ended": True, "currentTime": 0, "duration": 100}
+        reading = _ActiveReading(page=page, full_text="The final answer.", subtitles=(), started_at=0)
+        state = _MonitorState(active_reading=reading)
+        updates = []
+        monitor.reading_changed.connect(updates.append)
+        with patch("live_gpt.browser.time.monotonic", return_value=9) as clock:
+            monitor._poll_active_reading(state)
+            self.assertEqual(updates[-1], {"text": "The final answer.", "fraction": 0.0})
+            clock.return_value = 10
+            monitor._poll_active_reading(state)
+            self.assertGreater(updates[-1]["fraction"], 0)
+            clock.return_value = 1000
+            monitor._poll_active_reading(state)
+            self.assertIsNone(state.active_reading)
+
     def test_response_timeout_retries_then_completes_after_stability_window(self):
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
@@ -207,7 +337,7 @@ class BrowserMonitorTests(unittest.TestCase):
         chromium.connect_over_cdp.side_effect = FakePlaywrightError("declined")
         playwright = Mock(chromium=chromium)
         monitor = BrowserMonitor()
-        state = _MonitorState()
+        state = _MonitorState(settings_opened=True)
 
         monitor._try_connect(playwright, FakePlaywrightError, state)
         monitor._try_connect(playwright, FakePlaywrightError, state)
@@ -231,7 +361,7 @@ class BrowserMonitorTests(unittest.TestCase):
         chromium.connect_over_cdp.side_effect = FakePlaywrightError("declined")
         playwright = Mock(chromium=chromium)
         monitor = BrowserMonitor()
-        state = _MonitorState()
+        state = _MonitorState(settings_opened=True)
 
         with patch("live_gpt.browser.time.monotonic", return_value=100.0):
             monitor._try_connect(playwright, FakePlaywrightError, state)
@@ -239,6 +369,45 @@ class BrowserMonitorTests(unittest.TestCase):
             monitor._try_connect(playwright, FakePlaywrightError, state)
 
         self.assertEqual(chromium.connect_over_cdp.call_count, 2)
+
+    @patch("live_gpt.browser.open_remote_debugging_settings")
+    @patch("live_gpt.browser.discover_cdp_endpoint", return_value="ws://127.0.0.1:9222/devtools/browser/id")
+    def test_rejected_endpoint_opens_settings_and_retries_once(self, discover, open_settings):
+        monitor = BrowserMonitor()
+        state = _MonitorState()
+        playwright = Mock()
+        playwright.chromium.connect_over_cdp.side_effect = FakePlaywrightError("403 Forbidden")
+        monitor._try_connect(playwright, FakePlaywrightError, state)
+        open_settings.assert_called_once()
+        self.assertTrue(state.settings_opened)
+        self.assertIsNone(state.retry_endpoint)
+        monitor._try_connect(playwright, FakePlaywrightError, state)
+        monitor._try_connect(playwright, FakePlaywrightError, state)
+        self.assertEqual(playwright.chromium.connect_over_cdp.call_count, 2)
+        open_settings.assert_called_once()
+        monitor.request_retry_connection()
+        playwright.chromium.connect_over_cdp.side_effect = None
+        monitor._try_connect(playwright, FakePlaywrightError, state)
+        self.assertIsNotNone(state.browser)
+        self.assertIsNone(state.retry_endpoint)
+
+    @patch("live_gpt.browser.open_remote_debugging_settings", side_effect=[RuntimeError("Window unavailable"), "chrome://inspect/#remote-debugging"])
+    @patch("live_gpt.browser.discover_cdp_endpoint", return_value="ws://127.0.0.1:9222/devtools/browser/id")
+    def test_rejected_endpoint_retries_failed_settings_after_cooldown(self, discover, open_settings):
+        monitor = BrowserMonitor()
+        state = _MonitorState()
+        playwright = Mock()
+        playwright.chromium.connect_over_cdp.side_effect = FakePlaywrightError("403 Forbidden")
+        with patch("live_gpt.browser.time.monotonic", return_value=100) as clock:
+            monitor._try_connect(playwright, FakePlaywrightError, state)
+            monitor._try_connect(playwright, FakePlaywrightError, state)
+            open_settings.assert_called_once()
+            self.assertEqual(playwright.chromium.connect_over_cdp.call_count, 1)
+            clock.return_value = 131
+            monitor._try_connect(playwright, FakePlaywrightError, state)
+        self.assertEqual(open_settings.call_count, 2)
+        self.assertIsNone(state.retry_endpoint)
+        self.assertTrue(state.settings_opened)
 
     def test_stop_interrupts_pending_browser_approval(self) -> None:
         monitor = BrowserMonitor()
@@ -297,10 +466,7 @@ class BrowserMonitorTests(unittest.TestCase):
         def locate(selector: str) -> Mock:
             if selector == CHATGPT_COMPOSER_SELECTOR:
                 return composer_locator
-            if selector == (
-                '[data-testid^="conversation-turn-"]'
-                '[data-turn="assistant"]'
-            ):
+            if selector == ASSISTANT_TURN_SELECTOR:
                 return assistant_turns
             if selector.startswith('button[aria-label="Remove file"]'):
                 return attachment_locator
@@ -951,10 +1117,7 @@ class BrowserMonitorTests(unittest.TestCase):
         page = Mock()
 
         def locate(selector: str) -> Mock:
-            if selector == (
-                '[data-testid^="conversation-turn-"]'
-                '[data-turn="assistant"]'
-            ):
+            if selector == ASSISTANT_TURN_SELECTOR:
                 return turns
             return Mock(last=read_aloud)
 
@@ -1059,7 +1222,7 @@ class BrowserWindowsTests(unittest.TestCase):
     @patch("live_gpt.browser_windows._wait_for_remote_debugging_marker")
     @patch("live_gpt.browser_windows._enable_remote_debugging")
     @patch("live_gpt.browser_windows._navigate_browser_window")
-    @patch("live_gpt.browser_windows._windows_browser_window")
+    @patch("live_gpt.browser_windows._windows_browser_windows")
     @patch("live_gpt.browser_windows.windows_default_browser_executable")
     def test_existing_browser_gets_new_settings_tab(
         self,
@@ -1070,7 +1233,7 @@ class BrowserWindowsTests(unittest.TestCase):
         wait_for_marker: Mock,
     ) -> None:
         default_executable.return_value = Path("C:/Program Files/Edge/msedge.exe")
-        browser_window.return_value = 1234
+        browser_window.return_value = [(default_executable.return_value, 1234)]
         wait_for_marker.return_value = "ws://127.0.0.1:9222/devtools/browser/id"
 
         url = browser_windows.open_remote_debugging_settings()
@@ -1082,6 +1245,41 @@ class BrowserWindowsTests(unittest.TestCase):
             create_new_tab=True,
         )
         enable_debugging.assert_called_once_with(1234)
+
+    @patch("live_gpt.browser_windows._wait_for_remote_debugging_marker", return_value="ws://127.0.0.1:9222/devtools/browser/id")
+    @patch("live_gpt.browser_windows._enable_remote_debugging")
+    @patch("live_gpt.browser_windows._navigate_browser_window")
+    @patch("live_gpt.browser_windows._windows_browser_windows")
+    @patch("live_gpt.browser_windows.windows_default_browser_executable")
+    @patch("live_gpt.browser_windows.subprocess.Popen")
+    def test_only_open_chrome_is_used_even_when_edge_is_default(
+        self, launch, default, windows, navigate, enable, marker,
+    ):
+        default.return_value = Path("C:/Edge/msedge.exe")
+        chrome = Path("C:/Chrome/chrome.exe")
+        windows.return_value = [(chrome, 1234), (chrome, 5678)]
+        self.assertEqual(browser_windows.open_remote_debugging_settings(),
+                         "chrome://inspect/#remote-debugging")
+        navigate.assert_called_once_with(1234, "chrome://inspect/#remote-debugging", create_new_tab=True)
+        enable.assert_called_once_with(1234)
+        marker.assert_called_once_with(chrome)
+        launch.assert_not_called()
+
+    @patch("live_gpt.browser_windows._wait_for_remote_debugging_marker", return_value="ws://127.0.0.1:9222/devtools/browser/id")
+    @patch("live_gpt.browser_windows._enable_remote_debugging")
+    @patch("live_gpt.browser_windows._navigate_browser_window")
+    @patch("live_gpt.browser_windows._windows_browser_windows")
+    @patch("live_gpt.browser_windows.windows_default_browser_executable")
+    def test_open_default_is_preferred_when_both_browsers_are_open(
+        self, default, windows, navigate, enable, marker,
+    ):
+        edge = Path("C:/Edge/msedge.exe")
+        default.return_value = edge
+        windows.return_value = [(Path("C:/Chrome/chrome.exe"), 1234), (edge, 5678)]
+        self.assertEqual(browser_windows.open_remote_debugging_settings(),
+                         "edge://inspect/#remote-debugging")
+        navigate.assert_called_once_with(5678, "edge://inspect/#remote-debugging", create_new_tab=True)
+        enable.assert_called_once_with(5678)
 
 
 if __name__ == "__main__":

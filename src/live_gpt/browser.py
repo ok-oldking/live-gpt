@@ -4,9 +4,10 @@ import math
 import re
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from queue import Empty, Queue
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from PySide6.QtCore import QThread, Signal
 
@@ -28,9 +29,13 @@ from .logger import Logger
 
 logger = Logger.get_logger(__name__)
 ASSISTANT_TURN_SELECTOR = (
-    '[data-testid^="conversation-turn-"][data-turn="assistant"]'
+    '[data-testid^="conversation-turn-"][data-turn="assistant"], '
+    '[data-turn-key]:has([data-chatgpt-search-unit-key$=":assistant"]), '
+    '[data-turn-key]:has([data-markdown-text-style="assistant-message"])'
 )
 CHATGPT_COMPOSER_SELECTOR = (
+    'form[data-thread-find-composer="true"]:visible '
+    '[data-composer-markdown][contenteditable="true"][role="textbox"]:visible, '
     '[data-composer-surface="true"]:visible '
     '#prompt-textarea[contenteditable="true"]:visible, '
     '[data-composer-surface="true"]:visible '
@@ -270,6 +275,11 @@ class BrowserMonitor(QThread):
         preserve_attachments: bool = False,
     ) -> None:
         """Queue text for the selected ChatGPT page on the worker thread."""
+        if self._connection_pending.is_set():
+            self.send_finished.emit(
+                False, text, "Approve remote debugging in the browser before sending",
+            )
+            return
         self._send_requests.put(
             _SendRequest(
                 tab_id=tab_id,
@@ -326,12 +336,79 @@ class BrowserMonitor(QThread):
             return
 
         state = _MonitorState()
+        while not self._stop_requested:
+            try:
+                self._run_session(sync_playwright, PlaywrightError, state)
+            except Exception as error:
+                if not self._stop_requested:
+                    logger.error("Browser monitor failed; reconnecting", error)
+            finally:
+                self._playwright_cancellation = None
+                self._connection_pending.clear()
+                self._handle_disconnect(state)
+                self._fail_pending_requests(PlaywrightError, state)
+            if not self._stop_requested:
+                self._wake_event.wait(1.5)
+                self._wake_event.clear()
+        logger.info("Browser monitor stopped")
+
+    def _fail_pending_requests(
+        self, playwright_error: type[Exception], state: _MonitorState,
+    ) -> None:
+        self._process_dictation_requests(None, playwright_error)
+        self._process_attachment_requests(None, playwright_error)
+        self._process_clear_requests(None, playwright_error)
+        self._process_send_requests(None, playwright_error, state)
+
+    @contextmanager
+    def _browser_operation(self, timeout: float) -> Iterator[None]:
+        """Bound CDP/page calls that have no API timeout.
+
+        Stop only our Playwright driver. The outer loop creates a fresh driver
+        and rediscovers the browser without closing the user's windows.
+        """
+        cancellation = self._playwright_cancellation
+        if cancellation is None:
+            yield
+            return
+        loop, stop_transport = cancellation
+        expired = threading.Event()
+        cancelled = threading.Event()
+
+        def interrupt() -> None:
+            if not cancelled.is_set():
+                expired.set()
+                logger.warning(f"Browser operation exceeded {timeout:g}s; reconnecting")
+                stop_transport()
+
+        def schedule_interrupt() -> None:
+            try:
+                loop.call_soon_threadsafe(interrupt)
+            except RuntimeError:
+                pass  # The driver has already stopped.
+
+        timer = threading.Timer(timeout, schedule_interrupt)
+        timer.daemon = True
+        timer.start()
+        try:
+            yield
+        finally:
+            cancelled.set()
+            timer.cancel()
+            if expired.is_set():
+                raise TimeoutError("Browser stopped responding; reconnecting")
+
+    def _run_session(
+        self, sync_playwright: Callable, PlaywrightError: type[Exception],
+        state: _MonitorState,
+    ) -> None:
         with sync_playwright() as playwright:
             connection = playwright._impl_obj._connection
             # An unlimited CDP approval wait still needs to be cancellable when
             # the application exits. Playwright exposes no public cancellation
             # token for connect_over_cdp, so terminate its driver safely on the
-            # Playwright event loop only while that call is pending.
+            # Playwright event loop. The operation watchdog uses this same
+            # cancellation path for unresponsive established connections.
             self._playwright_cancellation = (
                 connection._loop,
                 connection._transport._proc.terminate,
@@ -343,7 +420,8 @@ class BrowserMonitor(QThread):
                     self._try_connect(playwright, PlaywrightError, state)
 
                 if self._is_connected(state.browser):
-                    self._refresh_tabs(state, PlaywrightError)
+                    with self._browser_operation(10):
+                        self._refresh_tabs(state, PlaywrightError)
                 elif state.last_tabs:
                     state.last_tabs = []
                     self.tabs_changed.emit([])
@@ -353,26 +431,27 @@ class BrowserMonitor(QThread):
                     if self._is_connected(state.browser)
                     else None
                 )
-                self._stop_active_reading(state)
-                self._process_dictation_requests(
-                    connected_browser,
-                    PlaywrightError,
-                )
-                self._process_attachment_requests(
-                    connected_browser,
-                    PlaywrightError,
-                )
-                self._process_clear_requests(
-                    connected_browser,
-                    PlaywrightError,
-                )
-                self._process_send_requests(
-                    connected_browser,
-                    PlaywrightError,
-                    state,
-                )
-                self._poll_active_response(state)
-                self._poll_active_reading(state)
+                with self._browser_operation(60):
+                    self._stop_active_reading(state)
+                    self._process_dictation_requests(
+                        connected_browser,
+                        PlaywrightError,
+                    )
+                    self._process_attachment_requests(
+                        connected_browser,
+                        PlaywrightError,
+                    )
+                    self._process_clear_requests(
+                        connected_browser,
+                        PlaywrightError,
+                    )
+                    self._process_send_requests(
+                        connected_browser,
+                        PlaywrightError,
+                        state,
+                    )
+                    self._poll_active_response(state)
+                    self._poll_active_reading(state)
                 is_busy = (
                     state.active_response is not None
                     or state.active_reading is not None
@@ -380,8 +459,6 @@ class BrowserMonitor(QThread):
                 self._wake_event.wait(0.25 if is_busy else 1.5)
                 self._wake_event.clear()
             self._playwright_cancellation = None
-
-        logger.info("Browser monitor stopped")
 
     def _stop_active_reading(self, state: _MonitorState) -> None:
         if not self._stop_reading_requested:
@@ -435,6 +512,9 @@ class BrowserMonitor(QThread):
             return
 
         if endpoint == state.retry_endpoint:
+            if self._prepare_remote_debugging(state):
+                state.retry_endpoint = None
+                return
             self._set_status(
                 "Remote debugging was not approved; "
                 "click Enable Debugging to retry"
@@ -443,6 +523,7 @@ class BrowserMonitor(QThread):
 
         self._set_status("Approve remote debugging in the browser…")
         self._connection_pending.set()
+        self._fail_pending_requests(playwright_error, state)
         try:
             state.browser = playwright.chromium.connect_over_cdp(
                 endpoint,
@@ -458,6 +539,12 @@ class BrowserMonitor(QThread):
                 f"endpoint={endpoint!r}: {error}"
             )
             state.retry_endpoint = endpoint
+            # A live marker/port does not mean Chrome will accept CDP. Open
+            # settings even when discovery succeeded, then retry once after
+            # setup. Keep subsequent rejections gated on an explicit retry.
+            if self._prepare_remote_debugging(state):
+                state.retry_endpoint = None
+                return
             self._set_status(
                 "Remote debugging was not approved; "
                 "click Enable Debugging to retry"
@@ -473,7 +560,8 @@ class BrowserMonitor(QThread):
         self._set_status("Browser connected")
         logger.info(f"Connected to browser endpoint={endpoint!r}")
 
-    def _prepare_remote_debugging(self, state: _MonitorState) -> None:
+    def _prepare_remote_debugging(self, state: _MonitorState) -> bool:
+        opened = False
         if (
             not state.settings_opened
             and time.monotonic() >= state.next_settings_attempt
@@ -482,6 +570,7 @@ class BrowserMonitor(QThread):
             try:
                 open_remote_debugging_settings()
                 state.settings_opened = True
+                opened = True
             except Exception as error:
                 logger.error("Unable to open remote debugging settings", error)
                 self._set_status(str(error))
@@ -489,6 +578,7 @@ class BrowserMonitor(QThread):
 
         if state.settings_opened:
             self._set_status("Enable remote debugging in the browser")
+        return opened
 
     def _refresh_tabs(self, state: _MonitorState, playwright_error: type[Exception]) -> None:
         try:
@@ -839,6 +929,9 @@ class BrowserMonitor(QThread):
 
         if not snapshot.has_new_turn:
             response.completion_candidate_at = None
+            if snapshot.is_generating and snapshot.status != response.last_status:
+                response.last_status = snapshot.status
+                self.response_changed.emit(snapshot.status, response.last_text)
             return
 
         text_changed = snapshot.text != response.last_text
@@ -921,6 +1014,7 @@ class BrowserMonitor(QThread):
                 subtitles=self._subtitle_segments(snapshot.text),
             )
             self.reading_started.emit("Preparing Read aloud…")
+            self.reading_changed.emit({"text": snapshot.text, "fraction": 0.0})
         else:
             self.response_finished.emit(
                 True,
@@ -994,7 +1088,7 @@ class BrowserMonitor(QThread):
             if reading.quiet_since is None:
                 reading.quiet_since = now
             finished = now - reading.quiet_since >= 4.0
-        elif elapsed_since_click >= 8.0:
+        if not reading.audio_seen and elapsed_since_click >= 8.0:
             if reading.playback_started_at is None:
                 reading.playback_started_at = now
             playback_elapsed = now - reading.playback_started_at
@@ -1076,7 +1170,8 @@ class BrowserMonitor(QThread):
         form = composer.locator('xpath=ancestor::form[1]')
         send_button = form.locator(
             'button[data-testid="send-button"]:visible, '
-            'button#composer-submit-button[type="submit"]:visible'
+            'button#composer-submit-button[type="submit"]:visible, '
+            'button[type="submit"]:visible'
         ).first
         send_button.wait_for(state="visible", timeout=5_000)
         send_button.click(timeout=15_000)
@@ -1309,6 +1404,7 @@ class BrowserMonitor(QThread):
         return (
             turn.get_attribute("data-turn-id")
             or turn.get_attribute("data-testid")
+            or turn.get_attribute("data-turn-key")
         )
 
     @classmethod
@@ -1322,8 +1418,33 @@ class BrowserMonitor(QThread):
         stop_button = page.locator(
             'button[data-testid="stop-button"], '
             + _label_selectors("button", "Stop generating", "停止生成", "停止產生")
+            + ', ' + _label_selectors(
+                'form[data-thread-find-composer="true"] button',
+                'Stop', '停止',
+            )
         ).first
         is_generating = cls._locator_is_visible(stop_button)
+        live_labels = page.locator(
+            '[data-request-input-activity-root] [role="status"]'
+        ).evaluate_all("elements => elements.map(element => element.textContent || '')")
+        live_status = ""
+        activity_labels = page.locator('[data-turn-key]').last.locator(
+            '[data-d-component="shimmer-text"]:visible'
+        ).evaluate_all("elements => elements.map(element => element.textContent || '')")
+        if isinstance(live_labels, list):
+            for label in reversed(live_labels):
+                status = cls._response_activity_status(str(label), True)
+                if status != "ChatGPT is responding…":
+                    live_status = status
+                    break
+        # These are explicitly rendered activity labels, not arbitrary reply
+        # text. Preserve them verbatim across languages and activity types.
+        if isinstance(activity_labels, list):
+            for label in reversed(activity_labels):
+                if isinstance(label, str) and label.strip():
+                    live_status = label.strip()
+                    break
+        is_generating = is_generating or bool(live_status)
 
         if turn_count == 0:
             return _ResponseSnapshot(
@@ -1331,13 +1452,14 @@ class BrowserMonitor(QThread):
                 is_generating=is_generating,
                 has_completion_controls=False,
                 text="",
-                status="Waiting for ChatGPT…",
+                status=live_status or ("Thinking…" if is_generating else "Waiting for ChatGPT…"),
             )
 
         turn = turns.last
         turn_marker = (
             turn.get_attribute("data-turn-id", timeout=1_000)
             or turn.get_attribute("data-testid", timeout=1_000)
+            or turn.get_attribute("data-turn-key", timeout=1_000)
         )
         if turn_marker == turn_marker_before:
             return _ResponseSnapshot(
@@ -1345,12 +1467,13 @@ class BrowserMonitor(QThread):
                 is_generating=is_generating,
                 has_completion_controls=False,
                 text="",
-                status="Waiting for ChatGPT…",
+                status=live_status or ("Thinking…" if is_generating else "Waiting for ChatGPT…"),
             )
 
         turn_text = turn.inner_text(timeout=1_000).strip()
         markdown = turn.locator(
-            '.markdown, [data-message-author-role="assistant"] .prose'
+            '.markdown, [data-message-author-role="assistant"] .prose, '
+            '[data-markdown-text-style="assistant-message"]'
         ).last
         text = (
             cls._clean_markdown_text(markdown)
@@ -1361,6 +1484,9 @@ class BrowserMonitor(QThread):
             'button[data-testid="copy-turn-action-button"], '
             + _label_selectors("button", "Copy response", "复制回复", "複製回覆")
             + ', ' + MORE_ACTIONS_SELECTOR
+            + ', ' + _label_selectors(
+                '.turn-action-controls button', 'Copy', '复制', '複製',
+            )
         )
         anchors = turn.locator("a[href]").evaluate_all(
             "elements => elements.map(a => [a.innerText, a.href])"
@@ -1374,7 +1500,7 @@ class BrowserMonitor(QThread):
             is_generating=is_generating,
             has_completion_controls=int(completion_controls.count()) > 0,
             text=text,
-            status=cls._response_activity_status(turn_text, is_generating),
+            status=live_status or cls._response_activity_status(turn_text, is_generating),
             links=links,
         )
 
@@ -1413,6 +1539,8 @@ class BrowserMonitor(QThread):
                 clone.querySelectorAll([
                     '[data-testid="webpage-citation-pill"]',
                     '[data-testid="webpage-citation-card"]',
+                    'span[data-search-result-target]:has([data-testid="chatgpt-citation"])',
+                    '[data-testid="chatgpt-citation"]',
                     '[data-content-reference-start]',
                     'button[aria-label="Copy table"]',
                     'button[aria-label="复制表格"]',
@@ -1532,6 +1660,7 @@ class BrowserMonitor(QThread):
             turn_marker = (
                 turn.get_attribute("data-turn-id")
                 or turn.get_attribute("data-testid")
+                or turn.get_attribute("data-turn-key")
             )
             logger.debug(
                 "Read aloud inspection "

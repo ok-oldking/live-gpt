@@ -3474,6 +3474,7 @@ class OverlayWindow(QMainWindow):
         self.transcript_area.begin_reading()
         self._subtitle_reading_active = True
         self._subtitle_reading_started = True
+        self._subtitle_status_text = message
         self._subtitle_hover_origin = None
         self._reading_fraction = 0.0
         self._reading_spoken_characters = 0
@@ -3486,6 +3487,7 @@ class OverlayWindow(QMainWindow):
             self._set_subtitle_status(message)
         else:
             self._render_reading_subtitle(resized=True)
+        self._update_expanded_subtitle()
         self.set_status(message)
 
     def set_reading_subtitle(self, update: object) -> None:
@@ -3619,7 +3621,10 @@ class OverlayWindow(QMainWindow):
     def _set_subtitle_status(self, message: str) -> None:
         self._subtitle_status_text = message
         if self._subtitle_mode_active and not self._subtitle_reading_started:
-            self.subtitle_line_one.setText(self._sent_message_text)
+            lines = self._subtitle_lines()
+            self.subtitle_line_one.setText(
+                lines[0] if lines else self._sent_message_text
+            )
             self.subtitle_line_two.setText(message)
         else:
             self.subtitle_line_one.setText(message)
@@ -3641,7 +3646,7 @@ class OverlayWindow(QMainWindow):
         previous_value = scrollbar.value()
         was_at_bottom = previous_value >= scrollbar.maximum() - 1
         self.subtitle_full_text.setPlainText(text)
-        if was_at_bottom:
+        if was_at_bottom and self._subtitle_reading_started:
             scrollbar.setValue(scrollbar.maximum())
         else:
             scrollbar.setValue(min(previous_value, scrollbar.maximum()))
@@ -4055,8 +4060,26 @@ class OverlayWindow(QMainWindow):
         margin_y = max(1, round(bounds.height() * 0.05))
         return bounds.adjusted(-margin_x, -margin_y, margin_x, margin_y)
 
+    def _pointer_over_visible_content(self, position: QPoint) -> bool:
+        widgets = [self.pet]
+        if self._content_visible:
+            widgets.extend((
+                self.transcript_area, self.subtitle_panel, self.dictation_panel,
+            ))
+        return any(
+            widget.isVisible()
+            and widget.rect().contains(widget.mapFromGlobal(position))
+            for widget in widgets
+        )
+
     def _track_pointer(self, position: QPoint) -> None:
-        hovered = self._pointer_hover_bounds().contains(position)
+        # Reveal from visible content; once open, retain the full overlay and
+        # its existing margin as the area that keeps controls visible.
+        hovered = (
+            self._pointer_hover_bounds().contains(position)
+            if self._chrome_visible
+            else self._pointer_over_visible_content(position)
+        )
         self._set_chrome_visible(hovered)
         if (self._fitting_hover_input or self._fitting_subtitle
                 or self._resize_edges or self.pet._drag_offset is not None):
@@ -4133,7 +4156,7 @@ class OverlayWindow(QMainWindow):
                     self._subtitle_hover_origin = position
                 elif (
                     position - self._subtitle_hover_origin
-                ).manhattanLength() >= 4:
+                ).manhattanLength() >= 4 and self._chrome_visible:
                     QTimer.singleShot(0, self._expand_subtitle)
             elif event_type == QEvent.Type.Leave:
                 QTimer.singleShot(
@@ -4184,8 +4207,6 @@ class OverlayWindow(QMainWindow):
                 self._update_border_resize(event.globalPosition().toPoint())
                 event.accept()
                 return True
-            if self._resize_edges_at(position):
-                self._set_chrome_visible(True)
             self._update_border_cursor(position)
         elif event_type == QEvent.Type.MouseButtonRelease:
             if self._resize_edges:
