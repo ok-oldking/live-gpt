@@ -113,6 +113,20 @@ overlay is hidden or unfocused. Live GPT observes their key state without
 registering or swallowing the keys, so the foreground program continues to
 receive the same keystrokes. Changes are saved for the current Windows user.
 
+If microphone shortcuts stop working when a game is in the foreground, check
+whether the game runs as administrator. Windows can block Live GPT's key-state
+polling across that privilege boundary. Exit Live GPT from its tray menu, then
+launch it at the same privilege level and accept the Windows UAC prompt:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\start-game-mode.ps1
+```
+
+This launcher uses the project's `.venv` and working directory. It requests
+administrator privileges for this launch only; normal launches are unchanged.
+It addresses the Windows privilege mismatch; game-specific input restrictions
+may still require separate troubleshooting.
+
 Preferences are stored as JSON in `%APPDATA%\Live GPT\config.json`. The file is
 updated automatically when a preference changes and includes the language,
 hotkeys, auto-hide state, selected screenshot source, selected

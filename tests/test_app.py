@@ -1076,6 +1076,19 @@ class TrayControllerBrowserTests(unittest.TestCase):
         finally:
             window.close()
 
+    def test_response_does_not_repeat_status_in_preview_line(self) -> None:
+        window = OverlayWindow()
+        try:
+            window.begin_response_display("Question")
+            window.set_response_update("已搜索 6 个网站", "已搜索 6 个网站")
+            self.assertEqual(window.subtitle_line_one.text(), "")
+            self.assertEqual(window.subtitle_line_two.text(), "已搜索 6 个网站")
+            window.set_response_update("正在阅读来源", "Actual reply")
+            self.assertEqual(window.subtitle_line_one.text(), "Actual reply")
+            self.assertEqual(window.subtitle_line_two.text(), "正在阅读来源")
+        finally:
+            window.close()
+
     def test_response_shows_streaming_text_and_status_until_read_aloud(self) -> None:
         window = OverlayWindow()
         try:

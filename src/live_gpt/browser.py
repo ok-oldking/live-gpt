@@ -1429,8 +1429,14 @@ class BrowserMonitor(QThread):
         ).evaluate_all("elements => elements.map(element => element.textContent || '')")
         live_status = ""
         activity_labels = page.locator('[data-turn-key]').last.locator(
-            '[data-d-component="shimmer-text"]:visible'
-        ).evaluate_all("elements => elements.map(element => element.textContent || '')")
+            '[data-d-component="shimmer-text"]:visible, '
+            '[class*="cadencedShimmer-"][class*="cadencedShimmerActive-"]:visible'
+        ).evaluate_all("""elements => elements.map(element => {
+            const clone = element.cloneNode(true);
+            // The animated sweep repeats the label for visual effects only.
+            clone.querySelectorAll('[aria-hidden="true"]').forEach(node => node.remove());
+            return clone.textContent || '';
+        })""")
         if isinstance(live_labels, list):
             for label in reversed(live_labels):
                 status = cls._response_activity_status(str(label), True)
@@ -1478,7 +1484,7 @@ class BrowserMonitor(QThread):
         text = (
             cls._clean_markdown_text(markdown)
             if int(markdown.count()) > 0
-            else cls._response_text_from_turn(turn_text)
+            else cls._response_text_from_turn(cls._clean_markdown_text(turn))
         )
         completion_controls = turn.locator(
             'button[data-testid="copy-turn-action-button"], '
@@ -1537,6 +1543,9 @@ class BrowserMonitor(QThread):
             element => {
                 const clone = element.cloneNode(true);
                 clone.querySelectorAll([
+                    '[data-d-component="shimmer-text"]',
+                    '[class*="cadencedShimmer-"]',
+                    '[aria-hidden="true"]',
                     '[data-testid="webpage-citation-pill"]',
                     '[data-testid="webpage-citation-card"]',
                     'span[data-search-result-target]:has([data-testid="chatgpt-citation"])',

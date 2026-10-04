@@ -3622,8 +3622,9 @@ class OverlayWindow(QMainWindow):
         self._subtitle_status_text = message
         if self._subtitle_mode_active and not self._subtitle_reading_started:
             lines = self._subtitle_lines()
+            preview = lines[0] if lines else self._sent_message_text
             self.subtitle_line_one.setText(
-                lines[0] if lines else self._sent_message_text
+                "" if " ".join(preview.split()) == " ".join(message.split()) else preview
             )
             self.subtitle_line_two.setText(message)
         else:

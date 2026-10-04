@@ -179,6 +179,50 @@ class BrowserLocalizationTests(unittest.TestCase):
             "element => element.textContent='Searching the web'")
         self.assertEqual(BrowserMonitor._response_snapshot(self.page, "old").status, "Searching the web")
 
+    def test_cadenced_shimmer_status_ignores_sweep_and_streams_updates(self):
+        from live_gpt.browser import _ActiveResponse, _MonitorState
+        self.page.set_content('''
+            <div data-turn-key="old">
+              <span class="cadencedShimmer-old cadencedShimmerActive-old">Old activity</span>
+            </div>
+            <div data-turn-key="new">
+              <span id="activity" class="relative inline-block align-top cadencedShimmer-uMTG1d
+                  text-size-chat select-none truncate cadencedShimmerActive-DpK60y">正在搜索 6 个网站<span
+                  aria-hidden="true" class="cadencedShimmerSweep-ICUAVH"><span
+                  class="cadencedShimmerHighlight-VcX29h">正在搜索 6 个网站</span></span></span>
+              <span class="cadencedShimmer-other">Inactive activity</span>
+              <span hidden class="cadencedShimmer-hidden cadencedShimmerActive-hidden">Hidden activity</span>
+            </div>
+            <button data-testid="stop-button">Stop</button>
+        ''')
+        monitor = BrowserMonitor()
+        updates = []
+        monitor.response_changed.connect(lambda *args: updates.append(args))
+        state = _MonitorState(active_response=_ActiveResponse(page=self.page, turn_marker_before="old"))
+        monitor._poll_active_response(state)
+        self.assertEqual(updates[-1], ("正在搜索 6 个网站", ""))
+        self.page.locator('#activity').evaluate("element => element.firstChild.textContent='正在阅读来源'")
+        monitor._poll_active_response(state)
+        self.assertEqual(updates[-1], ("正在阅读来源", ""))
+        self.assertIsNone(state.active_response.completion_candidate_at)
+        self.page.locator('#activity').evaluate("element => element.classList.remove('cadencedShimmerActive-DpK60y')")
+        self.page.locator('[data-testid="stop-button"]').evaluate("element => element.remove()")
+        snapshot = BrowserMonitor._response_snapshot(self.page, "old")
+        self.assertFalse(snapshot.is_generating)
+        self.assertEqual(snapshot.status, "Waiting for ChatGPT…")
+
+    def test_search_activity_is_not_extracted_as_reply_text(self):
+        for reply in ('', '<div class="markdown">Actual reply</div>'):
+            with self.subTest(reply=reply):
+                self.page.set_content(f'''
+                    <section data-testid="conversation-turn-2" data-turn="assistant" data-turn-id="new">
+                      <span class="cadencedShimmer-label">已搜索 6 个网站<span aria-hidden="true">已搜索 6 个网站</span></span>
+                      {reply}
+                    </section>
+                ''')
+                snapshot = BrowserMonitor._response_snapshot(self.page, "old")
+                self.assertEqual(snapshot.text, "Actual reply" if reply else "")
+
     def test_activity_markdown_and_localized_status_stream_before_final_reply(self):
         from live_gpt.browser import _ActiveResponse, _MonitorState
         self.page.set_content("""
