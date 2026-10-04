@@ -11,6 +11,7 @@ from PySide6.QtGui import QKeySequence
 from PySide6.QtWidgets import QLineEdit, QToolButton
 
 from .privileges import foreground_requires_administrator
+from .localization import tr
 
 
 VK_BACK = 0x08
@@ -63,11 +64,11 @@ class HotkeyEdit(QLineEdit):
         self.setReadOnly(True)
         self.setObjectName("hotkeyEdit")
         self._held_modifiers: dict[int, str] = {}
-        self.setPlaceholderText("Press a shortcut")
+        self.setPlaceholderText(tr("Press a shortcut"))
         self.clear_button = QToolButton(self)
         self.clear_button.setText("×")
-        self.clear_button.setAccessibleName("Clear shortcut")
-        self.clear_button.setToolTip("Clear shortcut")
+        self.clear_button.setAccessibleName(tr("Clear shortcut"))
+        self.clear_button.setToolTip(tr("Clear shortcut"))
         self.clear_button.setCursor(Qt.CursorShape.ArrowCursor)
         self.clear_button.setStyleSheet(
             "QToolButton { border: none; background: transparent; color: #cbd5e1; font-size: 20px; }"

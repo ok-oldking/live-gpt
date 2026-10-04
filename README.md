@@ -68,9 +68,16 @@ Starting another recording before the pending prompt is sent removes the
 previously uploaded screenshot before preparing the new one.
 
 The **Configure** button opens the application settings, organized into
-Shortcuts, Language, Recording, and Playing pages in the left navigation. English and
-Chinese can be selected as a preview, but the selection does not change the UI
-yet. Every valid change is saved immediately, so the styled title-bar close
+Shortcuts, Language, Recording, Playing, and Pet pages in the left navigation.
+**Language** offers **English** and **简体中文** (Simplified Chinese).
+On first launch, or when `language` in `config.json` is missing or empty, the app
+matches the operating system's display language to one of these options and
+saves that choice. Chinese locales select Simplified Chinese; other languages
+fall back to English. Changes apply immediately to the overlay, settings, and
+tray menu and persist across restarts. Existing explicit language choices are
+preserved. In `config.json`, `language` is `"en"` or `"zh"`; set it to `""` to
+detect the system language again on the next launch.
+Every valid change is saved immediately, so the styled title-bar close
 button is the only dismissal control and there is no separate Save Changes step.
 Recording independently chooses the browser or local Sherpa-ONNX, while
 Playing independently chooses browser playback or an existing

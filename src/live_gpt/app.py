@@ -71,6 +71,7 @@ from .browser import (
     open_remote_debugging_settings,
 )
 from .config import Config, DEFAULT_CONFIG
+from .localization import UiTranslations, localization, resolve_language, translate_message, tr
 from .pet import PetWidget, available_pets, default_pet_path
 from .pet_download import download_pet, pet_source
 from .logger import Logger, config_logger, shutdown_logger
@@ -181,7 +182,7 @@ class _VoiceOperationThread(QThread):
                     and model_ok
                 ):
                     self.progress.emit(
-                        "Preloading the local TTS model on the GPU…", None
+                        tr("Preloading the local TTS model on the GPU…"), None
                     )
                     model_message = (
                         f"{model_message} · {self.manager.preload(self.model_key)}"
@@ -293,7 +294,7 @@ class _LocalSpeechThread(QThread):
             self.progress.emit({"text": self.text, "fraction": 0.0})
             sd.play(samples, sample_rate, blocking=True)
             if self._cancel_event.is_set():
-                self.completed.emit(False, "Playback stopped for recording")
+                self.completed.emit(False, tr("Playback stopped for recording"))
                 return
             self.progress.emit({"text": self.text, "fraction": 1.0})
             self.completed.emit(
@@ -302,7 +303,7 @@ class _LocalSpeechThread(QThread):
             )
         except Exception as error:
             if self._cancel_event.is_set():
-                self.completed.emit(False, "Playback stopped for recording")
+                self.completed.emit(False, tr("Playback stopped for recording"))
                 return
             logger.error("Local voice playback failed", error)
             self.completed.emit(False, f"Local voice playback failed: {error}")
@@ -412,7 +413,7 @@ class _LocalSpeechThread(QThread):
         ) as output:
             while pending is not finished:
                 if self._cancel_event.is_set():
-                    self.completed.emit(False, "Playback stopped for recording")
+                    self.completed.emit(False, tr("Playback stopped for recording"))
                     return
                 if isinstance(pending, Exception):
                     pending_error = pending
@@ -611,7 +612,7 @@ class _QueuedLocalSpeechThread(QThread):
             while True:
                 item = generated.get()
                 if self._cancel_event.is_set():
-                    self.completed.emit(False, "Playback stopped for recording")
+                    self.completed.emit(False, tr("Playback stopped for recording"))
                     return
                 if item is self._FINISHED:
                     break
@@ -702,7 +703,7 @@ class _QueuedLocalSpeechThread(QThread):
             )
         except Exception as error:
             if self._cancel_event.is_set():
-                self.completed.emit(False, "Playback stopped for recording")
+                self.completed.emit(False, tr("Playback stopped for recording"))
                 return
             logger.error("Queued local voice playback failed", error)
             self.completed.emit(False, f"Local voice playback failed: {error}")
@@ -745,7 +746,7 @@ class HotkeyConfigDialog(QDialog):
         parent: QWidget | None = None,
         *,
         hold_without_screenshot: QKeySequence | str | None = None,
-        language: str = "en",
+        language: str = "",
         recording_backend: str = "web",
         playing_backend: str = "web",
         stt_language: str | None = None,
@@ -763,6 +764,8 @@ class HotkeyConfigDialog(QDialog):
         sovits_manager: SovitsTtsProvider | None = None,
     ) -> None:
         super().__init__(parent)
+        language = resolve_language(str(config["language"]) if config is not None else language)
+        localization.set_language(language)
         self._title_drag_offset: QPoint | None = None
         self.stt_manager = stt_manager or SherpaSttProvider()
         self.sovits_manager = sovits_manager or SovitsTtsProvider()
@@ -778,7 +781,7 @@ class HotkeyConfigDialog(QDialog):
             "tts": [],
         }
         self.setObjectName("settingsDialog")
-        self.setWindowTitle("Live GPT settings")
+        self.setWindowTitle(tr("Live GPT settings"))
         self.setWindowFlags(
             Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint
         )
@@ -807,7 +810,7 @@ class HotkeyConfigDialog(QDialog):
         app_title.setObjectName("settingsAppTitle")
         title_separator = QLabel("/")
         title_separator.setObjectName("settingsTitleSeparator")
-        window_title = QLabel("Settings")
+        window_title = QLabel(tr("Settings"))
         window_title.setObjectName("settingsWindowTitle")
         title_layout.addWidget(app_title)
         title_layout.addWidget(title_separator)
@@ -819,8 +822,8 @@ class HotkeyConfigDialog(QDialog):
         self.close_button.setIcon(QIcon(str(EXIT_ICON_PATH)))
         self.close_button.setIconSize(QSize(16, 16))
         self.close_button.setFixedSize(36, 36)
-        self.close_button.setAccessibleName("Close settings")
-        self.close_button.setToolTip("Close settings; changes are saved automatically")
+        self.close_button.setAccessibleName(tr("Close settings"))
+        self.close_button.setToolTip(tr("Close settings; changes are saved automatically"))
         self.close_button.clicked.connect(self.reject)
         title_layout.addWidget(self.close_button)
         shell_layout.addWidget(self.title_bar)
@@ -837,25 +840,25 @@ class HotkeyConfigDialog(QDialog):
         navigation_layout = QVBoxLayout(navigation)
         navigation_layout.setContentsMargins(14, 24, 14, 18)
         navigation_layout.setSpacing(8)
-        navigation_label = QLabel("SETTINGS")
+        navigation_label = QLabel(tr("SETTINGS"))
         navigation_label.setObjectName("settingsNavigationLabel")
         navigation_layout.addWidget(navigation_label)
         navigation_layout.addSpacing(8)
 
         self.shortcuts_nav_button = self._navigation_button(
-            "Shortcuts",
+            tr("Shortcuts"),
             SHORTCUTS_ICON_PATH,
         )
         self.language_nav_button = self._navigation_button(
-            "Language",
+            tr("Language"),
             LANGUAGE_ICON_PATH,
         )
         self.recording_nav_button = self._navigation_button(
-            "Recording",
+            tr("Recording"),
             MICROPHONE_ICON_PATH,
         )
         self.playing_nav_button = self._navigation_button(
-            "Playing",
+            tr("Playing"),
             SPEAKER_ICON_PATH,
         )
         self.navigation_group = QButtonGroup(self)
@@ -864,7 +867,7 @@ class HotkeyConfigDialog(QDialog):
         self.navigation_group.addButton(self.language_nav_button, 1)
         self.navigation_group.addButton(self.recording_nav_button, 2)
         self.navigation_group.addButton(self.playing_nav_button, 3)
-        self.pet_nav_button = self._navigation_button("Pet", PET_ICON_PATH)
+        self.pet_nav_button = self._navigation_button(tr("Pet"), PET_ICON_PATH)
         self.navigation_group.addButton(self.pet_nav_button, 4)
         self.shortcuts_nav_button.setChecked(True)
         navigation_layout.addWidget(self.shortcuts_nav_button)
@@ -889,10 +892,10 @@ class HotkeyConfigDialog(QDialog):
         hotkey_page_layout = QVBoxLayout(self.hotkey_section)
         hotkey_page_layout.setContentsMargins(0, 0, 0, 0)
         hotkey_page_layout.setSpacing(16)
-        hotkey_title = QLabel("Keyboard shortcuts")
+        hotkey_title = QLabel(tr("Keyboard shortcuts"))
         hotkey_title.setObjectName("settingsPageTitle")
         hotkey_description = QLabel(
-            "Control Live GPT without leaving the app you are using."
+            tr("Control Live GPT without leaving the app you are using.")
         )
         hotkey_description.setObjectName("settingsPageDescription")
         hotkey_description.setWordWrap(True)
@@ -904,7 +907,7 @@ class HotkeyConfigDialog(QDialog):
         hotkey_card_layout = QVBoxLayout(hotkey_card)
         hotkey_card_layout.setContentsMargins(20, 20, 20, 20)
         hotkey_card_layout.setSpacing(14)
-        card_title = QLabel("Global shortcuts")
+        card_title = QLabel(tr("Global shortcuts"))
         card_title.setObjectName("settingsCardTitle")
         hotkey_card_layout.addWidget(card_title)
 
@@ -913,16 +916,16 @@ class HotkeyConfigDialog(QDialog):
         form.setHorizontalSpacing(22)
         form.setVerticalSpacing(12)
         for name, label, editor in (
-            ("hold", "Record and Send with Screenshot", self.hold_microphone_edit),
-            ("hold_without_screenshot", "Record and Send without Screenshot",
+            ("hold", tr("Record and Send with Screenshot"), self.hold_microphone_edit),
+            ("hold_without_screenshot", tr("Record and Send without Screenshot"),
              self.hold_without_screenshot_edit),
         ):
             form.addRow(label, editor)
         hotkey_card_layout.addLayout(form)
 
         note = QLabel(
-            "These shortcuts work globally and are still passed to the "
-            "foreground program."
+            tr("These shortcuts work globally and are still passed to the "
+            "foreground program.")
         )
         note.setObjectName("settingsNote")
         note.setWordWrap(True)
@@ -935,10 +938,10 @@ class HotkeyConfigDialog(QDialog):
         language_page_layout = QVBoxLayout(self.language_section)
         language_page_layout.setContentsMargins(0, 0, 0, 0)
         language_page_layout.setSpacing(16)
-        language_title = QLabel("Interface language")
+        language_title = QLabel(tr("Interface language"))
         language_title.setObjectName("settingsPageTitle")
         language_description = QLabel(
-            "Choose the language used for menus, labels, and messages."
+            tr("Choose the language used for menus, labels, and messages.")
         )
         language_description.setObjectName("settingsPageDescription")
         language_description.setWordWrap(True)
@@ -950,22 +953,22 @@ class HotkeyConfigDialog(QDialog):
         language_card_layout = QVBoxLayout(language_card)
         language_card_layout.setContentsMargins(20, 20, 20, 20)
         language_card_layout.setSpacing(14)
-        language_card_title = QLabel("Display language")
+        language_card_title = QLabel(tr("Display language"))
         language_card_title.setObjectName("settingsCardTitle")
         language_card_layout.addWidget(language_card_title)
 
         self.language_combo = QComboBox()
         self.language_combo.setObjectName("languageCombo")
-        self.language_combo.setAccessibleName("Interface language")
-        self.language_combo.addItems(("English", "中文 (Chinese)"))
-        self.language_combo.setCurrentIndex(1 if language == "zh" else 0)
+        self.language_combo.setAccessibleName(tr("Interface language"))
+        self.language_combo.addItem("English", "en")
+        self.language_combo.addItem("简体中文", "zh")
+        self.language_combo.setCurrentIndex(max(self.language_combo.findData(language), 0))
         self.language_combo.setToolTip(
-            "Choose an interface language preview"
+            tr("Choose an interface language")
         )
         language_card_layout.addWidget(self.language_combo)
         self.language_status = QLabel(
-            "Language selection is available in settings, but translations "
-            "are not applied yet."
+            tr("Changes apply immediately and are saved automatically.")
         )
         self.language_status.setObjectName("settingsNote")
         self.language_status.setWordWrap(True)
@@ -978,10 +981,10 @@ class HotkeyConfigDialog(QDialog):
         recording_layout = QVBoxLayout(self.recording_section)
         recording_layout.setContentsMargins(0, 0, 0, 0)
         recording_layout.setSpacing(12)
-        recording_title = QLabel("Recording")
+        recording_title = QLabel(tr("Recording"))
         recording_title.setObjectName("settingsPageTitle")
         recording_description = QLabel(
-            "Configure microphone transcription independently from voice playback."
+            tr("Configure microphone transcription independently from voice playback.")
         )
         recording_description.setObjectName("settingsPageDescription")
         recording_description.setWordWrap(True)
@@ -993,13 +996,13 @@ class HotkeyConfigDialog(QDialog):
         recording_backend_layout = QVBoxLayout(recording_backend_card)
         recording_backend_layout.setContentsMargins(18, 16, 18, 16)
         recording_backend_layout.setSpacing(10)
-        recording_backend_title = QLabel("Recording engine")
+        recording_backend_title = QLabel(tr("Recording engine"))
         recording_backend_title.setObjectName("settingsCardTitle")
         recording_backend_layout.addWidget(recording_backend_title)
         self.recording_backend_combo = QComboBox()
         self.recording_backend_combo.setObjectName("voiceCombo")
-        self.recording_backend_combo.addItem("Web built-in (browser)", "web")
-        self.recording_backend_combo.addItem("Sherpa-ONNX (local)", "sherpa")
+        self.recording_backend_combo.addItem(tr("Web built-in (browser)"), "web")
+        self.recording_backend_combo.addItem(tr("Sherpa-ONNX (local)"), "sherpa")
         recording_backend_index = self.recording_backend_combo.findData(
             recording_backend
         )
@@ -1014,24 +1017,24 @@ class HotkeyConfigDialog(QDialog):
         recording_sherpa_layout = QVBoxLayout(self.recording_sherpa_card)
         recording_sherpa_layout.setContentsMargins(18, 16, 18, 16)
         recording_sherpa_layout.setSpacing(10)
-        recording_sherpa_title = QLabel("Local speech to text")
+        recording_sherpa_title = QLabel(tr("Local speech to text"))
         recording_sherpa_title.setObjectName("settingsCardTitle")
         recording_sherpa_layout.addWidget(recording_sherpa_title)
         recording_runtime_row = QHBoxLayout()
         recording_runtime_row.setSpacing(8)
-        self.recording_check_button = QPushButton("Check")
-        self.recording_install_button = QPushButton("Install / Repair runtime")
+        self.recording_check_button = QPushButton(tr("Check"))
+        self.recording_install_button = QPushButton(tr("Install / Repair runtime"))
         for button in (self.recording_check_button, self.recording_install_button):
             button.setObjectName("voiceActionButton")
             recording_runtime_row.addWidget(button)
         self.recording_pypi_mirror_combo = QComboBox()
         self.recording_pypi_mirror_combo.setObjectName("voiceCombo")
         self.recording_pypi_mirror_combo.setToolTip(
-            "PyPI mirror used when installing or repairing dependencies"
+            tr("PyPI mirror used when installing or repairing dependencies")
         )
         for mirror in PYPI_MIRRORS.values():
             self.recording_pypi_mirror_combo.addItem(
-                f"PyPI: {mirror.label}", mirror.key
+                tr("PyPI: {mirror}", mirror=tr(mirror.label)), mirror.key
             )
         recording_mirror_index = self.recording_pypi_mirror_combo.findData(
             pypi_mirror
@@ -1040,26 +1043,26 @@ class HotkeyConfigDialog(QDialog):
             max(recording_mirror_index, 0)
         )
         recording_runtime_row.addWidget(self.recording_pypi_mirror_combo)
-        self.recording_cancel_button = QPushButton("Cancel install / download")
+        self.recording_cancel_button = QPushButton(tr("Cancel install / download"))
         self.recording_cancel_button.setObjectName("voiceCancelButton")
         self.recording_cancel_button.setToolTip(
-            "Stop the active dependency installation or model download"
+            tr("Stop the active dependency installation or model download")
         )
         self.recording_cancel_button.hide()
         recording_runtime_row.addWidget(self.recording_cancel_button)
         recording_runtime_row.addStretch()
         recording_sherpa_layout.addLayout(recording_runtime_row)
 
-        recording_sherpa_layout.addWidget(QLabel("Recording language"))
+        recording_sherpa_layout.addWidget(QLabel(tr("Recording language")))
         self.stt_language_combo = QComboBox()
         self.stt_language_combo.setObjectName("voiceCombo")
-        for label, code in (("Auto (multiple languages)", "auto"), ("Chinese (zh)", "zh"), ("English (en)", "en")):
+        for label, code in ((tr("Auto (multiple languages)"), "auto"), (tr("Chinese (zh)"), "zh"), (tr("English (en)"), "en")):
             self.stt_language_combo.addItem(label, code)
         self.stt_language_combo.setCurrentIndex(self.stt_language_combo.findData(
             stt_language or STT_MODELS[stt_model].supported_languages[0]
         ))
         recording_sherpa_layout.addWidget(self.stt_language_combo)
-        recording_sherpa_layout.addWidget(QLabel("Recording model"))
+        recording_sherpa_layout.addWidget(QLabel(tr("Recording model")))
         self.stt_model_combo = QComboBox()
         self.stt_model_combo.setObjectName("voiceCombo")
         self._populate_stt_models(stt_model)
@@ -1072,13 +1075,13 @@ class HotkeyConfigDialog(QDialog):
         self.stt_test_result.setObjectName("voiceTestText")
         self.stt_test_result.setReadOnly(True)
         self.stt_test_result.setPlaceholderText(
-            "Live transcription appears here while streaming"
+            tr("Live transcription appears here while streaming")
         )
         recording_sherpa_layout.addWidget(self.stt_test_result)
         stt_action_row = QHBoxLayout()
         stt_action_row.setSpacing(8)
-        self.stt_download_button = QPushButton("Download STT model")
-        self.voice_record_button = QPushButton("Record microphone")
+        self.stt_download_button = QPushButton(tr("Download STT model"))
+        self.voice_record_button = QPushButton(tr("Record microphone"))
         for button in (self.stt_download_button, self.voice_record_button):
             button.setObjectName("voiceActionButton")
             stt_action_row.addWidget(button)
@@ -1090,7 +1093,7 @@ class HotkeyConfigDialog(QDialog):
         self.recording_progress.hide()
         recording_sherpa_layout.addWidget(self.recording_progress)
         self.recording_status = QLabel(
-            "Select Check to validate the runtime and selected recording model."
+            tr("Select Check to validate the runtime and selected recording model.")
         )
         self.recording_status.setObjectName("voiceStatus")
         self.recording_status.setWordWrap(True)
@@ -1111,10 +1114,10 @@ class HotkeyConfigDialog(QDialog):
         playing_layout = QVBoxLayout(self.playing_section)
         playing_layout.setContentsMargins(0, 0, 0, 0)
         playing_layout.setSpacing(12)
-        playing_title = QLabel("Playing")
+        playing_title = QLabel(tr("Playing"))
         playing_title.setObjectName("settingsPageTitle")
         playing_description = QLabel(
-            "Configure reply speech independently from microphone transcription."
+            tr("Configure reply speech independently from microphone transcription.")
         )
         playing_description.setObjectName("settingsPageDescription")
         playing_description.setWordWrap(True)
@@ -1126,14 +1129,14 @@ class HotkeyConfigDialog(QDialog):
         playing_backend_layout = QVBoxLayout(playing_backend_card)
         playing_backend_layout.setContentsMargins(18, 16, 18, 16)
         playing_backend_layout.setSpacing(10)
-        playing_backend_title = QLabel("Playback engine")
+        playing_backend_title = QLabel(tr("Playback engine"))
         playing_backend_title.setObjectName("settingsCardTitle")
         playing_backend_layout.addWidget(playing_backend_title)
         self.playing_backend_combo = QComboBox()
         self.playing_backend_combo.setObjectName("voiceCombo")
-        self.playing_backend_combo.addItem("Web built-in (browser)", "web")
+        self.playing_backend_combo.addItem(tr("Web built-in (browser)"), "web")
         self.playing_backend_combo.addItem(
-            "GPT-SoVITS (existing local installation)", "sovits"
+            tr("GPT-SoVITS (existing local installation)"), "sovits"
         )
         playing_backend_index = self.playing_backend_combo.findData(
             playing_backend
@@ -1147,24 +1150,24 @@ class HotkeyConfigDialog(QDialog):
         playing_local_layout = QVBoxLayout(self.playing_local_card)
         playing_local_layout.setContentsMargins(18, 16, 18, 16)
         playing_local_layout.setSpacing(10)
-        self.playing_local_title = QLabel("GPT-SoVITS text to speech")
+        self.playing_local_title = QLabel(tr("GPT-SoVITS text to speech"))
         self.playing_local_title.setObjectName("settingsCardTitle")
         playing_local_layout.addWidget(self.playing_local_title)
         playing_runtime_row = QHBoxLayout()
         playing_runtime_row.setSpacing(8)
-        self.playing_check_button = QPushButton("Check")
-        self.playing_install_button = QPushButton("Install / Repair runtime")
+        self.playing_check_button = QPushButton(tr("Check"))
+        self.playing_install_button = QPushButton(tr("Install / Repair runtime"))
         for button in (self.playing_check_button, self.playing_install_button):
             button.setObjectName("voiceActionButton")
             playing_runtime_row.addWidget(button)
         self.playing_pypi_mirror_combo = QComboBox()
         self.playing_pypi_mirror_combo.setObjectName("voiceCombo")
         self.playing_pypi_mirror_combo.setToolTip(
-            "PyPI mirror used when installing or repairing dependencies"
+            tr("PyPI mirror used when installing or repairing dependencies")
         )
         for mirror in PYPI_MIRRORS.values():
             self.playing_pypi_mirror_combo.addItem(
-                f"PyPI: {mirror.label}", mirror.key
+                tr("PyPI: {mirror}", mirror=tr(mirror.label)), mirror.key
             )
         playing_mirror_index = self.playing_pypi_mirror_combo.findData(
             pypi_mirror
@@ -1173,10 +1176,10 @@ class HotkeyConfigDialog(QDialog):
             max(playing_mirror_index, 0)
         )
         playing_runtime_row.addWidget(self.playing_pypi_mirror_combo)
-        self.playing_cancel_button = QPushButton("Cancel install / download")
+        self.playing_cancel_button = QPushButton(tr("Cancel install / download"))
         self.playing_cancel_button.setObjectName("voiceCancelButton")
         self.playing_cancel_button.setToolTip(
-            "Stop the active dependency installation or model download"
+            tr("Stop the active dependency installation or model download")
         )
         self.playing_cancel_button.hide()
         playing_runtime_row.addWidget(self.playing_cancel_button)
@@ -1185,15 +1188,15 @@ class HotkeyConfigDialog(QDialog):
 
         self.sovits_weight_widgets = []
         for suffix, label, value in (
-            ("ckpt", "GPT model (.ckpt)", sovits_ckpt_path),
-            ("pth", "SoVITS model (.pth)", sovits_pth_path),
+            ("ckpt", tr("GPT model (.ckpt)"), sovits_ckpt_path),
+            ("pth", tr("SoVITS model (.pth)"), sovits_pth_path),
         ):
             row = QHBoxLayout()
             edit = QLineEdit(value)
             edit.setObjectName("voiceTestText")
             edit.setAccessibleName(label)
-            edit.setPlaceholderText("Optional — select both model files or leave both blank")
-            button = QPushButton("Browse…")
+            edit.setPlaceholderText(tr("Optional — select both model files or leave both blank"))
+            button = QPushButton(tr("Browse…"))
             button.setObjectName("voiceActionButton")
             button.clicked.connect(lambda _checked=False, ext=suffix: self._browse_sovits_weight(ext))
             setattr(self, f"sovits_{suffix}_edit", edit)
@@ -1207,13 +1210,13 @@ class HotkeyConfigDialog(QDialog):
         self.sovits_weights_status.setWordWrap(True)
         playing_local_layout.addWidget(self.sovits_weights_status)
 
-        self.sovits_installation_label = QLabel("Installation folder")
+        self.sovits_installation_label = QLabel(tr("Installation folder"))
         self.sovits_installation_edit = QLineEdit(sovits_installation)
         self.sovits_installation_edit.setObjectName("voiceTestText")
         self.sovits_installation_edit.setPlaceholderText(
-            "Folder containing GPT_SoVITS and runtime/python.exe"
+            tr("Folder containing GPT_SoVITS and runtime/python.exe")
         )
-        self.sovits_installation_browse_button = QPushButton("Browse…")
+        self.sovits_installation_browse_button = QPushButton(tr("Browse…"))
         self.sovits_installation_browse_button.setObjectName("voiceActionButton")
         sovits_installation_row = QHBoxLayout()
         sovits_installation_row.setSpacing(8)
@@ -1222,30 +1225,37 @@ class HotkeyConfigDialog(QDialog):
         sovits_installation_row.addWidget(self.sovits_installation_browse_button)
         playing_local_layout.addLayout(sovits_installation_row)
 
-        self.sovits_reference_title = QLabel("Reference voice")
+        self.sovits_reference_title = QLabel(tr("Reference voice"))
         self.sovits_reference_title.setObjectName("voiceFieldGroupTitle")
         self.sovits_reference_description = QLabel(
-            "These settings describe the voice sample GPT-SoVITS should imitate."
+            tr("These settings describe the voice sample GPT-SoVITS should imitate.")
         )
         self.sovits_reference_description.setObjectName("settingsNote")
         self.sovits_reference_description.setWordWrap(True)
         playing_local_layout.addWidget(self.sovits_reference_title)
         playing_local_layout.addWidget(self.sovits_reference_description)
 
-        self.sovits_text_lang_label = QLabel("Output language")
+        self.sovits_text_lang_label = QLabel(tr("Output language"))
         self.sovits_text_lang_combo = QComboBox()
         self.sovits_text_lang_combo.setObjectName("voiceCombo")
         self.sovits_text_lang_combo.setToolTip(
-            "Language of the text that GPT-SoVITS will generate"
+            tr("Language of the text that GPT-SoVITS will generate")
         )
-        self.sovits_prompt_lang_label = QLabel("Reference language")
+        self.sovits_prompt_lang_label = QLabel(tr("Reference language"))
         self.sovits_prompt_lang_combo = QComboBox()
         self.sovits_prompt_lang_combo.setObjectName("voiceCombo")
         self.sovits_prompt_lang_combo.setToolTip(
-            "Language spoken in the reference audio and transcript"
+            tr("Language spoken in the reference audio and transcript")
         )
+        sovits_language_labels = {
+            "auto": "Auto", "auto_yue": "Auto (Cantonese)",
+            "zh": "Chinese", "en": "English", "ja": "Japanese",
+            "yue": "Cantonese", "ko": "Korean",
+            "all_zh": "Chinese only", "all_ja": "Japanese only",
+            "all_yue": "Cantonese only", "all_ko": "Korean only",
+        }
         for language_code in SOVITS_LANGUAGES:
-            label = language_code.replace("all_", "all ").replace("_", " ")
+            label = tr(sovits_language_labels[language_code])
             self.sovits_text_lang_combo.addItem(label, language_code)
             self.sovits_prompt_lang_combo.addItem(label, language_code)
         self.sovits_text_lang_combo.setCurrentIndex(
@@ -1254,13 +1264,13 @@ class HotkeyConfigDialog(QDialog):
         self.sovits_prompt_lang_combo.setCurrentIndex(
             max(self.sovits_prompt_lang_combo.findData(sovits_prompt_lang), 0)
         )
-        self.sovits_ref_audio_label = QLabel("Reference audio")
+        self.sovits_ref_audio_label = QLabel(tr("Reference audio"))
         self.sovits_ref_audio_edit = QLineEdit(sovits_ref_audio_path)
         self.sovits_ref_audio_edit.setObjectName("voiceTestText")
         self.sovits_ref_audio_edit.setPlaceholderText(
-            "Required for synthesis; cached while unchanged"
+            tr("Required for synthesis; cached while unchanged")
         )
-        self.sovits_ref_audio_browse_button = QPushButton("Browse…")
+        self.sovits_ref_audio_browse_button = QPushButton(tr("Browse…"))
         self.sovits_ref_audio_browse_button.setObjectName("voiceActionButton")
         sovits_ref_row = QHBoxLayout()
         sovits_ref_row.setSpacing(8)
@@ -1269,10 +1279,10 @@ class HotkeyConfigDialog(QDialog):
         sovits_ref_row.addWidget(self.sovits_ref_audio_browse_button)
         playing_local_layout.addLayout(sovits_ref_row)
 
-        self.sovits_prompt_text_label = QLabel("Reference transcript")
+        self.sovits_prompt_text_label = QLabel(tr("Reference transcript"))
         self.sovits_prompt_text_edit = QLineEdit(sovits_prompt_text)
         self.sovits_prompt_text_edit.setObjectName("voiceTestText")
-        self.sovits_prompt_text_edit.setPlaceholderText("Optional exact transcript")
+        self.sovits_prompt_text_edit.setPlaceholderText(tr("Optional exact transcript"))
         sovits_prompt_row = QHBoxLayout()
         sovits_prompt_row.setSpacing(8)
         sovits_prompt_row.addWidget(self.sovits_prompt_text_label)
@@ -1285,10 +1295,10 @@ class HotkeyConfigDialog(QDialog):
         sovits_reference_language_row.addWidget(self.sovits_prompt_lang_combo, 1)
         playing_local_layout.addLayout(sovits_reference_language_row)
 
-        self.sovits_output_title = QLabel("Generated speech")
+        self.sovits_output_title = QLabel(tr("Generated speech"))
         self.sovits_output_title.setObjectName("voiceFieldGroupTitle")
         self.sovits_output_description = QLabel(
-            "Choose the language of ChatGPT replies sent to speech synthesis."
+            tr("Choose the language of ChatGPT replies sent to speech synthesis.")
         )
         self.sovits_output_description.setObjectName("settingsNote")
         self.sovits_output_description.setWordWrap(True)
@@ -1302,10 +1312,10 @@ class HotkeyConfigDialog(QDialog):
 
         self.voice_test_text = QLineEdit()
         self.voice_test_text.setObjectName("voiceTestText")
-        self.voice_test_text.setPlaceholderText("Text to synthesize")
+        self.voice_test_text.setPlaceholderText(tr("Text to synthesize"))
         tts_action_row = QHBoxLayout()
         tts_action_row.setSpacing(8)
-        self.voice_play_button = QPushButton("Play text")
+        self.voice_play_button = QPushButton(tr("Play text"))
         self.voice_play_button.setObjectName("voiceActionButton")
         tts_action_row.addWidget(self.voice_play_button)
         tts_action_row.addStretch()
@@ -1317,7 +1327,7 @@ class HotkeyConfigDialog(QDialog):
         self.playing_progress.hide()
         playing_local_layout.addWidget(self.playing_progress)
         self.playing_status = QLabel(
-            "Select Check to validate the runtime and selected playback model."
+            tr("Select Check to validate the runtime and selected playback model.")
         )
         self.playing_status.setObjectName("voiceStatus")
         self.playing_status.setWordWrap(True)
@@ -1657,6 +1667,12 @@ class HotkeyConfigDialog(QDialog):
         )
 
         self.setStyleSheet(self.styleSheet() + COMBOBOX_STYLE)
+        self._translations = UiTranslations(self)
+        localization.changed.connect(self._retranslate_models)
+
+    def _retranslate_models(self) -> None:
+        self._populate_stt_models(self.stt_model())
+        self._update_stt_description()
 
     def _show_recording_page(self, checked: bool) -> None:
         if checked:
@@ -1697,7 +1713,7 @@ class HotkeyConfigDialog(QDialog):
 
     def _connect_auto_save(self) -> None:
         self.language_combo.currentIndexChanged.connect(
-            lambda: self._save_setting("language", self.language())
+            self._language_changed
         )
         self.recording_backend_combo.currentIndexChanged.connect(
             lambda: self._save_setting(
@@ -1744,10 +1760,10 @@ class HotkeyConfigDialog(QDialog):
         page.setObjectName("settingsPage")
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
-        title = QLabel("Pet")
+        title = QLabel(tr("Pet"))
         title.setObjectName("settingsPageTitle")
         layout.addWidget(title)
-        description = QLabel("Choose a pet or download one from GitHub. Changes are saved and applied immediately.")
+        description = QLabel(tr("Choose a pet or download one from GitHub. Changes are saved and applied immediately."))
         description.setObjectName("settingsPageDescription")
         description.setWordWrap(True)
         layout.addWidget(description)
@@ -1755,11 +1771,11 @@ class HotkeyConfigDialog(QDialog):
         pet_card.setObjectName("settingsCard")
         pet_layout = QVBoxLayout(pet_card)
         pet_layout.setContentsMargins(18, 18, 18, 18)
-        pet_title = QLabel("Choose a pet")
+        pet_title = QLabel(tr("Choose a pet"))
         pet_title.setObjectName("settingsCardTitle")
         pet_layout.addWidget(pet_title)
         self.pet_list = QListWidget()
-        self.pet_list.setAccessibleName("Available pets")
+        self.pet_list.setAccessibleName(tr("Available pets"))
         self.pet_list.setIconSize(QSize(48, 52))
         self.pet_list.setSpacing(4)
         self.pet_list.setStyleSheet("""
@@ -1776,24 +1792,24 @@ class HotkeyConfigDialog(QDialog):
         download_row = QHBoxLayout()
         self.pet_url_edit = QLineEdit()
         self.pet_url_edit.setObjectName("voiceTestText")
-        self.pet_url_edit.setAccessibleName("Pet GitHub folder URL")
+        self.pet_url_edit.setAccessibleName(tr("Pet GitHub folder URL"))
         self.pet_url_edit.setPlaceholderText("https://github.com/owner/repo/tree/main/pets/name")
-        self.pet_url_edit.setToolTip("Paste a GitHub pet folder URL using /tree/ or /blob/.")
-        self.pet_download_button = QPushButton("Download pet")
+        self.pet_url_edit.setToolTip(tr("Paste a GitHub pet folder URL using /tree/ or /blob/."))
+        self.pet_download_button = QPushButton(tr("Download pet"))
         self.pet_download_button.setObjectName("voiceActionButton")
         download_row.addWidget(self.pet_url_edit, 1)
         download_row.addWidget(self.pet_download_button)
         pet_layout.addLayout(download_row)
         self.pet_download_tip = QLabel(
-            'Find pets at <a href="https://github.com/legeling/awesome-codex-pet" '
+            tr('Find pets at <a href="https://github.com/legeling/awesome-codex-pet" '
             'style="color: #4cc9f0;">awesome-codex-pet</a>. '
-            'Copy a pet folder link and paste it above.'
+            'Copy a pet folder link and paste it above.')
         )
         self.pet_download_tip.setObjectName("settingsNote")
         self.pet_download_tip.setOpenExternalLinks(True)
         self.pet_download_tip.setWordWrap(True)
         pet_layout.addWidget(self.pet_download_tip)
-        self.pet_download_status = QLabel("Download pet.json and spritesheet.webp to download/pets, then switch to the pet.")
+        self.pet_download_status = QLabel(tr("Download pet.json and spritesheet.webp to download/pets, then switch to the pet."))
         self.pet_download_status.setObjectName("settingsNote")
         self.pet_download_status.setWordWrap(True)
         pet_layout.addWidget(self.pet_download_status)
@@ -1806,29 +1822,29 @@ class HotkeyConfigDialog(QDialog):
         self.pet_idle_form = form = QFormLayout(card)
         form.setContentsMargins(18, 18, 18, 18)
         form.setSpacing(16)
-        idle_title = QLabel("Idle animation")
+        idle_title = QLabel(tr("Idle animation"))
         idle_title.setObjectName("settingsCardTitle")
         form.addRow(idle_title)
         self.pet_idle_combo = QComboBox()
         self.pet_idle_combo.setObjectName("voiceCombo")
-        for label, mode in (("Always play idle animation", "always"),
-                            ("Do not play idle animation", "never"),
-                            ("Play idle animation for a duration", "timed")):
+        for label, mode in ((tr("Always play idle animation"), "always"),
+                            (tr("Do not play idle animation"), "never"),
+                            (tr("Play idle animation for a duration"), "timed")):
             self.pet_idle_combo.addItem(label, mode)
         self.pet_idle_combo.setCurrentIndex(self.pet_idle_combo.findData(values["pet_idle_mode"]))
-        form.addRow("Playback", self.pet_idle_combo)
+        form.addRow(tr("Playback"), self.pet_idle_combo)
         self.pet_idle_seconds = QSpinBox()
         self.pet_idle_seconds.setRange(1, 3600)
-        self.pet_idle_seconds.setSuffix(" seconds")
+        self.pet_idle_seconds.setSuffix(tr(" seconds"))
         self.pet_idle_seconds.setValue(int(values["pet_idle_seconds"]))
         self.pet_idle_seconds.setEnabled(self.pet_idle_combo.currentData() == "timed")
         self.pet_idle_seconds.setStyleSheet("QSpinBox { color: #f5f7ff; background: #18213b; padding: 8px; border: 1px solid #536080; border-radius: 6px; }")
-        form.addRow("Duration", self.pet_idle_seconds)
+        form.addRow(tr("Duration"), self.pet_idle_seconds)
         form.setRowVisible(self.pet_idle_seconds, self.pet_idle_combo.currentData() == "timed")
         layout.addWidget(card)
         self.pet_settings_note = QLabel(
-            "Idle stops on a still pose. The timer restarts when the pet returns to idle. "
-            "Looking and activity animations continue to work."
+            tr("Idle stops on a still pose. The timer restarts when the pet returns to idle. "
+            "Looking and activity animations continue to work.")
         )
         self.pet_settings_note.setObjectName("settingsPageDescription")
         self.pet_settings_note.setWordWrap(True)
@@ -1878,7 +1894,7 @@ class HotkeyConfigDialog(QDialog):
             return
         self.pet_download_button.setEnabled(False)
         self.pet_url_edit.setEnabled(False)
-        self.pet_download_status.setText("Downloading and checking the pet…")
+        self.pet_download_status.setText(tr("Downloading and checking the pet…"))
         worker = _PetDownloadThread(url, self)
         self._pet_download_thread = worker
         worker.completed.connect(self._pet_download_completed)
@@ -1887,11 +1903,11 @@ class HotkeyConfigDialog(QDialog):
 
     def _pet_download_completed(self, success: bool, message: str) -> None:
         if not success:
-            self.pet_download_status.setText(f"Could not download pet: {message}")
+            self.pet_download_status.setText(tr("Could not download pet: {message}", message=message))
             return
         self._refresh_pet_list(message)
         self._save_pet_settings()
-        self.pet_download_status.setText(f"Pet ready and selected: {Path(message).name}")
+        self.pet_download_status.setText(tr("Pet ready and selected: {name}", name=Path(message).name))
 
     def _pet_download_finished(self) -> None:
         worker = self._pet_download_thread
@@ -1914,9 +1930,9 @@ class HotkeyConfigDialog(QDialog):
             probe = PetWidget(path)
             probe.deleteLater()
         except (OSError, ValueError, TypeError, KeyError) as error:
-            self.pet_settings_note.setText(f"Could not load this pet: {error}")
+            self.pet_settings_note.setText(tr("Could not load this pet: {error}", error=error))
             return
-        self.pet_settings_note.setText("Saved. Idle stops on a still pose; looking and activity animations remain enabled.")
+        self.pet_settings_note.setText(tr("Saved. Idle stops on a still pose; looking and activity animations remain enabled."))
         if self.config is not None:
             self.config.update({"pet_path": path, "pet_idle_mode": mode, "pet_idle_seconds": seconds})
         self.pet_settings_changed.emit(path, mode, seconds)
@@ -1956,7 +1972,7 @@ class HotkeyConfigDialog(QDialog):
             if self.stt_language() in model.supported_languages:
                 size_mb = round(model.asset.size / 1024 / 1024)
                 self.stt_model_combo.addItem(
-                    f"[{model.mode}] {model.label} · {size_mb} MB", model.key
+                    f"[{tr(model.mode)}] {model.label} · {size_mb} MB", model.key
                 )
         self.stt_model_combo.setCurrentIndex(max(self.stt_model_combo.findData(selected), 0))
         self.stt_model_combo.blockSignals(False)
@@ -1971,15 +1987,22 @@ class HotkeyConfigDialog(QDialog):
         return str(self.stt_language_combo.currentData() or "auto")
 
     def _stt_model_changed(self) -> None:
-        model = STT_MODELS[self.stt_model()]
-        self.stt_model_description.setText(model.description)
+        self._update_stt_description()
         self.stt_test_result.clear()
         self._voice_status_checked["stt"] = False
+
+    def _update_stt_description(self) -> None:
+        model = STT_MODELS[self.stt_model()]
+        self.stt_model_description.setText(tr(
+            "{mode} · {accuracy} · 5-sec compute {compute} · model {size} · RAM {ram} · {best_for}",
+            mode=tr(model.mode), accuracy=tr(model.accuracy), compute=tr(model.compute),
+            size=model.model_size, ram=model.ram, best_for=tr(model.best_for),
+        ))
 
     def _browse_sovits_installation(self) -> None:
         selected = QFileDialog.getExistingDirectory(
             self,
-            "Choose GPT-SoVITS installation",
+            tr("Choose GPT-SoVITS installation"),
             self.sovits_installation_edit.text(),
         )
         if selected:
@@ -1994,8 +2017,8 @@ class HotkeyConfigDialog(QDialog):
     def _browse_sovits_weight(self, extension: str) -> None:
         edit = getattr(self, f"sovits_{extension}_edit")
         selected, _ = QFileDialog.getOpenFileName(
-            self, f"Choose .{extension} model", edit.text(),
-            f"Model files (*.{extension})",
+            self, tr("Choose .{extension} model", extension=extension), edit.text(),
+            tr("Model files (*.{extension})", extension=extension),
         )
         if selected:
             edit.setText(selected)
@@ -2008,11 +2031,11 @@ class HotkeyConfigDialog(QDialog):
         try:
             SovitsTtsProvider.validate_weights(*pair)
         except ValueError as error:
-            self.sovits_weights_status.setText(str(error) + " Changes are not saved.")
+            self.sovits_weights_status.setText(tr("{error} Changes are not saved.", error=translate_message(str(error))))
             self.playing_check_button.setEnabled(False)
             self.voice_play_button.setEnabled(False)
             return
-        self.sovits_weights_status.setText("Both paths are optional. Leave both blank to use the installation’s configured models.")
+        self.sovits_weights_status.setText(tr("Both paths are optional. Leave both blank to use the installation’s configured models."))
         busy = self._voice_worker is not None or self._voice_test_running()
         self.playing_check_button.setEnabled(not busy)
         self.voice_play_button.setEnabled(not busy)
@@ -2022,9 +2045,9 @@ class HotkeyConfigDialog(QDialog):
     def _browse_sovits_ref_audio(self) -> None:
         selected, _filter = QFileDialog.getOpenFileName(
             self,
-            "Choose GPT-SoVITS reference audio",
+            tr("Choose GPT-SoVITS reference audio"),
             self.sovits_ref_audio_edit.text(),
-            "Audio files (*.wav *.flac *.mp3);;All files (*)",
+            tr("Audio files (*.wav *.flac *.mp3);;All files (*)"),
         )
         if selected:
             self.sovits_ref_audio_edit.setText(selected)
@@ -2102,14 +2125,14 @@ class HotkeyConfigDialog(QDialog):
         install_log.setVisible(action in ("install", "download"))
         if install_log.isVisible():
             self._voice_install_log_lines[model_type].clear()
-            install_log.setText("Waiting for installer output…")
+            install_log.setText(tr("Waiting for installer output…"))
             install_log.setToolTip("")
         status.setProperty("error", False)
         status.setText(
             {
-                "status": "Checking versions and file integrity…",
-                "install": "Installing the local voice runtime…",
-                "download": "Preparing verified model download…",
+                "status": tr("Checking versions and file integrity…"),
+                "install": tr("Installing the local voice runtime…"),
+                "download": tr("Preparing verified model download…"),
             }[action]
         )
         self._refresh_voice_status_style(status)
@@ -2137,9 +2160,9 @@ class HotkeyConfigDialog(QDialog):
         button = self._voice_cancel_button(self._voice_operation_type)
         button.setEnabled(False)
         status, progress = self._voice_widgets(self._voice_operation_type)
-        status.setText("Cancelling the active install or download…")
+        status.setText(tr("Cancelling the active install or download…"))
         progress.setRange(0, 0)
-        self._voice_operation_log("Cancellation requested…")
+        self._voice_operation_log(tr("Cancellation requested…"))
         worker.cancel_operation()
 
     def _voice_operation_progress(
@@ -2148,7 +2171,7 @@ class HotkeyConfigDialog(QDialog):
         percent: object,
     ) -> None:
         status, progress = self._voice_widgets(self._voice_operation_type)
-        status.setText(message)
+        status.setText(translate_message(message))
         if isinstance(percent, int):
             progress.setRange(0, 100)
             progress.setValue(percent)
@@ -2185,15 +2208,14 @@ class HotkeyConfigDialog(QDialog):
         cancelled = isinstance(result, dict) and bool(result.get("cancelled"))
         if isinstance(result, dict) and "dependency_ok" in result:
             success = bool(result["dependency_ok"] and result["model_ok"])
-            message = (
-                f"Runtime: {result['dependency_message']}\n"
-                f"Model: {result['model_message']}"
-            )
+            message = tr("Runtime: {runtime}\nModel: {model}",
+                         runtime=translate_message(result["dependency_message"]),
+                         model=translate_message(result["model_message"]))
         if not success and not cancelled:
             logger.error(f"Voice setup check failed: {message}")
         status, progress = self._voice_widgets(self._voice_operation_type)
         status.setProperty("error", not success and not cancelled)
-        status.setText(message)
+        status.setText(translate_message(message))
         self._refresh_voice_status_style(status)
         progress.setRange(0, 100)
         progress.setValue(100 if success else 0)
@@ -2252,7 +2274,7 @@ class HotkeyConfigDialog(QDialog):
 
     def _toggle_voice_record_test(self) -> None:
         if self._voice_record_thread is not None:
-            self.voice_record_button.setText("Transcribing…")
+            self.voice_record_button.setText(tr("Transcribing…"))
             self.voice_record_button.setEnabled(False)
             self._voice_record_thread.stop_recording()
             return
@@ -2260,10 +2282,10 @@ class HotkeyConfigDialog(QDialog):
             return
         self._set_voice_busy(True)
         self.voice_record_button.setEnabled(True)
-        self.voice_record_button.setText("Starting microphone…")
+        self.voice_record_button.setText(tr("Starting microphone…"))
         self.stt_test_result.clear()
         self.recording_status.setProperty("error", False)
-        self.recording_status.setText("Starting the microphone…")
+        self.recording_status.setText(tr("Starting the microphone…"))
         self._refresh_voice_status_style(self.recording_status)
         worker = _LocalDictationThread(
             LocalDictationSession(self.stt_manager, self.stt_model(), self.stt_language())
@@ -2278,12 +2300,12 @@ class HotkeyConfigDialog(QDialog):
     def _voice_record_listening(self) -> None:
         streaming = STT_MODELS[self.stt_model()].mode == "Streaming"
         self.voice_record_button.setText(
-            "Stop recording" if streaming else "Stop & transcribe"
+            tr("Stop recording") if streaming else tr("Stop & transcribe")
         )
         self.recording_status.setText(
-            "Streaming transcription… text updates live."
+            tr("Streaming transcription… text updates live.")
             if streaming
-            else "Recording… select Stop when finished."
+            else tr("Recording… select Stop when finished.")
         )
 
     def _voice_record_partial(self, text: str) -> None:
@@ -2298,14 +2320,14 @@ class HotkeyConfigDialog(QDialog):
         if not success:
             logger.error(f"Voice record test failed: {message}")
         self.recording_status.setProperty("error", not success)
-        self.recording_status.setText(message)
+        self.recording_status.setText(translate_message(message))
         self._refresh_voice_status_style(self.recording_status)
         self._set_voice_busy(False)
 
     def _voice_record_finished(self) -> None:
         worker = self._voice_record_thread
         self._voice_record_thread = None
-        self.voice_record_button.setText("Record microphone")
+        self.voice_record_button.setText(tr("Record microphone"))
         self._set_voice_busy(False)
         if worker is not None:
             worker.deleteLater()
@@ -2326,7 +2348,7 @@ class HotkeyConfigDialog(QDialog):
         self.playing_progress.show()
         self.playing_progress.setRange(0, 0)
         self.playing_status.setProperty("error", False)
-        self.playing_status.setText("Generating speech…")
+        self.playing_status.setText(tr("Generating speech…"))
         self._refresh_voice_status_style(self.playing_status)
         worker = _LocalSpeechThread(
             self._voice_provider("tts"),
@@ -2336,7 +2358,7 @@ class HotkeyConfigDialog(QDialog):
             self.sovits_text_lang(),
         )
         self._voice_play_thread = worker
-        worker.started.connect(self.playing_status.setText)
+        worker.started.connect(lambda message: self.playing_status.setText(translate_message(message)))
         worker.completed.connect(self._voice_play_completed)
         worker.finished.connect(self._voice_play_finished)
         worker.start()
@@ -2345,7 +2367,7 @@ class HotkeyConfigDialog(QDialog):
         if not success:
             logger.error(f"Voice playback test failed: {message}")
         self.playing_status.setProperty("error", not success)
-        self.playing_status.setText(message)
+        self.playing_status.setText(translate_message(message))
         self._refresh_voice_status_style(self.playing_status)
         self.playing_progress.setRange(0, 100)
         self.playing_progress.setValue(100 if success else 0)
@@ -2412,8 +2434,12 @@ class HotkeyConfigDialog(QDialog):
             ),
         }
 
+    def _language_changed(self) -> None:
+        self._save_setting("language", self.language())
+        localization.set_language(self.language())
+
     def language(self) -> str:
-        return "zh" if self.language_combo.currentIndex() == 1 else "en"
+        return str(self.language_combo.currentData() or localization.language)
 
     def recording_backend(self) -> str:
         return str(self.recording_backend_combo.currentData() or "web")
@@ -2454,36 +2480,36 @@ class HotkeyConfigDialog(QDialog):
         }
         texts = [binding.text.casefold() for binding in bindings.values() if binding.text]
         if len(set(texts)) != len(texts):
-            raise ValueError("Each action must use a different hotkey")
+            raise ValueError(tr("Each action must use a different hotkey"))
         return bindings
 
     def accept(self) -> None:
         if self._pet_download_thread is not None:
-            self.pet_download_status.setText("Please wait for the pet download to finish.")
+            self.pet_download_status.setText(tr("Please wait for the pet download to finish."))
             return
         if self._voice_worker is not None or self._voice_test_running():
             QMessageBox.information(
                 self,
-                "Voice setup is running",
-                "Wait for the current voice setup operation to finish.",
+                tr("Voice setup is running"),
+                tr("Wait for the current voice setup operation to finish."),
             )
             return
         try:
             self.bindings()
         except ValueError as error:
-            QMessageBox.warning(self, "Invalid hotkey", str(error))
+            QMessageBox.warning(self, tr("Invalid hotkey"), str(error))
             return
         super().accept()
 
     def reject(self) -> None:
         if self._pet_download_thread is not None:
-            self.pet_download_status.setText("Please wait for the pet download to finish.")
+            self.pet_download_status.setText(tr("Please wait for the pet download to finish."))
             return
         if self._voice_worker is not None:
             QMessageBox.information(
                 self,
-                "Voice setup is running",
-                "Wait for the current voice setup operation to finish.",
+                tr("Voice setup is running"),
+                tr("Wait for the current voice setup operation to finish."),
             )
             return
         super().reject()
@@ -2534,19 +2560,19 @@ class TranscriptEditor(LinkTextEdit):
         self.clear_button.setIcon(QIcon(str(EXIT_ICON_PATH)))
         self.clear_button.setIconSize(QSize(16, 16))
         self.clear_button.setFixedSize(32, 32)
-        self.clear_button.setAccessibleName("Delete text")
-        self.clear_button.setToolTip("Delete text")
+        self.clear_button.setAccessibleName(tr("Delete text"))
+        self.clear_button.setToolTip(tr("Delete text"))
 
         self.send_button = QPushButton(self)
         self.send_button.setObjectName("sendButton")
         self.send_button.setIcon(QIcon(str(SEND_ICON_PATH)))
         self.send_button.setIconSize(QSize(16, 16))
         self.send_button.setFixedSize(32, 32)
-        self.send_button.setAccessibleName("Send")
-        self.send_button.setToolTip("Send")
+        self.send_button.setAccessibleName(tr("Send"))
+        self.send_button.setToolTip(tr("Send"))
 
         self.send_without_screenshot_button = QPushButton(
-            "No Screenshot",
+            tr("No Screenshot"),
             self,
         )
         self.send_without_screenshot_button.setObjectName(
@@ -2558,10 +2584,10 @@ class TranscriptEditor(LinkTextEdit):
         self.send_without_screenshot_button.setIconSize(QSize(16, 16))
         self.send_without_screenshot_button.setFixedSize(132, 32)
         self.send_without_screenshot_button.setAccessibleName(
-            "Send without screenshot"
+            tr("Send without screenshot")
         )
         self.send_without_screenshot_button.setToolTip(
-            "Send the text without the selected screenshot"
+            tr("Send the text without the selected screenshot")
         )
 
         self.textChanged.connect(self._sync_action_visibility)
@@ -2663,17 +2689,17 @@ class TranscriptEditor(LinkTextEdit):
     def set_screenshot_selected(self, selected: bool) -> None:
         self._screenshot_selected = selected
         if selected:
-            self.send_button.setText("With Screenshot")
+            self.send_button.setText(tr("With Screenshot"))
             self.send_button.setFixedSize(144, 32)
-            self.send_button.setAccessibleName("Send with screenshot")
+            self.send_button.setAccessibleName(tr("Send with screenshot"))
             self.send_button.setToolTip(
-                "Send the message with the selected screenshot"
+                tr("Send the message with the selected screenshot")
             )
         else:
             self.send_button.setText("")
             self.send_button.setFixedSize(32, 32)
-            self.send_button.setAccessibleName("Send")
-            self.send_button.setToolTip("Send the message")
+            self.send_button.setAccessibleName(tr("Send"))
+            self.send_button.setToolTip(tr("Send the message"))
         self._sync_action_visibility()
         self._position_action_buttons()
 
@@ -2807,10 +2833,10 @@ class OverlayWindow(QMainWindow):
 
         self.chatgpt_tab_combo = QComboBox()
         self.chatgpt_tab_combo.setObjectName("chatgptTabCombo")
-        self.chatgpt_tab_combo.setAccessibleName("ChatGPT window")
+        self.chatgpt_tab_combo.setAccessibleName(tr("ChatGPT window"))
         self.chatgpt_tab_combo.setMinimumWidth(220)
         self.chatgpt_tab_combo.setMaximumWidth(300)
-        self.chatgpt_tab_combo.addItem("Looking for ChatGPT windows…")
+        self.chatgpt_tab_combo.addItem(tr("Looking for ChatGPT windows…"))
         self.chatgpt_tab_combo.setEnabled(False)
         self.chatgpt_tab_combo.currentIndexChanged.connect(
             self._chatgpt_tab_changed
@@ -2819,25 +2845,25 @@ class OverlayWindow(QMainWindow):
 
         self.capture_source_combo = QComboBox()
         self.capture_source_combo.setObjectName("captureSourceCombo")
-        self.capture_source_combo.setAccessibleName("Screenshot source")
+        self.capture_source_combo.setAccessibleName(tr("Screenshot source"))
         self.capture_source_combo.setMinimumWidth(150)
         self.capture_source_combo.setMaximumWidth(220)
-        self.capture_source_combo.addItem("No screenshot", None)
+        self.capture_source_combo.addItem(tr("No screenshot"), None)
         self.capture_source_combo.setToolTip(
-            "Choose a desktop or visible window to attach when sending"
+            tr("Choose a desktop or visible window to attach when sending")
         )
         self.capture_source_combo.currentIndexChanged.connect(
             self._capture_source_changed
         )
         title_layout.addWidget(self.capture_source_combo, 1)
 
-        self.remote_debugging_button = QPushButton("Enable Debugging")
+        self.remote_debugging_button = QPushButton(tr("Enable Debugging"))
         self.remote_debugging_button.setObjectName("remoteDebuggingButton")
         self.remote_debugging_button.setAccessibleName(
-            "Open remote debugging settings"
+            tr("Open remote debugging settings")
         )
         self.remote_debugging_button.setToolTip(
-            "Open the browser's remote debugging settings"
+            tr("Open the browser's remote debugging settings")
         )
         self.remote_debugging_button.clicked.connect(
             self.open_remote_debugging_requested.emit
@@ -2851,7 +2877,7 @@ class OverlayWindow(QMainWindow):
         self._configure_icon_button(
             self.configure_button,
             SETTINGS_ICON_PATH,
-            "Open settings",
+            tr("Open settings"),
         )
         self.configure_button.clicked.connect(self.configure_requested.emit)
         title_layout.addWidget(self.configure_button)
@@ -2862,7 +2888,7 @@ class OverlayWindow(QMainWindow):
         self._configure_icon_button(
             self.lock_button,
             UNLOCK_ICON_PATH,
-            "Lock overlay position",
+            tr("Lock overlay position"),
         )
         self.lock_button.toggled.connect(self._set_position_locked)
         title_layout.addWidget(self.lock_button)
@@ -2873,7 +2899,7 @@ class OverlayWindow(QMainWindow):
         self._configure_icon_button(
             self.auto_hide_button,
             AUTO_HIDE_ICON_PATH,
-            "Enable auto-hide",
+            tr("Enable auto-hide"),
         )
         self.auto_hide_button.toggled.connect(
             self._set_auto_hide_enabled
@@ -2885,7 +2911,7 @@ class OverlayWindow(QMainWindow):
         self._configure_icon_button(
             self.exit_button,
             EXIT_ICON_PATH,
-            "Exit",
+            tr("Exit"),
         )
         self.exit_button.clicked.connect(self.exit_requested.emit)
         title_layout.addWidget(self.exit_button)
@@ -2893,7 +2919,7 @@ class OverlayWindow(QMainWindow):
         self.transcript_area = TranscriptEditor()
         self.transcript_area.setObjectName("transcriptArea")
         self.transcript_area.setEnabled(False)
-        self.transcript_area.set_hint("Looking for ChatGPT windows…")
+        self.transcript_area.set_hint(tr("Looking for ChatGPT windows…"))
 
         self.subtitle_panel = QFrame()
         self.subtitle_panel.setObjectName("subtitlePanel")
@@ -2962,10 +2988,10 @@ class OverlayWindow(QMainWindow):
         self.microphone_button.setIcon(QIcon(str(MICROPHONE_ICON_PATH)))
         self.microphone_button.setIconSize(QSize(26, 26))
         self.microphone_button.setFixedSize(56, 56)
-        self.microphone_button.setAccessibleName("Hold to dictate")
+        self.microphone_button.setAccessibleName(tr("Hold to dictate"))
         self.microphone_button.setEnabled(False)
         self.microphone_button.setToolTip(
-            "Press and hold to use ChatGPT dictation"
+            tr("Press and hold to use ChatGPT dictation")
         )
         self.microphone_button.pressed.connect(self.dictation_requested.emit)
         self.microphone_button.released.connect(
@@ -3189,6 +3215,20 @@ class OverlayWindow(QMainWindow):
         )
         self.setStyleSheet(self.styleSheet() + COMBOBOX_STYLE)
         self._set_chrome_visible(False)
+        self._translations = UiTranslations(self)
+        localization.changed.connect(self._retranslate_status)
+
+    def _retranslate_status(self) -> None:
+        if self._subtitle_mode_active and not self._subtitle_reading_started:
+            self._set_subtitle_status(self._subtitle_status_text)
+        state, separator, text = self.dictation_state_label.text().partition("\n\n")
+        self.dictation_state_label.setText(translate_message(state) + separator + text)
+        blocked = self.capture_source_combo.blockSignals(True)
+        for index in range(self.capture_source_combo.count()):
+            source = self.capture_source_combo.itemData(index)
+            if isinstance(source, CaptureSource) and source.kind == "display":
+                self.capture_source_combo.setItemText(index, translate_message(source.label))
+        self.capture_source_combo.blockSignals(blocked)
 
     @staticmethod
     def _configure_icon_button(
@@ -3207,12 +3247,12 @@ class OverlayWindow(QMainWindow):
         message: str | None = None,
     ) -> None:
         labels = {
-            "idle": "Press and hold the microphone to dictate",
-            "recording": "ChatGPT is listening… release to finish",
-            "saved": "Dictation copied from ChatGPT",
-            "error": "Browser dictation unavailable",
+            "idle": tr("Press and hold the microphone to dictate"),
+            "recording": tr("ChatGPT is listening… release to finish"),
+            "saved": tr("Dictation copied from ChatGPT"),
+            "error": tr("Browser dictation unavailable"),
         }
-        label = message or labels[state]
+        label = translate_message(message) if message else labels[state]
         self._pet_listening = state == "recording"
         self.set_status(label, error=state == "error")
         self.microphone_button.setProperty("recordingState", state)
@@ -3225,7 +3265,7 @@ class OverlayWindow(QMainWindow):
         self._track_pointer(QCursor.pos())
 
     def set_status(self, message: str, *, error: bool = False) -> None:
-        self.transcript_area.set_hint(message, error=error)
+        self.transcript_area.set_hint(translate_message(message), error=error)
         self._pet_error = error
         self._refresh_pet()
 
@@ -3252,7 +3292,7 @@ class OverlayWindow(QMainWindow):
         self.chatgpt_tab_combo.blockSignals(True)
         self.chatgpt_tab_combo.clear()
         if not tabs:
-            self.chatgpt_tab_combo.addItem("No ChatGPT tabs open")
+            self.chatgpt_tab_combo.addItem(tr("No ChatGPT tabs open"))
             self.chatgpt_tab_combo.setEnabled(False)
             self.remote_debugging_button.setVisible(not self._debug_connected)
             self.microphone_button.setEnabled(False)
@@ -3271,7 +3311,7 @@ class OverlayWindow(QMainWindow):
             self.remote_debugging_button.setVisible(False)
             self.microphone_button.setEnabled(True)
             self.transcript_area.setEnabled(True)
-            self.set_status("Hold the microphone or enter a message")
+            self.set_status(tr("Hold the microphone or enter a message"))
             selected_index = self.chatgpt_tab_combo.findData(selected_id)
             if selected_index < 0 and self._preferred_chatgpt_url:
                 for index in range(self.chatgpt_tab_combo.count()):
@@ -3308,12 +3348,12 @@ class OverlayWindow(QMainWindow):
 
     def _show_browser_connection_hint(self) -> None:
         if self._debug_connected:
-            self.chatgpt_tab_combo.setItemText(0, "Debugger connected — open ChatGPT")
+            self.chatgpt_tab_combo.setItemText(0, tr("Debugger connected — open ChatGPT"))
         message = (
-            "Debugger connected. No ChatGPT tab is open. Open chatgpt.com in this browser; "
-            "Live GPT will detect the tab automatically."
+            tr("Debugger connected. No ChatGPT tab is open. Open chatgpt.com in this browser; "
+            "Live GPT will detect the tab automatically.")
             if self._debug_connected else
-            "Connect to a ChatGPT window to begin"
+            tr("Connect to a ChatGPT window to begin")
         )
         self.chatgpt_tab_combo.setToolTip(message)
         self.set_status(message)
@@ -3324,7 +3364,7 @@ class OverlayWindow(QMainWindow):
         if self._debug_connected and not self._browser_connected:
             self._show_browser_connection_hint()
             return
-        self.chatgpt_tab_combo.setToolTip(status)
+        self.chatgpt_tab_combo.setToolTip(translate_message(status))
         status_lower = status.casefold()
         self.set_status(
             status,
@@ -3334,7 +3374,7 @@ class OverlayWindow(QMainWindow):
             ),
         )
         if not self.chatgpt_tab_combo.isEnabled():
-            self.chatgpt_tab_combo.setItemText(0, status)
+            self.chatgpt_tab_combo.setItemText(0, translate_message(status))
 
     def set_response_links(self, links: object) -> None:
         self.transcript_area.response_links = links
@@ -3349,9 +3389,11 @@ class OverlayWindow(QMainWindow):
         )
         self.capture_source_combo.blockSignals(True)
         self.capture_source_combo.clear()
-        self.capture_source_combo.addItem("No screenshot", None)
+        self.capture_source_combo.addItem(tr("No screenshot"), None)
         for source in sources:
-            self.capture_source_combo.addItem(source.label, source)
+            self.capture_source_combo.addItem(
+                translate_message(source.label) if source.kind == "display" else source.label, source
+            )
         if selected_key:
             for index in range(1, self.capture_source_combo.count()):
                 source = self.capture_source_combo.itemData(index)
@@ -3391,13 +3433,13 @@ class OverlayWindow(QMainWindow):
         del message
         if not self._subtitle_mode_active:
             self.begin_response_display(sent_text)
-        self._set_subtitle_status("Waiting for ChatGPT…")
-        self.set_status("Waiting for ChatGPT…")
+        self._set_subtitle_status(tr("Waiting for ChatGPT…"))
+        self.set_status(tr("Waiting for ChatGPT…"))
 
     def begin_response_display(
         self,
         sent_text: str = "",
-        message: str = "Sending to ChatGPT…",
+        message: str = tr("Sending to ChatGPT…"),
     ) -> None:
         self._collapse_hover_input()
         self._playback_input_timer.stop()
@@ -3438,7 +3480,7 @@ class OverlayWindow(QMainWindow):
             )
             self._render_reading_subtitle(resized=True)
             self._update_expanded_subtitle()
-            self.set_status("Reading aloud…")
+            self.set_status(tr("Reading aloud…"))
             return
         self.set_status(status)
         self._reading_fraction = 0.0
@@ -3456,7 +3498,7 @@ class OverlayWindow(QMainWindow):
         self.transcript_area.finish_response()
         self.microphone_button.setVisible(True)
         if self._subtitle_reading_active and success:
-            self.set_status("Reading aloud…")
+            self.set_status(tr("Reading aloud…"))
             return
         self.set_status(message, error=not success)
         if self._subtitle_mode_active:
@@ -3511,7 +3553,7 @@ class OverlayWindow(QMainWindow):
             return
         self._render_reading_subtitle()
         self._update_expanded_subtitle()
-        self.set_status("Reading aloud…")
+        self.set_status(tr("Reading aloud…"))
 
     def _subtitle_lines(self) -> list[str]:
         text = self._reading_full_text.strip()
@@ -3619,6 +3661,7 @@ class OverlayWindow(QMainWindow):
         self._track_pointer(QCursor.pos())
 
     def _set_subtitle_status(self, message: str) -> None:
+        message = translate_message(message)
         self._subtitle_status_text = message
         if self._subtitle_mode_active and not self._subtitle_reading_started:
             lines = self._subtitle_lines()
@@ -3752,7 +3795,7 @@ class OverlayWindow(QMainWindow):
         self.transcript_area.setPlainText(response_text)
         self.transcript_area.show()
         self.microphone_button.setVisible(True)
-        self.set_status("Hold the microphone or enter a message")
+        self.set_status(tr("Hold the microphone or enter a message"))
         self.schedule_auto_hide()
         return True
 
@@ -3768,7 +3811,7 @@ class OverlayWindow(QMainWindow):
         self.subtitle_panel.hide()
         self.transcript_area.hide()
         self.dictation_state_label.setText(
-            "Waiting for the browser to start listening…"
+            tr("Waiting for the browser to start listening…")
         )
         self.dictation_panel.show()
         self._track_pointer(QCursor.pos())
@@ -3786,7 +3829,7 @@ class OverlayWindow(QMainWindow):
         self._pet_listening = True
         self._pet_error = False
         self._refresh_pet()
-        self.dictation_state_label.setText("Listening…")
+        self.dictation_state_label.setText(tr("Listening…"))
         self._track_pointer(QCursor.pos())
 
     def set_dictation_partial(
@@ -3796,14 +3839,14 @@ class OverlayWindow(QMainWindow):
         finishing: bool = False,
     ) -> None:
         if text.strip():
-            state = "Finishing dictation…" if finishing else "Listening…"
+            state = tr("Finishing dictation…") if finishing else tr("Listening…")
             self.dictation_state_label.setText(f"{state}\n\n{text}")
 
     def set_dictation_finishing(self) -> None:
-        self.dictation_state_label.setText("Finishing dictation…")
+        self.dictation_state_label.setText(tr("Finishing dictation…"))
 
     def set_dictation_cancelling(self) -> None:
-        self.dictation_state_label.setText("Cancelling short dictation…")
+        self.dictation_state_label.setText(tr("Cancelling short dictation…"))
 
     def end_dictation_display(self) -> None:
         self._pet_listening = False
@@ -3856,7 +3899,7 @@ class OverlayWindow(QMainWindow):
 
     def clear_transcript(self) -> None:
         self.transcript_area.begin_composing()
-        self.set_status("Text cleared")
+        self.set_status(tr("Text cleared"))
 
     def _request_clear(self) -> None:
         self.clear_transcript()
@@ -3869,7 +3912,7 @@ class OverlayWindow(QMainWindow):
         restore_focus: bool = True,
     ) -> None:
         if self.transcript_area.is_showing_response:
-            self.set_status("Wait for the current response to finish")
+            self.set_status(tr("Wait for the current response to finish"))
             return
         text = self.transcript_area.toPlainText().strip()
         capture_source = (
@@ -3879,7 +3922,7 @@ class OverlayWindow(QMainWindow):
         )
         if not text and capture_source is None:
             self.set_status(
-                "Enter text or select a screenshot before sending",
+                tr("Enter text or select a screenshot before sending"),
                 error=True,
             )
             return
@@ -3918,10 +3961,10 @@ class OverlayWindow(QMainWindow):
 
     def _set_auto_hide_enabled(self, enabled: bool) -> None:
         self._auto_hide_enabled = enabled
-        label = "Disable auto-hide" if enabled else "Enable auto-hide"
+        label = tr("Disable auto-hide") if enabled else tr("Enable auto-hide")
         self.auto_hide_button.setAccessibleName(label)
         self.auto_hide_button.setToolTip(
-            f"{label}; the overlay appears for dictation and ChatGPT replies"
+            tr("{label}; the overlay appears for dictation and ChatGPT replies", label=label)
         )
         if enabled:
             self.schedule_auto_hide()
@@ -3973,12 +4016,12 @@ class OverlayWindow(QMainWindow):
         if locked:
             self.setFixedSize(self.size())
             icon_path = LOCK_ICON_PATH
-            label = "Unlock overlay position"
+            label = tr("Unlock overlay position")
         else:
             self.setMinimumSize(760, 180)
             self.setMaximumSize(16_777_215, 16_777_215)
             icon_path = UNLOCK_ICON_PATH
-            label = "Lock overlay position"
+            label = tr("Lock overlay position")
         self.lock_button.setIcon(QIcon(str(icon_path)))
         self.lock_button.setAccessibleName(label)
         self.lock_button.setToolTip(label)
@@ -4339,6 +4382,7 @@ class TrayController:
         self.application = application
         self.icon = QIcon(str(ICON_PATH))
         self.config = Config()
+        localization.set_language(str(self.config["language"]))
         self.stt_manager = SherpaSttProvider()
         self.sovits_manager = SovitsTtsProvider()
         self._local_dictation_thread: _LocalDictationThread | None = None
@@ -4493,9 +4537,10 @@ class TrayController:
         self._refresh_capture_sources()
 
         self.menu = QMenu()
-        self.exit_action = QAction("Exit", self.menu)
+        self.exit_action = QAction(tr("Exit"), self.menu)
         self.exit_action.triggered.connect(self._exit_application)
         self.menu.addAction(self.exit_action)
+        self._menu_translations = UiTranslations(self.menu)
 
         self.tray_icon = QSystemTrayIcon(self.icon, self.application)
         self.tray_icon.setToolTip("Live GPT")
@@ -4509,13 +4554,13 @@ class TrayController:
         self._start_local_tts_preload()
 
     def _warn_hotkey_privileges(self) -> None:
-        title = "Microphone shortcuts may not work"
+        title = tr("Microphone shortcuts may not work")
         message = (
-            "The foreground window is running as administrator. Windows may block "
+            tr("The foreground window is running as administrator. Windows may block "
             "Live GPT's microphone shortcuts while that window is in front.\n\n"
             "Exit Live GPT and run it as administrator (or use start-game-mode.ps1) "
             "to allow microphone shortcuts in administrator windows.\n\n"
-            "This warning appears only once per app run."
+            "This warning appears only once per app run.")
         )
         logger.warning(title + ": foreground process is elevated")
         self.tray_icon.showMessage(title, message, QSystemTrayIcon.MessageIcon.Warning, 10_000)
@@ -4548,7 +4593,7 @@ class TrayController:
             for name, sequence in sequences.items()
         }
         if len({binding.text.casefold() for binding in bindings.values() if binding.text}) != sum(bool(binding.text) for binding in bindings.values()):
-            raise ValueError("Each action must use a different hotkey")
+            raise ValueError(tr("Each action must use a different hotkey"))
         return bindings
 
     def _migrate_legacy_hotkeys(self) -> None:
@@ -4633,7 +4678,7 @@ class TrayController:
                 hold_without_screenshot=bindings["hold_without_screenshot"],
                 enabled=self._hotkey_enabled_states(),
             )
-            self.window.set_status("Settings updated")
+            self.window.set_status(tr("Settings updated"))
             logger.info(
                 "Updated global hotkeys "
                 + ", ".join(
@@ -4884,7 +4929,7 @@ class TrayController:
             self._dictation_input_held = False
             self.window.set_microphone_state(
                 "error",
-                "Select a ChatGPT window first",
+                tr("Select a ChatGPT window first"),
             )
             self.window.schedule_auto_hide(5_000)
             return
@@ -4896,7 +4941,7 @@ class TrayController:
         self.window.begin_dictation_waiting()
         self.window.set_microphone_state(
             "recording",
-            "Waiting for the browser to start listening…",
+            tr("Waiting for the browser to start listening…"),
         )
         self._schedule_dictation_screenshot_upload()
         self.browser_monitor.request_start_dictation(tab_id)
@@ -4908,7 +4953,7 @@ class TrayController:
         if worker is not None:
             self._local_voice_interrupted = True
             worker.request_stop()
-            self.window.finish_reading(False, "Playback stopped for recording")
+            self.window.finish_reading(False, tr("Playback stopped for recording"))
 
     def _schedule_dictation_screenshot_upload(self) -> None:
         generation = self._dictation_press_generation
@@ -4995,7 +5040,7 @@ class TrayController:
         self.window.begin_dictation_waiting()
         self.window.set_microphone_state(
             "recording",
-            "Starting the local microphone…",
+            tr("Starting the local microphone…"),
         )
         session = LocalDictationSession(self.stt_manager, stt_model, self.config["stt_language"])
         worker = _LocalDictationThread(session)
@@ -5003,7 +5048,7 @@ class TrayController:
         worker.listening.connect(
             lambda: self._on_dictation_started(
                 True,
-                "Sherpa-ONNX is listening",
+                tr("Sherpa-ONNX is listening"),
             )
         )
         worker.partial_text.connect(self._on_local_dictation_partial)
@@ -5065,7 +5110,7 @@ class TrayController:
         self.window.set_dictation_finishing()
         self.window.set_microphone_state(
             "recording",
-            "Transcribing local audio…" if local else "Finishing ChatGPT dictation…",
+            tr("Transcribing local audio…") if local else tr("Finishing ChatGPT dictation…"),
         )
         if local and self._local_dictation_thread is not None:
             self._local_dictation_thread.stop_recording()
@@ -5079,7 +5124,7 @@ class TrayController:
         self.window.set_dictation_cancelling()
         self.window.set_microphone_state(
             "recording",
-            "Dictation was too short; cancelling…",
+            tr("Dictation was too short; cancelling…"),
         )
         if tab_id == "local" and self._local_dictation_thread is not None:
             self._local_dictation_thread.stop_recording(cancel=True)
@@ -5155,7 +5200,7 @@ class TrayController:
             self.window.set_microphone_state(
                 "saved",
                 (
-                    "Voice input must contain at least 2 characters to send"
+                    tr("Voice input must contain at least 2 characters to send")
                     if voice_text_too_short
                     else message
                 ),
@@ -5208,7 +5253,7 @@ class TrayController:
         normalized_text = text.strip()
         if normalized_text == getattr(self, "_short_voice_text", None):
             self.window.set_status(
-                "Voice input must contain at least 2 characters to send",
+                tr("Voice input must contain at least 2 characters to send"),
                 error=True,
             )
             return
@@ -5222,7 +5267,7 @@ class TrayController:
         tab_id = self.selected_chatgpt_tab_id
         if tab_id is None:
             self.window.set_status(
-                "Select a ChatGPT window first",
+                tr("Select a ChatGPT window first"),
                 error=True,
             )
             return
@@ -5245,7 +5290,7 @@ class TrayController:
             screenshot = None
 
         if capture_source is not None and pending_capture is None:
-            self.window.set_status("Capturing screenshot…")
+            self.window.set_status(tr("Capturing screenshot…"))
             try:
                 screenshot = capture_webp(capture_source)
             except Exception as error:
@@ -5264,7 +5309,7 @@ class TrayController:
             f"screenshot={capture_source.key if capture_source else None!r}"
         )
         self.window.begin_response_display(text)
-        self.window.set_status("Sending to ChatGPT…")
+        self.window.set_status(tr("Sending to ChatGPT…"))
         self._local_voice_interrupted = False
         preserve_attachments = bool(
             pending_capture is not None and pending_capture.preuploaded
@@ -5300,7 +5345,7 @@ class TrayController:
             return
 
         logger.info(f"Clearing ChatGPT input tab_id={tab_id!r}")
-        self.window.set_status("Clearing ChatGPT input…")
+        self.window.set_status(tr("Clearing ChatGPT input…"))
         self.browser_monitor.request_clear(tab_id)
 
     def _on_clear_finished(self, success: bool, message: str) -> None:
@@ -5325,7 +5370,7 @@ class TrayController:
         endpoint = discover_cdp_endpoint()
         if endpoint is not None:
             self.window.set_browser_status(
-                "Retrying connection… approve it in the browser"
+                tr("Retrying connection… approve it in the browser")
             )
             self.browser_monitor.request_retry_connection()
             return
@@ -5423,7 +5468,7 @@ def main() -> int:
             QMessageBox.critical(
                 None,
                 "Live GPT",
-                "No system tray is available on this desktop.",
+                tr("No system tray is available on this desktop."),
             )
             return 1
 

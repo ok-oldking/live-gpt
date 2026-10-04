@@ -31,6 +31,7 @@ from live_gpt.app import (  # noqa: E402
     _QueuedLocalSpeechThread,
 )
 from live_gpt.config import Config  # noqa: E402
+from live_gpt.localization import resolve_language  # noqa: E402
 from live_gpt.screen_capture import CaptureSource  # noqa: E402
 
 
@@ -403,7 +404,7 @@ class SettingsDialogTests(unittest.TestCase):
         finally:
             dialog.close()
 
-    def test_settings_use_navigation_and_selectable_language_preview(self) -> None:
+    def test_settings_use_navigation_and_live_language_selection(self) -> None:
         dialog = HotkeyConfigDialog(
             QKeySequence("CapsLock"),
             QKeySequence("Ctrl+S"),
@@ -432,16 +433,19 @@ class SettingsDialogTests(unittest.TestCase):
                 "Right Ctrl",
             )
             self.assertTrue(dialog.language_combo.isEnabled())
-            self.assertEqual(dialog.language_combo.currentText(), "English")
+            self.assertEqual(dialog.language(), resolve_language())
             self.assertEqual(dialog.language_combo.count(), 2)
 
             dialog.language_nav_button.click()
             self.assertEqual(dialog.settings_pages.currentIndex(), 1)
-            dialog.language_combo.setCurrentIndex(1)
+            dialog.language_combo.setCurrentIndex(dialog.language_combo.findData("zh"))
             self.assertEqual(
                 dialog.language_combo.currentText(),
-                "中文 (Chinese)",
+                "简体中文",
             )
+            self.assertEqual(dialog.windowTitle(), "Live GPT 设置")
+            self.assertEqual(dialog.recording_nav_button.text(), "录音")
+            dialog.language_combo.setCurrentIndex(dialog.language_combo.findData("en"))
 
             dialog.shortcuts_nav_button.click()
             self.assertEqual(dialog.settings_pages.currentIndex(), 0)
@@ -524,7 +528,7 @@ class SettingsDialogTests(unittest.TestCase):
             self.assertEqual(chinese_dialog.language(), "zh")
             self.assertEqual(
                 chinese_dialog.language_combo.currentText(),
-                "中文 (Chinese)",
+                "简体中文",
             )
         finally:
             chinese_dialog.close()
@@ -592,7 +596,7 @@ class SettingsDialogTests(unittest.TestCase):
                 controller.config = saved_config
                 self.assertEqual(controller._load_hotkey_sequences(), dialog.sequences())
                 self.assertFalse(any(controller._hotkey_enabled_states().values()))
-                dialog.language_combo.setCurrentIndex(1)
+                dialog.language_combo.setCurrentIndex(dialog.language_combo.findData("zh"))
                 dialog.recording_backend_combo.setCurrentIndex(
                     dialog.recording_backend_combo.findData("sherpa")
                 )

@@ -9,13 +9,14 @@ from pathlib import Path
 from typing import Any
 
 from .logger import Logger
+from .localization import resolve_language
 
 
 logger = Logger.get_logger(__name__)
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "version": 1,
-    "language": "en",
+    "language": "",
     "hotkey_hold": "Right Alt",
     "hotkey_hold_without_screenshot": "Right Ctrl",
     "auto_hide": False,
@@ -73,7 +74,7 @@ def _valid_value(key: str, value: Any, default: Any) -> bool:
     if key == "version":
         return value == DEFAULT_CONFIG["version"]
     if key == "language":
-        return value in ("en", "zh")
+        return value in ("", "en", "zh")
     if key == "recording_backend":
         return value in ("web", "sherpa")
     if key == "playing_backend":
@@ -121,6 +122,8 @@ class Config(dict[str, Any]):
         default: Mapping[str, Any] | None = None,
     ) -> None:
         self.default = copy.deepcopy(dict(default or DEFAULT_CONFIG))
+        if "language" in self.default:
+            self.default["language"] = resolve_language(self.default["language"])
         self.path = Path(path) if path is not None else default_config_path()
         self.file_existed = self.path.is_file()
         loaded = self._read_file()
@@ -177,6 +180,9 @@ class Config(dict[str, Any]):
             value = loaded.get(key, default)
             if not _valid_value(key, value, default):
                 value = copy.deepcopy(default)
+                modified = True
+            if key == "language" and not value:
+                value = default
                 modified = True
             verified[key] = value
         if "stt_language" in verified and "stt_model" in verified:

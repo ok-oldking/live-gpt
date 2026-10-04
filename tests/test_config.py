@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 from live_gpt.config import Config, DEFAULT_CONFIG
+from live_gpt.localization import resolve_language
 
 
 class ConfigTests(unittest.TestCase):
@@ -86,10 +87,11 @@ class ConfigTests(unittest.TestCase):
 
             config = Config(path)
 
-            self.assertEqual(dict(config), DEFAULT_CONFIG)
+            expected = {**DEFAULT_CONFIG, "language": resolve_language()}
+            self.assertEqual(dict(config), expected)
             self.assertEqual(
                 json.loads(path.read_text(encoding="utf-8")),
-                DEFAULT_CONFIG,
+                expected,
             )
 
     def test_assignment_saves_automatically(self) -> None:
@@ -111,10 +113,11 @@ class ConfigTests(unittest.TestCase):
 
             config = Config(path)
 
-            self.assertEqual(dict(config), DEFAULT_CONFIG)
+            expected = {**DEFAULT_CONFIG, "language": resolve_language()}
+            self.assertEqual(dict(config), expected)
             self.assertEqual(
                 json.loads(path.read_text(encoding="utf-8")),
-                DEFAULT_CONFIG,
+                expected,
             )
 
     def test_invalid_values_and_unknown_keys_are_repaired_on_load(self) -> None:
@@ -128,7 +131,7 @@ class ConfigTests(unittest.TestCase):
 
             config = Config(path)
 
-            self.assertEqual(config["language"], "en")
+            self.assertEqual(config["language"], resolve_language())
             self.assertEqual(config["window_geometry"], [])
             self.assertNotIn("unknown", config)
 
