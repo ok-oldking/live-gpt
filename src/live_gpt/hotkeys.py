@@ -10,6 +10,8 @@ from PySide6.QtCore import QObject, QTimer, Signal, Qt, QEvent
 from PySide6.QtGui import QKeySequence
 from PySide6.QtWidgets import QLineEdit, QToolButton
 
+from .privileges import foreground_requires_administrator
+
 
 VK_BACK = 0x08
 VK_TAB = 0x09
@@ -268,6 +270,7 @@ class GlobalHotkeyMonitor(QObject):
     hold_without_screenshot_released = Signal()
     send_pressed = Signal()
     send_without_screenshot_pressed = Signal()
+    administrator_required = Signal()
 
     def __init__(
         self,
@@ -304,6 +307,10 @@ class GlobalHotkeyMonitor(QObject):
         self._timer = QTimer(self)
         self._timer.setInterval(interval_ms)
         self._timer.timeout.connect(self.poll_now)
+        self._administrator_warned = False
+        self._privilege_timer = QTimer(self)
+        self._privilege_timer.setInterval(1_000)
+        self._privilege_timer.timeout.connect(self.check_foreground_privileges)
         self.update_bindings(
             hold,
             send,
@@ -343,12 +350,29 @@ class GlobalHotkeyMonitor(QObject):
 
     def start(self) -> None:
         self._timer.start()
+        if not self._administrator_warned:
+            self._privilege_timer.start()
+
+    def check_foreground_privileges(self) -> None:
+        if self._administrator_warned:
+            return
+        if not any(
+            self._bindings[name] and self._bindings[name].text
+            and (self._enabled is None or self._enabled.get(name, False))
+            for name in ("hold", "hold_without_screenshot")
+        ):
+            return
+        if foreground_requires_administrator():
+            self._administrator_warned = True
+            self._privilege_timer.stop()
+            self.administrator_required.emit()
 
     @property
     def hold_delay_seconds(self) -> float:
         return self._hold_delay
 
     def stop(self) -> None:
+        self._privilege_timer.stop()
         if self._hold_emitted["hold"]:
             self.hold_released.emit()
         if self._hold_emitted["hold_without_screenshot"]:

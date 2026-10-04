@@ -3929,6 +3929,8 @@ class OverlayWindow(QMainWindow):
             self._auto_hide_timer.stop()
 
     def _can_auto_hide(self) -> bool:
+        if any(not notice.isHidden() for notice in self.findChildren(QMessageBox)):
+            return False
         if not self._browser_connected or not self._auto_hide_enabled:
             return False
         if not self.dictation_panel.isHidden():
@@ -3984,6 +3986,7 @@ class OverlayWindow(QMainWindow):
     def _set_chrome_visible(self, visible: bool) -> None:
         visible = (
             visible or not self._browser_connected
+            or any(not notice.isHidden() for notice in self.findChildren(QMessageBox))
             or bool(self._resize_edges) or self.pet._drag_offset is not None
         )
         content_visible = (
@@ -4499,10 +4502,36 @@ class TrayController:
         self.tray_icon.setContextMenu(self.menu)
         self.tray_icon.activated.connect(self._handle_activation)
         self.tray_icon.show()
+        self.hotkey_monitor.administrator_required.connect(self._warn_hotkey_privileges)
         logger.info("System tray icon is ready")
         self.show_window()
         self._start_stt_preload()
         self._start_local_tts_preload()
+
+    def _warn_hotkey_privileges(self) -> None:
+        title = "Microphone shortcuts may not work"
+        message = (
+            "The foreground window is running as administrator. Windows may block "
+            "Live GPT's microphone shortcuts while that window is in front.\n\n"
+            "Exit Live GPT and run it as administrator (or use start-game-mode.ps1) "
+            "to allow microphone shortcuts in administrator windows.\n\n"
+            "This warning appears only once per app run."
+        )
+        logger.warning(title + ": foreground process is elevated")
+        self.tray_icon.showMessage(title, message, QSystemTrayIcon.MessageIcon.Warning, 10_000)
+        self.window.show_for_auto_hide()
+        self.show_window()
+        self._hotkey_privilege_notice = QMessageBox(
+            QMessageBox.Icon.Warning, title, message, QMessageBox.StandardButton.Ok, self.window
+        )
+        self._hotkey_privilege_notice.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        self._hotkey_privilege_notice.open()
+        self._hotkey_privilege_notice.finished.connect(
+            lambda _result: self.window.schedule_auto_hide(5_000)
+        )
+        self.window._set_chrome_visible(True)
+        self._hotkey_privilege_notice.raise_()
+        self._hotkey_privilege_notice.activateWindow()
 
     def _hotkey_enabled_states(self) -> dict[str, bool]:
         return {

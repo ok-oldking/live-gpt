@@ -114,6 +114,12 @@ registering or swallowing the keys, so the foreground program continues to
 receive the same keystrokes. Changes are saved for the current Windows user.
 
 If microphone shortcuts stop working when a game is in the foreground, check
+Live GPT's warning: once per app run, an elevated foreground window triggers a
+system notification and brings the overlay forward with an explanation, if
+Live GPT is not elevated and a microphone shortcut is enabled. Dismiss the
+warning with OK; it will not repeat when switching windows or changing settings.
+
+If you see this warning, check
 whether the game runs as administrator. Windows can block Live GPT's key-state
 polling across that privilege boundary. Exit Live GPT from its tray menu, then
 launch it at the same privilege level and accept the Windows UAC prompt:

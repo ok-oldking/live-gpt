@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from unittest.mock import patch
 
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -36,6 +37,33 @@ class GlobalHotkeyMonitorTests(unittest.TestCase):
             key_state=lambda key: 0x8000 if key in self.pressed else 0,
             clock=lambda: self.now,
         )
+
+    @patch("live_gpt.hotkeys.foreground_requires_administrator")
+    def test_privilege_warning_once_even_after_restart_and_settings(self, check):
+        events = []
+        self.monitor.administrator_required.connect(lambda: events.append("warning"))
+        check.return_value = False
+        self.monitor.check_foreground_privileges()
+        self.assertEqual(events, [])
+        check.return_value = True
+        self.monitor.check_foreground_privileges()
+        self.monitor.stop()
+        self.monitor.update_bindings(HotkeyBinding.from_sequence("Left Alt"))
+        self.monitor.start()
+        self.monitor.check_foreground_privileges()
+        self.assertEqual(events, ["warning"])
+        self.assertEqual(check.call_count, 2)
+        self.assertFalse(self.monitor._privilege_timer.isActive())
+        self.monitor.stop()
+
+    @patch("live_gpt.hotkeys.foreground_requires_administrator", return_value=True)
+    def test_privilege_check_skips_disabled_and_cleared_microphone_keys(self, check):
+        self.monitor.update_bindings(HotkeyBinding.from_sequence("Left Alt"), enabled={})
+        self.monitor.check_foreground_privileges()
+        self.monitor.update_bindings(HotkeyBinding.from_sequence(""),
+                                     hold_without_screenshot=HotkeyBinding.from_sequence(""))
+        self.monitor.check_foreground_privileges()
+        check.assert_not_called()
 
     def test_hold_hotkey_emits_press_and_release_edges(self) -> None:
         events: list[str] = []

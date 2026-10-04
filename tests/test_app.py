@@ -1076,6 +1076,23 @@ class TrayControllerBrowserTests(unittest.TestCase):
         finally:
             window.close()
 
+    def test_privilege_warning_notifies_and_reveals_overlay(self) -> None:
+        application = QApplication.instance() or QApplication([])
+        controller = TrayController.__new__(TrayController)
+        controller.window = OverlayWindow()
+        controller.tray_icon = Mock()
+        try:
+            controller.window.hide()
+            controller._warn_hotkey_privileges()
+            self.assertFalse(controller.window.isHidden())
+            self.assertFalse(controller._hotkey_privilege_notice.isHidden())
+            self.assertFalse(controller.window._can_auto_hide())
+            controller.tray_icon.showMessage.assert_called_once()
+            self.assertIn("run it as administrator", controller._hotkey_privilege_notice.text())
+            controller._hotkey_privilege_notice.accept()
+        finally:
+            controller.window.close()
+
     def test_response_does_not_repeat_status_in_preview_line(self) -> None:
         window = OverlayWindow()
         try:
