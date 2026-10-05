@@ -2758,7 +2758,13 @@ class OverlayWindow(QMainWindow):
     geometry_changed = Signal(object)
 
     def __init__(self, pet_path: str = "") -> None:
-        super().__init__()
+        # A hidden owner keeps the Windows overlay out of the taskbar without
+        # using Qt.Tool, which broadcast window pickers exclude.
+        taskbar_owner = (
+            QWidget(None, Qt.WindowType.Tool) if sys.platform == "win32" else None
+        )
+        super().__init__(taskbar_owner, Qt.WindowType.Window)
+        self._taskbar_owner = taskbar_owner
         logger.debug("Creating overlay window")
         self._pet_response_pending = False
         self._pet_playing = False
@@ -2780,10 +2786,11 @@ class OverlayWindow(QMainWindow):
         self._preferred_chatgpt_url = ""
         self.setWindowTitle("Live GPT")
         self.setMinimumSize(760, 180)
+        # Broadcast window pickers filter out Qt.Tool / WS_EX_TOOLWINDOW.
         self.setWindowFlags(
-            Qt.WindowType.FramelessWindowHint
+            Qt.WindowType.Window
+            | Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
-            | Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
 

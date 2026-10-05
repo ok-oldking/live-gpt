@@ -28,6 +28,16 @@ messages are still allowed.
 Double-click the tray icon to reveal it and turn auto-hide off. The **Exit**
 button closes the app.
 
+To capture the overlay in broadcast software, add a **Window capture** source
+and select **Live GPT** (the executable may be listed as `python.exe`,
+`pythonw.exe`, or `live-gpt.exe`). Keep the overlay shown and turn **Auto-hide**
+off while streaming. The overlay uses a normal top-level window so broadcast
+window lists can include it. A hidden owner keeps it out of the Windows taskbar;
+use the system tray icon to reveal it.
+If a capture method produces a blank image, try **Windows Graphics Capture**
+if your broadcast software offers it. Transparency support depends on the
+capture method and broadcast software.
+
 Press and hold the microphone button to start ChatGPT's browser dictation
 through Playwright. Releasing it clicks ChatGPT's **Done** control, waits for
 the dictated text to appear in ChatGPT's composer, and copies that text into
