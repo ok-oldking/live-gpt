@@ -393,7 +393,7 @@ class BrowserMonitorTests(unittest.TestCase):
 
     @patch("live_gpt.browser.open_remote_debugging_settings", side_effect=[RuntimeError("Window unavailable"), "chrome://inspect/#remote-debugging"])
     @patch("live_gpt.browser.discover_cdp_endpoint", return_value="ws://127.0.0.1:9222/devtools/browser/id")
-    def test_rejected_endpoint_retries_failed_settings_after_cooldown(self, discover, open_settings):
+    def test_rejected_endpoint_requires_explicit_retry_after_failed_settings(self, discover, open_settings):
         monitor = BrowserMonitor()
         state = _MonitorState()
         playwright = Mock()
@@ -405,9 +405,43 @@ class BrowserMonitorTests(unittest.TestCase):
             self.assertEqual(playwright.chromium.connect_over_cdp.call_count, 1)
             clock.return_value = 131
             monitor._try_connect(playwright, FakePlaywrightError, state)
+            clock.return_value = 1000
+            monitor._try_connect(playwright, FakePlaywrightError, state)
+            open_settings.assert_called_once()
+            self.assertEqual(playwright.chromium.connect_over_cdp.call_count, 1)
+            monitor.request_retry_connection()
+            monitor._try_connect(playwright, FakePlaywrightError, state)
         self.assertEqual(open_settings.call_count, 2)
         self.assertIsNone(state.retry_endpoint)
         self.assertTrue(state.settings_opened)
+
+    @patch("live_gpt.browser.open_remote_debugging_settings", side_effect=RuntimeError("Address bar not found"))
+    @patch("live_gpt.browser.discover_cdp_endpoint", return_value=None)
+    def test_missing_endpoint_does_not_repeat_failed_settings_navigation(self, discover, open_settings):
+        monitor = BrowserMonitor()
+        state = _MonitorState()
+        playwright = Mock()
+        for now in (100, 131, 200, 1000):
+            with patch("live_gpt.browser.time.monotonic", return_value=now):
+                monitor._try_connect(playwright, FakePlaywrightError, state)
+        open_settings.assert_called_once()
+        playwright.chromium.connect_over_cdp.assert_not_called()
+        monitor.request_retry_connection()
+        monitor._try_connect(playwright, FakePlaywrightError, state)
+        self.assertEqual(open_settings.call_count, 2)
+
+    @patch("live_gpt.browser.open_remote_debugging_settings", side_effect=RuntimeError("Address bar not found"))
+    @patch("live_gpt.browser.discover_cdp_endpoint")
+    def test_browser_enabled_manually_connects_after_failed_setup(self, discover, open_settings):
+        discover.side_effect = [None, "ws://127.0.0.1:9222/devtools/browser/id"]
+        monitor = BrowserMonitor()
+        state = _MonitorState()
+        playwright = Mock()
+        monitor._try_connect(playwright, FakePlaywrightError, state)
+        monitor._try_connect(playwright, FakePlaywrightError, state)
+        self.assertIsNotNone(state.browser)
+        open_settings.assert_called_once()
+        playwright.chromium.connect_over_cdp.assert_called_once()
 
     def test_stop_interrupts_pending_browser_approval(self) -> None:
         monitor = BrowserMonitor()
@@ -1214,6 +1248,12 @@ class BrowserWindowsTests(unittest.TestCase):
         self.assertIn("0x54", script)
         self.assertNotIn("New Tab button not found", script)
         self.assertIn("AttachThreadInput", script)
+        self.assertIn("AcceleratorKeyProperty", script)
+        self.assertIn("'Ctrl+L'", script)
+        self.assertLess(
+            script.index("$value = Get-LiveGptAddressValue $addressBar"),
+            script.index("if ($true)"),
+        )
         self.assertEqual(
             script.count("[LiveGptWindowMessages]::ActivateWindow($window)"),
             2,

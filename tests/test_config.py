@@ -8,6 +8,15 @@ from live_gpt.localization import resolve_language
 
 
 class ConfigTests(unittest.TestCase):
+    def test_existing_config_defaults_cursor_capture_on(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text('{"version": 1}', encoding="utf-8")
+            config = Config(path)
+            self.assertTrue(config["capture_cursor"])
+            config["capture_cursor"] = False
+            self.assertFalse(Config(path)["capture_cursor"])
+
     def test_weight_paths_are_saved_atomically_and_incomplete_pair_is_repaired(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"

@@ -25,7 +25,11 @@ send it. Recording hotkeys automatically send successful dictation. Voice recogn
 at least two non-whitespace characters before it can be sent. A one-character
 result remains in the editor for correction; manually typed one-character
 messages are still allowed.
-Double-click the tray icon to reveal it and turn auto-hide off. The **Exit**
+Click or double-click the tray icon, or choose **Show Live GPT** from its menu,
+to reveal the overlay and turn auto-hide off. Its controls stay visible until
+you move the pointer onto the overlay. Monitor, resolution, and display scaling
+changes automatically move an offscreen overlay back into the usable screen
+area; revealing it from the tray also checks its position. The **Exit**
 button closes the app.
 
 To capture the overlay in broadcast software, add a **Window capture** source
@@ -68,6 +72,10 @@ image attachments and, unless **No screenshot** is selected, captures the
 chosen source, scales its longest edge down to 1920 pixels when necessary, and
 uploads it as lossless WebP before clicking Send. Window capture uses the
 BitBlt/PrintWindow approach with full-content rendering enabled.
+Window screenshots include the visible mouse cursor by default. Turn off
+**Configure → Screenshots → Capture mouse cursor in window screenshots** to
+omit it. The setting is saved as `capture_cursor` and applies to manual sends
+and recording screenshots. Desktop screenshots keep their existing behavior.
 When a screenshot source is selected, the **With Screenshot** action remains
 available even with an empty prompt. If the editor also contains text, a
 paper-plane **No Screenshot** action appears so the prompt can be sent without
@@ -78,7 +86,7 @@ Starting another recording before the pending prompt is sent removes the
 previously uploaded screenshot before preparing the new one.
 
 The **Configure** button opens the application settings, organized into
-Shortcuts, Language, Recording, Playing, and Pet pages in the left navigation.
+Shortcuts, Screenshots, Language, Recording, Playing, and Pet pages in the left navigation.
 **Language** offers **English** and **简体中文** (Simplified Chinese).
 On first launch, or when `language` in `config.json` is missing or empty, the app
 matches the operating system's display language to one of these options and
@@ -193,6 +201,9 @@ the user to approve the incoming connection. Live GPT keeps one approval request
 pending until the user chooses **Allow** or **Deny**, preventing unanswered
 requests from creating a stack of dialogs. After choosing **Deny**, click
 **Enable Debugging** to make another request; the browser tabs remain unchanged.
+If opening or enabling the debugging settings fails, Live GPT stops automatic
+setup attempts. Click **Enable Debugging** to retry after correcting the issue;
+it checks that the browser address bar is accessible before opening a new tab.
 Attached
 ChatGPT pages retain the browser's native color-scheme
 preference. Live GPT does not launch the browser with debugging flags or create

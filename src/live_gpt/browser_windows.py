@@ -338,6 +338,58 @@ $window = [System.IntPtr]::new({window_handle})
 $root = [System.Windows.Automation.AutomationElement]::FromHandle(
     $window
 )
+$edgeAddressCondition = New-Object System.Windows.Automation.PropertyCondition(
+    [System.Windows.Automation.AutomationElement]::AutomationIdProperty,
+    'view_1021'
+)
+$chromeAddressCondition = New-Object System.Windows.Automation.PropertyCondition(
+    [System.Windows.Automation.AutomationElement]::AutomationIdProperty,
+    'view_1012'
+)
+$addressIdCondition = New-Object System.Windows.Automation.OrCondition(
+    $edgeAddressCondition, $chromeAddressCondition
+)
+# Chromium's numeric view IDs change between versions. The address bar's
+# Ctrl+L accelerator identifies it without matching page text fields.
+$addressShortcutCondition = New-Object System.Windows.Automation.PropertyCondition(
+    [System.Windows.Automation.AutomationElement]::AcceleratorKeyProperty,
+    'Ctrl+L'
+)
+$addressHintCondition = New-Object System.Windows.Automation.OrCondition(
+    $addressIdCondition, $addressShortcutCondition
+)
+$editCondition = New-Object System.Windows.Automation.PropertyCondition(
+    [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+    [System.Windows.Automation.ControlType]::Edit
+)
+$addressCondition = New-Object System.Windows.Automation.AndCondition(
+    $addressHintCondition, $editCondition
+)
+function Find-LiveGptAddressBar {{
+    $deadline = [DateTime]::UtcNow.AddSeconds(3)
+    do {{
+        $addressBar = $root.FindFirst(
+            [System.Windows.Automation.TreeScope]::Descendants,
+            $addressCondition
+        )
+        if ($addressBar) {{ return $addressBar }}
+        Start-Sleep -Milliseconds 100
+    }} while ([DateTime]::UtcNow -lt $deadline)
+    throw 'Address bar not found'
+}}
+function Get-LiveGptAddressValue($addressBar) {{
+    $value = $null
+    if (-not $addressBar.TryGetCurrentPattern(
+        [System.Windows.Automation.ValuePattern]::Pattern, [ref]$value
+    ) -or $value.Current.IsReadOnly) {{
+        throw 'Browser address bar is not writable'
+    }}
+    return $value
+}}
+# Check navigation support before creating a tab, so a missing or inaccessible
+# address bar cannot leave a blank tab behind.
+$addressBar = Find-LiveGptAddressBar
+$value = Get-LiveGptAddressValue $addressBar
 if ({create_new_tab_value}) {{
     $newTabCondition = New-Object `
         System.Windows.Automation.PropertyCondition(
@@ -398,38 +450,10 @@ if ({create_new_tab_value}) {{
         )
     }}
     Start-Sleep -Milliseconds 250
+    # Opening a tab can replace the accessibility elements.
+    $addressBar = Find-LiveGptAddressBar
+    $value = Get-LiveGptAddressValue $addressBar
 }}
-$edgeAddressCondition = New-Object System.Windows.Automation.PropertyCondition(
-    [System.Windows.Automation.AutomationElement]::AutomationIdProperty,
-    'view_1021'
-)
-$chromeAddressCondition = New-Object System.Windows.Automation.PropertyCondition(
-    [System.Windows.Automation.AutomationElement]::AutomationIdProperty,
-    'view_1012'
-)
-$addressIdCondition = New-Object System.Windows.Automation.OrCondition(
-    $edgeAddressCondition, $chromeAddressCondition
-)
-$editCondition = New-Object System.Windows.Automation.PropertyCondition(
-    [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-    [System.Windows.Automation.ControlType]::Edit
-)
-$addressCondition = New-Object System.Windows.Automation.AndCondition(
-    $addressIdCondition, $editCondition
-)
-$deadline = [DateTime]::UtcNow.AddSeconds(3)
-$addressBar = $null
-do {{
-    $addressBar = $root.FindFirst(
-        [System.Windows.Automation.TreeScope]::Descendants,
-        $addressCondition
-    )
-    if (-not $addressBar) {{ Start-Sleep -Milliseconds 100 }}
-}} while (-not $addressBar -and [DateTime]::UtcNow -lt $deadline)
-if (-not $addressBar) {{ throw 'Address bar not found' }}
-$value = $addressBar.GetCurrentPattern(
-    [System.Windows.Automation.ValuePattern]::Pattern
-)
 $value.SetValue('{url}')
 $addressBar.SetFocus()
 [void][LiveGptWindowMessages]::PostMessage(

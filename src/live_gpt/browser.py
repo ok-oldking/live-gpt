@@ -141,7 +141,7 @@ class _MonitorState:
     browser: Any | None = None
     discovery_session: Any | None = None
     settings_opened: bool = False
-    next_settings_attempt: float = 0.0
+    settings_attempted: bool = False
     retry_endpoint: str | None = None
     last_tabs: list[dict[str, str]] | None = None
     media_reset_pages: set[str] = field(default_factory=set)
@@ -506,6 +506,8 @@ class BrowserMonitor(QThread):
         if self._retry_connection_requested:
             self._retry_connection_requested = False
             state.retry_endpoint = None
+            if not state.settings_opened:
+                state.settings_attempted = False
 
         if endpoint is None:
             self._prepare_remote_debugging(state)
@@ -556,6 +558,7 @@ class BrowserMonitor(QThread):
         state.retry_endpoint = None
         state.media_reset_pages.clear()
         state.settings_opened = False
+        state.settings_attempted = False
         self.debug_connection_changed.emit(True)
         self._set_status("Browser connected")
         logger.info(f"Connected to browser endpoint={endpoint!r}")
@@ -564,8 +567,11 @@ class BrowserMonitor(QThread):
         opened = False
         if (
             not state.settings_opened
-            and time.monotonic() >= state.next_settings_attempt
+            and not state.settings_attempted
         ):
+            # Setup can create a tab before a later step fails. Never repeat
+            # that side effect in the background; wait for an explicit retry.
+            state.settings_attempted = True
             self._set_status("Opening remote debugging settings…")
             try:
                 open_remote_debugging_settings()
@@ -574,8 +580,6 @@ class BrowserMonitor(QThread):
             except Exception as error:
                 logger.error("Unable to open remote debugging settings", error)
                 self._set_status(str(error))
-            state.next_settings_attempt = time.monotonic() + 30
-
         if state.settings_opened:
             self._set_status("Enable remote debugging in the browser")
         return opened

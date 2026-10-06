@@ -347,6 +347,24 @@ class TranscriptEditorTests(unittest.TestCase):
 
 
 class SettingsDialogTests(unittest.TestCase):
+    def test_screenshot_cursor_option_defaults_on_and_saves_immediately(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = Config(Path(directory) / "config.json")
+            dialog = HotkeyConfigDialog("Right Alt", config=config)
+            try:
+                dialog.screenshots_nav_button.click()
+                self.assertEqual(dialog.settings_pages.currentIndex(), 5)
+                self.assertTrue(dialog.capture_cursor_checkbox.isChecked())
+                dialog.capture_cursor_checkbox.setChecked(False)
+                self.assertFalse(Config(config.path)["capture_cursor"])
+            finally:
+                dialog.close()
+            reopened = HotkeyConfigDialog("Right Alt", config=Config(config.path))
+            try:
+                self.assertFalse(reopened.capture_cursor_checkbox.isChecked())
+            finally:
+                reopened.close()
+
     def test_sovits_pair_blocks_incomplete_settings_and_saves_both(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -846,13 +864,14 @@ class TrayControllerBrowserTests(unittest.TestCase):
             hwnd=123,
         )
         controller = TrayController.__new__(TrayController)
+        controller.config = {"capture_cursor": True}
         controller.window = Mock()
         controller.browser_monitor = Mock()
         controller.selected_chatgpt_tab_id = "selected-tab"
 
         controller._handle_send_requested("Explain this", source)
 
-        capture.assert_called_once_with(source)
+        capture.assert_called_once_with(source, include_cursor=True)
         controller.browser_monitor.request_send.assert_called_once_with(
             "selected-tab",
             "Explain this",
@@ -861,6 +880,10 @@ class TrayControllerBrowserTests(unittest.TestCase):
         controller.window.begin_response_display.assert_called_once_with(
             "Explain this"
         )
+        capture.reset_mock()
+        controller.config["capture_cursor"] = False
+        controller._handle_send_requested("Without cursor", source)
+        capture.assert_called_once_with(source, include_cursor=False)
 
     def test_clear_queues_selected_browser_composer(self) -> None:
         controller = TrayController.__new__(TrayController)
@@ -1766,6 +1789,7 @@ class TrayControllerBrowserTests(unittest.TestCase):
         )
         controller = TrayController.__new__(TrayController)
         controller.window = Mock()
+        controller.config = {"capture_cursor": False}
         controller.window.capture_source_combo.currentData.return_value = (
             release_source
         )
@@ -1782,7 +1806,7 @@ class TrayControllerBrowserTests(unittest.TestCase):
 
         controller._upload_dictation_screenshot_after_hold(1)
 
-        capture.assert_called_once_with(release_source)
+        capture.assert_called_once_with(release_source, include_cursor=False)
         controller.browser_monitor.request_replace_attachment.assert_called_once_with(
             "selected-tab",
             b"hold-screenshot",
@@ -1795,7 +1819,7 @@ class TrayControllerBrowserTests(unittest.TestCase):
 
         controller._handle_send_requested("Dictated text", later_source)
 
-        capture.assert_called_once_with(release_source)
+        capture.assert_called_once_with(release_source, include_cursor=False)
         controller.browser_monitor.request_send.assert_called_once_with(
             "selected-tab",
             "Dictated text",
@@ -2111,17 +2135,82 @@ class TrayControllerBrowserTests(unittest.TestCase):
             None,
         )
 
-    def test_tray_double_click_disables_auto_hide_before_showing(self) -> None:
+    def test_tray_clicks_disable_auto_hide_and_reveal_controls(self) -> None:
+        for reason in (
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        ):
+            controller = TrayController.__new__(TrayController)
+            controller.window = Mock()
+            controller.show_window = Mock()
+            controller._handle_activation(reason)
+            controller.window.disable_auto_hide.assert_called_once_with()
+            controller.show_window.assert_called_once_with()
+            controller.window.reveal_controls.assert_called_once_with()
+
+    @patch("live_gpt.app.QCursor.pos", return_value=QPoint(-10000, -10000))
+    def test_tray_reveal_recovers_offscreen_window_and_survives_pointer_ticks(self, _cursor) -> None:
+        window = OverlayWindow()
         controller = TrayController.__new__(TrayController)
-        controller.window = Mock()
-        controller.show_window = Mock()
+        controller.window = window
+        bounds = QRect(0, 0, 3413, 1440)
+        screen = Mock()
+        screen.availableGeometry.return_value = bounds
+        try:
+            window.set_chatgpt_tabs([{"id": "tab", "title": "ChatGPT", "url": "https://chatgpt.com"}])
+            window.setGeometry(3246, 1808, 1619, 306)
+            window.auto_hide_button.setChecked(True)
+            window.hide()
+            with patch("live_gpt.app.QApplication.screens", return_value=[screen]), \
+                    patch("live_gpt.app.QApplication.primaryScreen", return_value=screen):
+                controller._handle_activation(QSystemTrayIcon.ActivationReason.Trigger)
+            self.assertFalse(window.isHidden())
+            self.assertFalse(window.auto_hide_enabled)
+            self.assertTrue(bounds.contains(window.geometry()))
+            for _ in range(5):
+                window._track_pointer(QPoint(-10000, -10000))
+                self.assertTrue(window._chrome_visible)
+                self.assertEqual(window._title_opacity.opacity(), 1)
+            window._track_pointer(window.frameGeometry().center())
+            window._track_pointer(QPoint(-10000, -10000))
+            self.assertFalse(window._chrome_visible)
+        finally:
+            window.close()
 
-        controller._handle_activation(
-            QSystemTrayIcon.ActivationReason.DoubleClick
-        )
+    def test_screen_recovery_handles_locked_sizes_and_collapsed_geometry(self) -> None:
+        window = OverlayWindow()
+        screen = Mock()
+        bounds = QRect(-1280, 0, 1280, 720)
+        screen.availableGeometry.return_value = bounds
+        try:
+            window.setGeometry(3246, 1808, 1619, 900)
+            window.lock_button.setChecked(True)
+            window._input_collapsed_geometry = QRect(3246, 1808, 1619, 306)
+            with patch("live_gpt.app.QApplication.screens", return_value=[screen]), \
+                    patch("live_gpt.app.QApplication.primaryScreen", return_value=screen):
+                window.ensure_on_screen()
+            self.assertTrue(bounds.contains(window.geometry()))
+            self.assertTrue(window._position_locked)
+            self.assertTrue(bounds.contains(window._input_collapsed_geometry))
+            window._collapse_hover_input()
+            self.assertTrue(bounds.contains(window.geometry()))
+        finally:
+            window.close()
 
-        controller.window.disable_auto_hide.assert_called_once_with()
-        controller.show_window.assert_called_once_with()
+    def test_screen_recovery_preserves_visible_secondary_monitor_position(self) -> None:
+        window = OverlayWindow()
+        primary, secondary = Mock(), Mock()
+        primary.availableGeometry.return_value = QRect(0, 0, 1920, 1080)
+        secondary.availableGeometry.return_value = QRect(-1920, 0, 1920, 1080)
+        try:
+            expected = QRect(-1700, 700, 1140, 240)
+            window.setGeometry(expected)
+            with patch("live_gpt.app.QApplication.screens", return_value=[primary, secondary]), \
+                    patch("live_gpt.app.QApplication.primaryScreen", return_value=primary):
+                window.ensure_on_screen()
+            self.assertEqual(window.geometry(), expected)
+        finally:
+            window.close()
 
     def test_empty_dictation_returns_to_auto_hidden_state(self) -> None:
         controller = TrayController.__new__(TrayController)

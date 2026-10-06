@@ -21,6 +21,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "hotkey_hold_without_screenshot": "Right Ctrl",
     "auto_hide": False,
     "capture_source": "",
+    "capture_cursor": True,
     "chatgpt_window": "",
     "window_geometry": [],
     "window_locked": False,

@@ -94,6 +94,7 @@ SPEAKER_ICON_PATH = ASSET_DIRECTORY / "speaker.svg"
 CHECK_ICON_PATH = ASSET_DIRECTORY / "check.svg"
 SETTINGS_ICON_PATH = ASSET_DIRECTORY / "settings.svg"
 SHORTCUTS_ICON_PATH = ASSET_DIRECTORY / "shortcuts.svg"
+SCREENSHOT_ICON_PATH = ASSET_DIRECTORY / "screenshot.svg"
 LANGUAGE_ICON_PATH = ASSET_DIRECTORY / "language.svg"
 LOCK_ICON_PATH = ASSET_DIRECTORY / "lock.svg"
 UNLOCK_ICON_PATH = ASSET_DIRECTORY / "unlock.svg"
@@ -869,8 +870,13 @@ class HotkeyConfigDialog(QDialog):
         self.navigation_group.addButton(self.playing_nav_button, 3)
         self.pet_nav_button = self._navigation_button(tr("Pet"), PET_ICON_PATH)
         self.navigation_group.addButton(self.pet_nav_button, 4)
+        self.screenshots_nav_button = self._navigation_button(
+            tr("Screenshots"), SCREENSHOT_ICON_PATH,
+        )
+        self.navigation_group.addButton(self.screenshots_nav_button, 5)
         self.shortcuts_nav_button.setChecked(True)
         navigation_layout.addWidget(self.shortcuts_nav_button)
+        navigation_layout.addWidget(self.screenshots_nav_button)
         navigation_layout.addWidget(self.language_nav_button)
         navigation_layout.addWidget(self.recording_nav_button)
         navigation_layout.addWidget(self.playing_nav_button)
@@ -1364,6 +1370,10 @@ class HotkeyConfigDialog(QDialog):
         self.settings_pages.addWidget(self.recording_scroll)
         self.settings_pages.addWidget(self.playing_scroll)
         self._build_pet_page()
+        self._build_screenshots_page()
+        self.screenshots_nav_button.clicked.connect(
+            lambda checked: checked and self.settings_pages.setCurrentIndex(5)
+        )
         self.pet_nav_button.clicked.connect(
             lambda checked: checked and self.settings_pages.setCurrentIndex(4)
         )
@@ -1546,6 +1556,13 @@ class HotkeyConfigDialog(QDialog):
                 background: transparent;
                 border: none;
             }
+            QFrame#settingsCard QCheckBox {
+                color: #f5f7ff;
+                background: transparent;
+                border: none;
+                spacing: 10px;
+                font-size: 14px;
+            }
             QLabel#settingsCardTitle {
                 color: #f5f7ff;
                 font-size: 16px;
@@ -1712,6 +1729,9 @@ class HotkeyConfigDialog(QDialog):
             self._check_voice_page_when_needed("tts")
 
     def _connect_auto_save(self) -> None:
+        self.capture_cursor_checkbox.toggled.connect(
+            lambda enabled: self._save_setting("capture_cursor", enabled)
+        )
         self.language_combo.currentIndexChanged.connect(
             self._language_changed
         )
@@ -1754,6 +1774,37 @@ class HotkeyConfigDialog(QDialog):
             editor.keySequenceChanged.connect(
                 lambda _sequence: self._save_hotkeys()
             )
+
+    def _build_screenshots_page(self) -> None:
+        page = QWidget()
+        page.setObjectName("settingsPage")
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(16)
+        title = QLabel(tr("Screenshots"))
+        title.setObjectName("settingsPageTitle")
+        layout.addWidget(title)
+        card = QFrame()
+        card.setObjectName("settingsCard")
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(20, 20, 20, 20)
+        card_layout.setSpacing(14)
+        self.capture_cursor_checkbox = QCheckBox(
+            tr("Capture mouse cursor in window screenshots")
+        )
+        self.capture_cursor_checkbox.setChecked(
+            bool(self.config["capture_cursor"]) if self.config is not None else True
+        )
+        card_layout.addWidget(self.capture_cursor_checkbox)
+        note = QLabel(tr(
+            "Include the visible mouse cursor when it overlaps the selected window."
+        ))
+        note.setObjectName("settingsNote")
+        note.setWordWrap(True)
+        card_layout.addWidget(note)
+        layout.addWidget(card)
+        layout.addStretch()
+        self.settings_pages.addWidget(page)
 
     def _build_pet_page(self) -> None:
         page = QWidget()
@@ -2778,6 +2829,7 @@ class OverlayWindow(QMainWindow):
         self._resize_start_global: QPoint | None = None
         self._resize_start_geometry: QRect | None = None
         self._chrome_visible = False
+        self._reveal_until_hovered = False
         self._focus_restorer = ForegroundWindowRestorer()
         self._auto_hide_enabled = False
         self._browser_connected = False
@@ -3950,6 +4002,63 @@ class OverlayWindow(QMainWindow):
     def remember_foreground_app(self) -> None:
         self._focus_restorer.remember_foreground()
 
+    def ensure_on_screen(self) -> None:
+        """Recover geometry after monitor, resolution, or scaling changes."""
+        screens = QApplication.screens()
+        if not screens:
+            return
+        geometry = self.geometry()
+
+        def overlap(screen) -> int:
+            intersection = screen.availableGeometry().intersected(geometry)
+            return max(0, intersection.width()) * max(0, intersection.height())
+
+        screen = max(screens, key=overlap)
+        if overlap(screen) == 0:
+            screen = QApplication.primaryScreen() or screen
+        bounds = screen.availableGeometry()
+        minimum_width = 760 if self._position_locked else self.minimumWidth()
+        minimum_height = 180 if self._position_locked else self.minimumHeight()
+
+        def clamp(rect: QRect) -> QRect:
+            result = QRect(rect)
+            result.setWidth(max(minimum_width, min(rect.width(), bounds.width())))
+            result.setHeight(max(minimum_height, min(rect.height(), bounds.height())))
+            result.moveLeft(max(bounds.left(), min(
+                rect.left(), bounds.right() - result.width() + 1,
+            )))
+            result.moveTop(max(bounds.top(), min(
+                rect.top(), bounds.bottom() - result.height() + 1,
+            )))
+            return result
+
+        recovered = clamp(geometry)
+        # Hover/subtitle collapse must not restore a stale offscreen position.
+        for attribute in ("_input_collapsed_geometry", "_subtitle_collapsed_geometry"):
+            collapsed = getattr(self, attribute)
+            if collapsed is not None:
+                setattr(self, attribute, clamp(collapsed))
+        if recovered == geometry:
+            return
+        logger.warning(f"Recovering offscreen overlay: {geometry.getRect()} -> {recovered.getRect()}")
+        if self._position_locked:
+            # A position lock must not prevent recovery on a smaller display.
+            self.setFixedSize(recovered.size())
+        self._fitting_hover_input = True
+        try:
+            self.setGeometry(recovered)
+        finally:
+            self._fitting_hover_input = False
+        self.geometry_changed.emit(QRect(
+            self._subtitle_collapsed_geometry or self._input_collapsed_geometry or recovered
+        ))
+
+    def reveal_controls(self) -> None:
+        # A tray click happens outside the overlay. Keep controls visible until
+        # the user reaches them instead of fading on the next pointer tick.
+        self._reveal_until_hovered = True
+        self._set_chrome_visible(True)
+
     def _restore_previous_focus(self) -> None:
         if self._focus_restorer.restore_previous():
             logger.debug("Restored focus to the previous application")
@@ -4035,7 +4144,7 @@ class OverlayWindow(QMainWindow):
 
     def _set_chrome_visible(self, visible: bool) -> None:
         visible = (
-            visible or not self._browser_connected
+            visible or self._reveal_until_hovered or not self._browser_connected
             or any(not notice.isHidden() for notice in self.findChildren(QMessageBox))
             or bool(self._resize_edges) or self.pet._drag_offset is not None
         )
@@ -4134,6 +4243,8 @@ class OverlayWindow(QMainWindow):
             if self._chrome_visible
             else self._pointer_over_visible_content(position)
         )
+        if hovered:
+            self._reveal_until_hovered = False
         self._set_chrome_visible(hovered)
         if (self._fitting_hover_input or self._fitting_subtitle
                 or self._resize_edges or self.pet._drag_offset is not None):
@@ -4532,6 +4643,14 @@ class TrayController:
         self.window.geometry_changed.connect(
             self._schedule_window_geometry_save
         )
+        self._screen_recovery_timer = QTimer(self.window)
+        self._screen_recovery_timer.setSingleShot(True)
+        self._screen_recovery_timer.timeout.connect(self.window.ensure_on_screen)
+        self.application.screenAdded.connect(self._watch_screen)
+        self.application.screenRemoved.connect(self._schedule_screen_recovery)
+        self.application.primaryScreenChanged.connect(self._schedule_screen_recovery)
+        for screen in self.application.screens():
+            self._watch_screen(screen)
 
         self.browser_monitor.start()
         self.hotkey_monitor.start()
@@ -4544,6 +4663,9 @@ class TrayController:
         self._refresh_capture_sources()
 
         self.menu = QMenu()
+        self.show_action = QAction(tr("Show Live GPT"), self.menu)
+        self.show_action.triggered.connect(self._show_from_tray)
+        self.menu.addAction(self.show_action)
         self.exit_action = QAction(tr("Exit"), self.menu)
         self.exit_action.triggered.connect(self._exit_application)
         self.menu.addAction(self.exit_action)
@@ -4704,16 +4826,35 @@ class TrayController:
         self, reason: QSystemTrayIcon.ActivationReason
     ) -> None:
         logger.debug(f"Tray icon activated: {reason.name}")
-        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
-            self.window.disable_auto_hide()
-            self.show_window()
+        if reason in (
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        ):
+            self._show_from_tray()
+
+    def _show_from_tray(self, checked: bool = False) -> None:
+        del checked
+        self.window.disable_auto_hide()
+        self.show_window()
+        self.window.reveal_controls()
 
     def show_window(self) -> None:
         logger.info("Showing the overlay window")
         self.window.remember_foreground_app()
         self.window.showNormal()
+        self.window.ensure_on_screen()
         self.window.raise_()
         self.window.activateWindow()
+
+    def _watch_screen(self, screen) -> None:
+        screen.geometryChanged.connect(self._schedule_screen_recovery)
+        screen.availableGeometryChanged.connect(self._schedule_screen_recovery)
+        screen.logicalDotsPerInchChanged.connect(self._schedule_screen_recovery)
+        self._schedule_screen_recovery()
+
+    def _schedule_screen_recovery(self, *_args) -> None:
+        # Run after Qt finishes applying the display change to its coordinates.
+        self._screen_recovery_timer.start(0)
 
     def _local_tts_configuration(
         self,
@@ -5003,7 +5144,9 @@ class TrayController:
         if tab_id is None:
             return
         try:
-            screenshot = capture_webp(source)
+            screenshot = capture_webp(
+                source, include_cursor=bool(self.config["capture_cursor"])
+            )
         except Exception as error:
             logger.error("Unable to capture dictation screenshot", error)
             self._pending_dictation_capture = _PendingDictationCapture(
@@ -5299,7 +5442,9 @@ class TrayController:
         if capture_source is not None and pending_capture is None:
             self.window.set_status(tr("Capturing screenshot…"))
             try:
-                screenshot = capture_webp(capture_source)
+                screenshot = capture_webp(
+                    capture_source, include_cursor=bool(self.config["capture_cursor"])
+                )
             except Exception as error:
                 logger.error("Unable to capture screenshot", error)
                 self.window.send_button.setEnabled(True)

@@ -1,6 +1,10 @@
 """Simplified Chinese interface catalog (English source → translation)."""
 
 TRANSLATIONS = {
+    "Show Live GPT": "显示 Live GPT",
+    "Screenshots": "截图",
+    "Capture mouse cursor in window screenshots": "窗口截图包含鼠标指针",
+    "Include the visible mouse cursor when it overlaps the selected window.": "鼠标指针与所选窗口重叠时，将可见的指针包含在截图中。",
     "Auto": "自动",
     "Auto (Cantonese)": "自动（粤语）",
     "Chinese": "中文",

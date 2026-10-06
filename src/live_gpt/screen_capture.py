@@ -22,6 +22,8 @@ BI_RGB = 0
 DWMWA_CLOAKED = 14
 MONITOR_DEFAULTTONEAREST = 2
 render_full = True
+CURSOR_SHOWING = 0x00000001
+DI_NORMAL = 0x00000003
 
 
 @dataclass(frozen=True)
@@ -65,6 +67,25 @@ class _MonitorInfo(ctypes.Structure):
         ("rcMonitor", wintypes.RECT),
         ("rcWork", wintypes.RECT),
         ("dwFlags", wintypes.DWORD),
+    ]
+
+
+class _CursorInfo(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("flags", wintypes.DWORD),
+        ("hCursor", wintypes.HANDLE),
+        ("ptScreenPos", wintypes.POINT),
+    ]
+
+
+class _IconInfo(ctypes.Structure):
+    _fields_ = [
+        ("fIcon", wintypes.BOOL),
+        ("xHotspot", wintypes.DWORD),
+        ("yHotspot", wintypes.DWORD),
+        ("hbmMask", wintypes.HBITMAP),
+        ("hbmColor", wintypes.HBITMAP),
     ]
 
 
@@ -119,6 +140,19 @@ if sys.platform == "win32":
     user32.ReleaseDC.restype = ctypes.c_int
     user32.PrintWindow.argtypes = [wintypes.HWND, wintypes.HDC, wintypes.UINT]
     user32.PrintWindow.restype = wintypes.BOOL
+    user32.GetCursorInfo.argtypes = [ctypes.POINTER(_CursorInfo)]
+    user32.GetCursorInfo.restype = wintypes.BOOL
+    user32.CopyIcon.argtypes = [wintypes.HANDLE]
+    user32.CopyIcon.restype = wintypes.HANDLE
+    user32.GetIconInfo.argtypes = [wintypes.HANDLE, ctypes.POINTER(_IconInfo)]
+    user32.GetIconInfo.restype = wintypes.BOOL
+    user32.DestroyCursor.argtypes = [wintypes.HANDLE]
+    user32.DestroyCursor.restype = wintypes.BOOL
+    user32.DrawIconEx.argtypes = [
+        wintypes.HDC, ctypes.c_int, ctypes.c_int, wintypes.HANDLE,
+        ctypes.c_int, ctypes.c_int, wintypes.UINT, wintypes.HBRUSH, wintypes.UINT,
+    ]
+    user32.DrawIconEx.restype = wintypes.BOOL
 
     gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
     gdi32.CreateCompatibleDC.restype = wintypes.HDC
@@ -194,7 +228,7 @@ def list_capture_sources(
     return display_sources + windows
 
 
-def capture_webp(source: CaptureSource) -> bytes:
+def capture_webp(source: CaptureSource, *, include_cursor: bool = True) -> bytes:
     if sys.platform != "win32":
         raise RuntimeError("Screen capture is only available on Windows")
     if source.kind == "display":
@@ -217,6 +251,7 @@ def capture_webp(source: CaptureSource) -> bytes:
             width=rect.right - rect.left,
             height=rect.bottom - rect.top,
             render_full=render_full,
+            cursor_origin=(rect.left, rect.top) if include_cursor else None,
         )
     else:
         raise ValueError(f"Unsupported capture source: {source.kind}")
@@ -390,6 +425,7 @@ def _capture_bitmap(
     width: int,
     height: int,
     render_full: bool,
+    cursor_origin: tuple[int, int] | None = None,
 ) -> QImage:
     if width <= 0 or height <= 0:
         raise ValueError(f"Invalid capture size: {width}×{height}")
@@ -426,6 +462,9 @@ def _capture_bitmap(
             )
         if not captured:
             raise ctypes.WinError(ctypes.get_last_error())
+
+        if cursor_origin is not None:
+            _draw_cursor(memory_dc, *cursor_origin)
 
         bitmap_info = _BitmapInfo()
         bitmap_info.bmiHeader = _BitmapInfoHeader(
@@ -464,6 +503,35 @@ def _capture_bitmap(
         if memory_dc:
             gdi32.DeleteDC(memory_dc)
         user32.ReleaseDC(hwnd, source_dc)
+
+
+def _draw_cursor(memory_dc: int, screen_left: int, screen_top: int) -> None:
+    """Composite the visible cursor at its hotspot; the bitmap clips its edges."""
+    cursor = _CursorInfo(cbSize=ctypes.sizeof(_CursorInfo))
+    if not user32.GetCursorInfo(ctypes.byref(cursor)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    if not cursor.flags & CURSOR_SHOWING or not cursor.hCursor:
+        return
+    copied_cursor = user32.CopyIcon(cursor.hCursor)
+    if not copied_cursor:
+        raise ctypes.WinError(ctypes.get_last_error())
+    icon = _IconInfo()
+    try:
+        if not user32.GetIconInfo(copied_cursor, ctypes.byref(icon)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        # Draw before resizing for upload so the cursor scales with the image.
+        if not user32.DrawIconEx(
+            memory_dc,
+            cursor.ptScreenPos.x - screen_left - icon.xHotspot,
+            cursor.ptScreenPos.y - screen_top - icon.yHotspot,
+            copied_cursor, 0, 0, 0, None, DI_NORMAL,
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+    finally:
+        for bitmap in (icon.hbmMask, icon.hbmColor):
+            if bitmap:
+                gdi32.DeleteObject(bitmap)
+        user32.DestroyCursor(copied_cursor)
 
 
 __all__ = ["CaptureSource", "capture_webp", "list_capture_sources"]
