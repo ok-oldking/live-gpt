@@ -114,7 +114,8 @@ the installation defaults.
 Live GPT copies `sovits_server.py` into the selected installation and runs it with
 `runtime/python.exe`. It preloads the model, reuses reference-audio features, and
 streams speech through one audio output. Complete sentences enter the synthesis
-queue while ChatGPT is still generating its reply.
+queue while ChatGPT is still generating its reply. If ChatGPT replaces an
+intermediate reply with a final answer, the changed sentences are also read.
 
 The STT catalog includes Mandarin and English models. Recording settings can
 install the Sherpa runtime and download models into the working directory's

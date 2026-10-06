@@ -4894,7 +4894,11 @@ class TrayController:
                 and text[match.end()].isdigit()
             ):
                 continue
-            if match.end() < len(text) and not text[match.end()].isspace():
+            if (
+                match.end() < len(text)
+                and not text[match.end()].isspace()
+                and not any(character in "。！？" for character in match.group())
+            ):
                 continue
             end = match.end()
             sentence = text[start:end].strip()
@@ -4929,8 +4933,16 @@ class TrayController:
         sentences, _consumed = self._completed_response_sentences(
             text, final=final
         )
-        queued_count = len(self._local_voice_queued_sentences)
-        new_sentences = sentences[queued_count:]
+        queued_sentences = self._local_voice_queued_sentences
+        matched_count = 0
+        for sentence, queued_sentence in zip(sentences, queued_sentences):
+            if sentence != queued_sentence:
+                break
+            matched_count += 1
+        # ChatGPT can replace an intermediate reply with a separate final answer.
+        # Only skip sentences whose text still matches the current response.
+        response_replaced = matched_count < min(len(sentences), len(queued_sentences))
+        new_sentences = sentences[matched_count:]
         if new_sentences and self._local_speech_thread is None:
             configuration = self._local_tts_configuration()
             if configuration is None:
@@ -4948,6 +4960,12 @@ class TrayController:
 
         worker = self._local_speech_thread
         if isinstance(worker, _QueuedLocalSpeechThread):
+            if response_replaced:
+                logger.debug(
+                    "Local voice response replaced; queuing changed sentences "
+                    f"matching_prefix={matched_count} sentences={len(sentences)}"
+                )
+                del queued_sentences[matched_count:]
             worker.update_full_text(text)
             for sentence in new_sentences:
                 worker.enqueue(sentence, text)

@@ -228,7 +228,26 @@ class LocalSpeechThreadTests(unittest.TestCase):
         self.assertEqual(sentences, ["Second sentence is done"])
         self.assertEqual(consumed, len("Second sentence is done"))
 
-    def test_response_rewrite_queues_sentences_after_the_spoken_position(self) -> None:
+    def test_chinese_sentences_do_not_require_spaces_after_punctuation(self) -> None:
+        text = (
+            "打开 https://github.com/WowUp/WowUp/releases。"
+            "下载 2.24.0-beta 的 Setup.exe！"
+            "“装好了吗？”重新打开"
+        )
+        sentences, consumed = TrayController._completed_response_sentences(
+            text, final=False
+        )
+        self.assertEqual(
+            sentences,
+            [
+                "打开 https://github.com/WowUp/WowUp/releases。",
+                "下载 2.24.0-beta 的 Setup.exe！",
+                "“装好了吗？”",
+            ],
+        )
+        self.assertEqual(text[consumed:], "重新打开")
+
+    def test_response_rewrite_queues_changed_sentences(self) -> None:
         controller = TrayController.__new__(TrayController)
         controller._local_voice_longest_text = "Original first. Partial"
         controller._local_voice_queued_sentences = ["Original first."]
@@ -240,12 +259,89 @@ class LocalSpeechThreadTests(unittest.TestCase):
             True,
         )
 
-        queued = worker._sentences.get_nowait()
-        remainder = worker._sentences.get_nowait()
-        finished = worker._sentences.get_nowait()
-        self.assertEqual(queued, "Rewritten second.")
-        self.assertEqual(remainder, "Final remainder")
-        self.assertIs(finished, worker._FINISHED)
+        self.assertEqual(worker._sentences.get_nowait(), "Rewritten first.")
+        self.assertEqual(worker._sentences.get_nowait(), "Rewritten second.")
+        self.assertEqual(worker._sentences.get_nowait(), "Final remainder")
+        self.assertIs(worker._sentences.get_nowait(), worker._FINISHED)
+        self.assertEqual(
+            controller._local_voice_queued_sentences,
+            ["Rewritten first.", "Rewritten second.", "Final remainder"],
+        )
+
+    def test_response_rewrite_preserves_unchanged_prefix(self) -> None:
+        controller = TrayController.__new__(TrayController)
+        controller._local_voice_longest_text = "First. Original second."
+        controller._local_voice_queued_sentences = ["First.", "Original second."]
+        worker = _QueuedLocalSpeechThread(Mock(), "model", "speaker", "en")
+        controller._local_speech_thread = worker
+
+        controller._update_local_voice("First. Replacement second.", False)
+        controller._update_local_voice("First. Replacement second. Last", False)
+        controller._update_local_voice("First. Replacement second. Last", True)
+
+        self.assertEqual(worker._sentences.get_nowait(), "Replacement second.")
+        self.assertEqual(worker._sentences.get_nowait(), "Last")
+        self.assertIs(worker._sentences.get_nowait(), worker._FINISHED)
+        self.assertTrue(worker._sentences.empty())
+
+    def test_shorter_final_answer_is_queued_after_intermediate_reply(self) -> None:
+        controller = TrayController.__new__(TrayController)
+        controller._local_voice_longest_text = "I will look up the answer for you."
+        controller._local_voice_queued_sentences = [controller._local_voice_longest_text]
+        worker = _QueuedLocalSpeechThread(Mock(), "model", "speaker", "en")
+        controller._local_speech_thread = worker
+
+        controller._update_local_voice("The answer is 42.", True)
+
+        self.assertEqual(worker._sentences.get_nowait(), "The answer is 42.")
+        self.assertIs(worker._sentences.get_nowait(), worker._FINISHED)
+
+    def test_final_chinese_answer_reaches_synthesis_after_intermediate_reply(self) -> None:
+        import numpy as np
+
+        manager = Mock()
+        manager.display_name = "Test TTS"
+        manager.continuous_audio_stream = True
+        manager.synthesize_stream.side_effect = lambda _model, sentence, *_args: (
+            (np.ones(20, dtype=np.float32), 24000, sentence),
+        )
+        controller = TrayController.__new__(TrayController)
+        controller._local_voice_longest_text = ""
+        controller._local_voice_queued_sentences = []
+        worker = _QueuedLocalSpeechThread(manager, "model", "speaker", "zh")
+        controller._local_speech_thread = worker
+        intermediate = "我查一下 WowUp 切换测试版的具体位置。"
+        final_sentences = [
+            "最直接是去 WowUp 官方发布页，下载测试版安装包。",
+            "官方说明测试版就在这里提供。",
+            "找到 2.24.0-beta 或更新的测试版，展开下面的 Assets，"
+            "下载 Windows 用的 Setup、以 .exe 结尾的文件。",
+            "退出现在的 WowUp，运行安装包，装好再打开即可。",
+            "之后到 Options → WoW Clients 重新扫描游戏，再选择 Forever 客户端。",
+        ]
+        final_text = "".join(final_sentences)
+        completed: list[bool] = []
+        worker.completed.connect(lambda ok, _message: completed.append(ok))
+        controller._update_local_voice(intermediate, False)
+        # The final response replaces the intermediate message and streams from
+        # a shorter snapshot, as in the reported browser response.
+        for length in (1, 20, 63, 121, len(final_text)):
+            controller._update_local_voice(final_text[:length], False)
+        controller._update_local_voice(final_text, True)
+
+        output = Mock()
+        with patch.dict(
+            "sys.modules",
+            {"sounddevice": SimpleNamespace(OutputStream=Mock(return_value=output))},
+        ):
+            worker.run()
+
+        self.assertEqual(
+            [call.args[1] for call in manager.synthesize_stream.call_args_list],
+            [intermediate, *final_sentences],
+        )
+        self.assertEqual(output.write.call_count, 1 + len(final_sentences))
+        self.assertEqual(completed, [True])
 
     def test_temporary_shorter_response_snapshot_is_ignored(self) -> None:
         controller = TrayController.__new__(TrayController)

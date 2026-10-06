@@ -1547,6 +1547,7 @@ class BrowserMonitor(QThread):
             element => {
                 const clone = element.cloneNode(true);
                 clone.querySelectorAll([
+                    '[data-markdown-copy="exclude"]',
                     '[data-d-component="shimmer-text"]',
                     '[class*="cadencedShimmer-"]',
                     '[aria-hidden="true"]',

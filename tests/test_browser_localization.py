@@ -250,6 +250,54 @@ class BrowserLocalizationTests(unittest.TestCase):
         self.assertEqual(updates[-1], ("Comparing results", "I found the current bonuses."))
         self.assertIsNotNone(state.active_response)
 
+    def test_code_block_formatting_is_excluded_from_subtitles_and_local_voice(self):
+        from unittest.mock import patch
+        from live_gpt.browser import _ActiveResponse, _MonitorState
+
+        for language_label in ("Plain text", "Python", "纯文本"):
+            with self.subTest(language_label=language_label):
+                self.page.set_content("".join(line.strip() for line in f'''
+                    <div data-turn-key="new">
+                      <div data-markdown-text-style="assistant-message">
+                        <p>把这行放进宏里，点击就能重载界面：</p>
+                        <div class="CodeBlock-zu1QM3">
+                          <div data-markdown-copy="code-block">
+                            <div data-markdown-copy="exclude">
+                              <div>{language_label}</div>
+                              <button aria-label="Enable word wrap">Wrap</button>
+                              <button aria-label="Copy">Copy code</button>
+                            </div>
+                            <div><code><span>/reload</span></code></div>
+                          </div>
+                        </div>
+                        <p>Plain text 是正文。<code>Python</code> 也是正文。</p>
+                      </div>
+                      <div class="turn-action-controls"><button aria-label="Copy">Copy</button></div>
+                    </div>
+                '''.splitlines()))
+                snapshot = BrowserMonitor._response_snapshot(self.page, "old")
+                expected = "把这行放进宏里，点击就能重载界面：/reloadPlain text 是正文。Python 也是正文。"
+                self.assertEqual("".join(snapshot.text.splitlines()).strip(), expected)
+                monitor = BrowserMonitor()
+                monitor.set_use_browser_voice(False)
+                subtitles, speech = [], []
+                monitor.response_changed.connect(lambda _status, text: subtitles.append(text))
+                monitor.local_voice_updated.connect(lambda text, final: speech.append((text, final)))
+                state = _MonitorState(active_response=_ActiveResponse(
+                    page=self.page, turn_marker_before="old", started_at=90,
+                ))
+                with patch("live_gpt.browser.time.monotonic", return_value=100) as clock:
+                    monitor._poll_active_response(state)
+                    clock.return_value = 103
+                    monitor._poll_active_response(state)
+                self.assertTrue(subtitles)
+                self.assertTrue(all(text == snapshot.text for text in subtitles))
+                self.assertEqual(speech, [(snapshot.text, False), (snapshot.text, True)])
+                # Extraction must leave the original browser response intact.
+                self.assertEqual(
+                    self.page.locator('[data-markdown-copy="exclude"]').count(), 1
+                )
+
     def test_completion_and_read_aloud_menu_in_each_language(self):
         for copy, more, read in (
             ("Copy response", "More actions", "Read aloud"),
