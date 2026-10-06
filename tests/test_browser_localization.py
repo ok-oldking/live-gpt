@@ -27,6 +27,45 @@ class BrowserLocalizationTests(unittest.TestCase):
         self.page = self.browser.new_page()
         self.addCleanup(self.page.close)
 
+    def test_work_usage_banner_keeps_reset_details_and_omits_action_buttons(self):
+        title = "You’ve reached your 5-hour Work usage limit"
+        description = "Upgrade to Pro to remove the 5-hour limit, add credits to continue now, or wait for your usage to reset at 2:53 PM."
+        self.page.set_content(f'''
+            <form data-thread-find-composer="true">
+                <aside role="status" aria-live="polite">
+                    <div><div><h3>{title}</h3><div>{description}</div></div>
+                    <div><button>Add credits</button><button>Upgrade</button></div></div>
+                </aside>
+                <div data-composer-markdown contenteditable="true" role="textbox">Unsent prompt</div>
+            </form>
+        ''')
+        message = BrowserMonitor._usage_limit_message(self.page)
+        self.assertEqual(message, f"{title} {description}")
+        snapshot = BrowserMonitor._response_snapshot(self.page, None)
+        self.assertEqual(snapshot.error_message, message)
+        self.assertFalse(snapshot.is_generating)
+        with self.assertRaisesRegex(RuntimeError, "5-hour Work usage limit"):
+            BrowserMonitor._send_to_chatgpt_page(self.page, "New prompt")
+        self.assertEqual(BrowserMonitor._read_composer_text(self.page), "Unsent prompt")
+
+    def test_hidden_limits_and_assistant_text_do_not_block_send(self):
+        self.page.set_content('''
+            <form data-thread-find-composer="true">
+                <aside hidden role="status">You’ve reached your usage limit</aside>
+                <aside role="status">You have messages remaining</aside>
+            </form>
+            <div data-turn-key="reply">
+                <div data-markdown-text-style="assistant-message">You’ve reached your usage limit</div>
+            </div>
+        ''')
+        self.assertEqual(BrowserMonitor._usage_limit_message(self.page), "")
+        self.assertEqual(BrowserMonitor._response_snapshot(self.page, None).error_message, "")
+
+    def test_chinese_usage_limit_alert_is_reported(self):
+        message = "你已达到 Work 使用限额，请等待额度重置。"
+        self.page.set_content(f'<div role="alert">{message}</div>')
+        self.assertEqual(BrowserMonitor._usage_limit_message(self.page), message)
+
     def test_send_uses_active_chinese_composer_and_waits_until_enabled(self):
         for attribute in ('data-testid="send-button"', 'id="composer-submit-button"'):
             with self.subTest(attribute=attribute):

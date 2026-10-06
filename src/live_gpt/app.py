@@ -3071,6 +3071,13 @@ class OverlayWindow(QMainWindow):
         self.clear_button.clicked.connect(self._request_clear)
 
         panel_layout.addWidget(self.title_bar)
+        self.error_banner = QLabel()
+        self.error_banner.setObjectName("errorBanner")
+        self.error_banner.setTextFormat(Qt.TextFormat.PlainText)
+        self.error_banner.setWordWrap(True)
+        self.error_banner.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.error_banner.hide()
+        panel_layout.addWidget(self.error_banner)
         recording_layout = QHBoxLayout()
         recording_layout.setSpacing(16)
         try:
@@ -3101,7 +3108,7 @@ class OverlayWindow(QMainWindow):
         )
         self.microphone_button.setGraphicsEffect(self._microphone_opacity)
         self._content_opacities = []
-        for widget in (self.transcript_area, self.subtitle_panel, self.dictation_panel):
+        for widget in (self.transcript_area, self.subtitle_panel, self.dictation_panel, self.error_banner):
             effect = QGraphicsOpacityEffect(widget)
             widget.setGraphicsEffect(effect)
             self._content_opacities.append(effect)
@@ -3125,6 +3132,14 @@ class OverlayWindow(QMainWindow):
                 color: #f5f7ff;
                 font-size: 20px;
                 font-weight: 700;
+            }
+            QLabel#errorBanner {
+                color: #ff8999;
+                background-color: rgba(120, 30, 48, 110);
+                border: 1px solid rgba(255, 102, 122, 120);
+                border-radius: 10px;
+                padding: 10px 14px;
+                font-size: 14px;
             }
             QComboBox#chatgptTabCombo,
             QComboBox#captureSourceCombo {
@@ -3324,7 +3339,10 @@ class OverlayWindow(QMainWindow):
         self._track_pointer(QCursor.pos())
 
     def set_status(self, message: str, *, error: bool = False) -> None:
-        self.transcript_area.set_hint(translate_message(message), error=error)
+        message = translate_message(message)
+        self.transcript_area.set_hint(message, error=error)
+        self.error_banner.setText(message if error else "")
+        self.error_banner.setVisible(error)
         self._pet_error = error
         self._refresh_pet()
 
@@ -3552,6 +3570,9 @@ class OverlayWindow(QMainWindow):
         self._pet_error = not success
         self._refresh_pet()
         if self._subtitle_dismissed:
+            if not success:
+                self.show_for_auto_hide()
+                self.set_status(message, error=True)
             return
         self.show_for_auto_hide()
         self.transcript_area.finish_response()

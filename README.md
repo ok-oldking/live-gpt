@@ -172,7 +172,10 @@ is repaired on disk. Existing registry-based hotkeys are migrated on the first
 JSON-configured launch.
 The editor and microphone remain disabled until a ChatGPT window is connected.
 Status tips appear as the editor hint rather than in a separate row; errors use
-a red hint.
+a red hint and a visible, wrapping banner above the input. When ChatGPT shows
+a usage-limit notice, Live GPT displays its message, including any reset time,
+and stops waiting for a reply. Prompts rejected before sending stay in the editor
+so they can be sent after usage resets.
 
 Sending switches directly to a full-width two-label subtitle view. While
 ChatGPT responds, its first line shows the sent prompt and its second line

@@ -25,6 +25,52 @@ class FakePlaywrightError(Exception):
     pass
 
 
+class BrowserUsageLimitTests(unittest.TestCase):
+    message = "You’ve reached your 5-hour Work usage limit. Wait for your usage to reset at 2:53 PM."
+
+    def test_existing_limit_rejects_send_and_preserves_prompt(self):
+        page = Mock(url="https://chatgpt.com/c/conversation")
+        page.is_closed.return_value = False
+        browser = Mock(contexts=[Mock(pages=[page])])
+        monitor = BrowserMonitor()
+        state = _MonitorState()
+        results = []
+        monitor.send_finished.connect(lambda *args: results.append(args))
+        with (
+            patch.object(monitor, "_assistant_turn_marker", return_value=None),
+            patch.object(BrowserMonitor, "_usage_limit_message", return_value=self.message),
+        ):
+            monitor.request_send(str(id(page)), "Keep this prompt", b"screenshot")
+            monitor._process_send_requests(browser, FakePlaywrightError, state)
+        self.assertEqual(results, [(False, "Keep this prompt", self.message)])
+        self.assertIsNone(state.active_response)
+        page.locator.assert_not_called()
+
+    def test_limit_after_send_finishes_without_reply_or_read_aloud(self):
+        page = Mock()
+        monitor = BrowserMonitor()
+        state = _MonitorState(active_response=_ActiveResponse(page=page, turn_marker_before="old"))
+        results = []
+        monitor.response_finished.connect(lambda *args: results.append(args))
+        with (
+            patch.object(BrowserMonitor, "_usage_limit_message", return_value=self.message),
+            patch.object(monitor, "_click_read_aloud") as read_aloud,
+        ):
+            monitor._poll_active_response(state)
+        self.assertEqual(results, [(False, self.message)])
+        self.assertIsNone(state.active_response)
+        read_aloud.assert_not_called()
+
+    def test_limit_during_send_replaces_generic_click_error(self):
+        from live_gpt.browser import _UsageLimitError
+        page = Mock()
+        button = page.locator.return_value.first.locator.return_value.locator.return_value.first
+        button.click.side_effect = RuntimeError("Send disabled")
+        with patch.object(BrowserMonitor, "_usage_limit_message", side_effect=["", self.message]):
+            with self.assertRaisesRegex(_UsageLimitError, "5-hour Work usage limit"):
+                BrowserMonitor._send_to_chatgpt_page(page, "Prompt", preserve_attachments=True)
+
+
 class BrowserDiscoveryTests(unittest.TestCase):
     @patch.dict("os.environ", {"LIVE_GPT_CDP_ENDPOINT": ""})
     @patch("live_gpt.browser_discovery.sys.platform", "win32")

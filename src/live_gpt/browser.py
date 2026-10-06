@@ -43,6 +43,25 @@ CHATGPT_COMPOSER_SELECTOR = (
     '#prompt-textarea[contenteditable="true"]:visible, '
     'textarea[name="prompt-textarea"]:visible'
 )
+USAGE_LIMIT_BANNER_SELECTOR = (
+    'form[data-thread-find-composer="true"] aside[role="status"]:visible, '
+    'form aside[role="status"]:visible, '
+    '[data-above-composer-portal] [role="status"]:visible, '
+    '[role="alert"]:visible'
+)
+_USAGE_LIMIT_PATTERN = re.compile(
+    r"(?:reached|hit|exceeded)[^.!?\n]{0,120}\blimit\b"
+    r"|\b(?:usage|message|rate) limit (?:reached|exceeded)\b"
+    r"|\bout of (?:usage|credits)\b"
+    r"|\b(?:no|not enough|insufficient) credits\b"
+    r"|(?:已达到|已達到|已达|已達|达到|達到|超出|超过|超過).{0,60}(?:上限|限额|限額)"
+    r"|(?:额度|額度|次数|次數|点数|點數).{0,20}(?:用尽|用盡|不足)",
+    re.IGNORECASE,
+)
+
+
+class _UsageLimitError(RuntimeError):
+    """ChatGPT cannot accept the prompt until its usage allowance resets."""
 
 
 def _label_selectors(element: str, *labels: str) -> str:
@@ -194,6 +213,7 @@ class _ResponseSnapshot:
     text: str
     status: str
     links: tuple[tuple[str, str], ...] = ()
+    error_message: str = ""
 
 
 @dataclass
@@ -873,6 +893,9 @@ class BrowserMonitor(QThread):
                     request.screenshot_webp,
                     preserve_attachments=request.preserve_attachments,
                 )
+            except _UsageLimitError as error:
+                self.send_finished.emit(False, request.text, str(error))
+                continue
             except Exception as error:
                 logger.error("Unable to send text to ChatGPT", error)
                 self.send_finished.emit(
@@ -928,6 +951,13 @@ class BrowserMonitor(QThread):
                 False,
                 f"Could not read ChatGPT's reply: {error}",
             )
+            state.active_response = None
+            return
+
+        if snapshot.error_message:
+            if not self._use_browser_voice and response.last_text:
+                self.local_voice_updated.emit(response.last_text, True)
+            self.response_finished.emit(False, snapshot.error_message)
             state.active_response = None
             return
 
@@ -1161,6 +1191,9 @@ class BrowserMonitor(QThread):
         *,
         preserve_attachments: bool = False,
     ) -> None:
+        usage_error = cls._usage_limit_message(page)
+        if usage_error:
+            raise _UsageLimitError(usage_error)
         composer = page.locator(CHATGPT_COMPOSER_SELECTOR).first
         composer.wait_for(state="visible", timeout=5_000)
         if not preserve_attachments:
@@ -1177,8 +1210,15 @@ class BrowserMonitor(QThread):
             'button#composer-submit-button[type="submit"]:visible, '
             'button[type="submit"]:visible'
         ).first
-        send_button.wait_for(state="visible", timeout=5_000)
-        send_button.click(timeout=15_000)
+        try:
+            send_button.wait_for(state="visible", timeout=5_000)
+            send_button.click(timeout=15_000)
+        except Exception:
+            # A limit can appear while attachments upload or Send becomes ready.
+            usage_error = cls._usage_limit_message(page)
+            if usage_error:
+                raise _UsageLimitError(usage_error) from None
+            raise
 
     @classmethod
     def _clear_chatgpt_attachments(cls, page: Any) -> None:
@@ -1412,11 +1452,39 @@ class BrowserMonitor(QThread):
         )
 
     @classmethod
+    def _usage_limit_message(cls, page: Any) -> str:
+        messages = page.locator(USAGE_LIMIT_BANNER_SELECTOR).evaluate_all("""elements =>
+            elements.map(element => {
+                const clone = element.cloneNode(true);
+                clone.querySelectorAll('button, [role="button"], [aria-hidden="true"]')
+                    .forEach(node => node.remove());
+                clone.querySelectorAll('h1, h2, h3, h4, p, div')
+                    .forEach(node => node.append(' '));
+                return clone.textContent || '';
+            })
+        """)
+        if isinstance(messages, list):
+            for message in messages:
+                if isinstance(message, str) and _USAGE_LIMIT_PATTERN.search(message):
+                    return " ".join(message.split())
+        return ""
+
+    @classmethod
     def _response_snapshot(
         cls,
         page: Any,
         turn_marker_before: str | None,
     ) -> _ResponseSnapshot:
+        usage_error = cls._usage_limit_message(page)
+        if usage_error:
+            return _ResponseSnapshot(
+                has_new_turn=False,
+                is_generating=False,
+                has_completion_controls=False,
+                text="",
+                status=usage_error,
+                error_message=usage_error,
+            )
         turns = page.locator(ASSISTANT_TURN_SELECTOR)
         turn_count = int(turns.count())
         stop_button = page.locator(

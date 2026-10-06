@@ -1229,6 +1229,36 @@ class TrayControllerBrowserTests(unittest.TestCase):
         finally:
             window.close()
 
+    def test_send_error_banner_remains_visible_above_preserved_prompt(self) -> None:
+        window = OverlayWindow()
+        message = "You’ve reached your 5-hour Work usage limit. Resets at 2:53 PM."
+        try:
+            window.show()
+            window.begin_response_display("Unsent prompt")
+            window.set_send_result(False, "Unsent prompt", message)
+            QApplication.processEvents()
+            self.assertEqual(window.transcript_area.toPlainText(), "Unsent prompt")
+            self.assertTrue(window.error_banner.isVisible())
+            self.assertEqual(window.error_banner.text(), message)
+            self.assertTrue(window.error_banner.wordWrap())
+            self.assertTrue(window._pet_error)
+            window.set_status("Sent to ChatGPT")
+            self.assertTrue(window.error_banner.isHidden())
+        finally:
+            window.close()
+
+    def test_usage_limit_response_error_is_visible_after_subtitles_dismissed(self) -> None:
+        window = OverlayWindow()
+        try:
+            window.begin_response_display("Question")
+            window.dismiss_subtitle_mode()
+            window.set_response_finished(False, "You’ve reached your usage limit")
+            self.assertFalse(window.error_banner.isHidden())
+            self.assertEqual(window.error_banner.text(), "You’ve reached your usage limit")
+            self.assertFalse(window._pet_response_pending)
+        finally:
+            window.close()
+
     def test_response_shows_streaming_text_and_status_until_read_aloud(self) -> None:
         window = OverlayWindow()
         try:
