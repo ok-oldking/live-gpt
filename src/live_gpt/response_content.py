@@ -184,15 +184,54 @@ element => {
             }
         }
         if (!links.size) {
+            // Some closed badges expose only a favicon's source domain. Link
+            // to that site's home page rather than inventing an article URL.
+            for (const image of node.querySelectorAll('[data-d-component="favicon"] img[src], img[src*="/s2/favicons"]')) {
+                try {
+                    const favicon = new URL(image.getAttribute('src'), element.ownerDocument.baseURI);
+                    const domain = favicon.searchParams.get('domain') || favicon.searchParams.get('domain_url');
+                    if (!domain) continue;
+                    const site = new URL(domain.includes('://') ? domain : `https://${domain}`);
+                    if (['http:', 'https:'].includes(site.protocol)) links.set(site.origin + '/', label);
+                } catch (_) {}
+            }
+        }
+        if (!links.size) {
             const chat = new URL(element.ownerDocument.URL);
             // Some closed popovers expose no source URL. Make the badge open
             // the original conversation, where its sources can be inspected.
             if (chat.protocol === 'https:' && ['chatgpt.com', 'www.chatgpt.com'].includes(chat.hostname)
                 && chat.pathname.startsWith('/c/')) links.set(chat.href, `${label} (ChatGPT)`);
         }
-        for (const [url, title] of links) if (!citations.has(url)) citations.set(url, title);
+        for (const [url, title] of links) {
+            const visibleLabel = title.includes(label) ? title : `${label} · ${title}`;
+            // Different closed badges can share the same conversation URL.
+            // URL-only deduplication must not discard the later source names.
+            const key = `${url}\n${visibleLabel}`;
+            if (!citations.has(key)) citations.set(key, {url, label: visibleLabel});
+        }
     }
     const clone = element.cloneNode(true);
+    // Resolve srcset and relative paths while the images still belong to the page.
+    const liveImages = element.querySelectorAll('img');
+    clone.querySelectorAll('img').forEach((image, index) => {
+        const live = liveImages[index];
+        let source = live.currentSrc || live.src || '';
+        if (source.startsWith('blob:') && live.complete && live.naturalWidth) {
+            try {
+                const canvas = element.ownerDocument.createElement('canvas');
+                canvas.width = live.naturalWidth;
+                canvas.height = live.naturalHeight;
+                canvas.getContext('2d').drawImage(live, 0, 0);
+                source = canvas.toDataURL('image/png');
+            } catch (_) {}
+        }
+        image.setAttribute('src', source);
+        if (live.naturalWidth && live.naturalHeight) {
+            image.setAttribute('width', live.naturalWidth);
+            image.setAttribute('height', live.naturalHeight);
+        }
+    });
     for (const block of clone.querySelectorAll('[data-markdown-copy="code-block"], pre')) {
         const header = block.querySelector('[data-markdown-copy="exclude"]');
         const label = header && (header.querySelector('.truncate') || Array.from(header.children).find(
@@ -233,6 +272,23 @@ element => {
         }
         if (node.nodeType !== Node.ELEMENT_NODE) return {text: '', html: ''};
         const tag = node.tagName.toLowerCase();
+        if (tag === 'img') {
+            const source = node.getAttribute('src') || '';
+            if (!webURL(source) && !/^data:image\/(?:png|jpe?g|gif|webp|bmp);base64,/i.test(source)) {
+                return {text: '', html: ''};
+            }
+            const size = ['width', 'height'].map(attr => {
+                const value = node.getAttribute(attr);
+                return /^[1-9][0-9]*$/.test(value || '') ? ` ${attr}="${value}"` : '';
+            }).join('');
+            return {text: '', html: `<img src="${escape(source)}" alt="${escape(node.getAttribute('alt') || '')}"${size}>`};
+        }
+        if (node.matches('[data-d-component="grid"]') && node.querySelector('img')) {
+            const cells = Array.from(node.children, serialize);
+            return {text: cells.map(cell => cell.text).join(''), html:
+                '<table border="0" cellspacing="8" cellpadding="0"><tr>' +
+                cells.map(cell => `<td>${cell.html}</td>`).join('') + '</tr></table>'};
+        }
         if (tag === 'pre' || node.getAttribute('data-markdown-copy') === 'code-block') {
             const code = node.querySelector('code') || node;
             const text = code.textContent || '';
@@ -243,7 +299,7 @@ element => {
         const parts = Array.from(node.childNodes, serialize);
         let text = parts.map(part => part.text).join('');
         let html = parts.map(part => part.html).join('');
-        if (tag === 'p' && !text.trim() && !html.includes('<br>')) return {text: '', html: ''};
+        if (tag === 'p' && !text.trim() && !html.includes('<br>') && !html.includes('<img ')) return {text: '', html: ''};
         if (tag === 'br' || tag === 'hr') text = '\n';
         else if (tag === 'td' || tag === 'th') text += '\t';
         else if (blocks.has(tag) && !node.hasAttribute('data-d-inline')) text += '\n';
@@ -251,7 +307,7 @@ element => {
             let url;
             try { url = new URL(node.getAttribute('href') || node.getAttribute('data-href') || node.getAttribute('data-url'), element.ownerDocument.baseURI); }
             catch (_) {}
-            if (url && ['http:', 'https:'].includes(url.protocol)) {
+            if (url && ['http:', 'https:'].includes(url.protocol) && !html.includes('<img ')) {
                 html = `<a href="${escape(url.href)}" target="_blank" rel="noopener noreferrer">${html}</a>`;
             }
         } else if (node.hasAttribute('data-d-default-strong')) {
@@ -277,7 +333,7 @@ element => {
     const result = serialize(clone);
     result.text = result.text.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
     if (citations.size) {
-        result.html += '<p>' + Array.from(citations, ([url, label]) =>
+        result.html += '<p>' + Array.from(citations.values(), ({url, label}) =>
             `<a href="${escape(url)}" target="_blank" rel="noopener noreferrer">${escape(label)}</a>`
         ).join(' · ') + '</p>';
     }

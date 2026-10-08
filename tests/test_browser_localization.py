@@ -62,10 +62,11 @@ class BrowserLocalizationTests(unittest.TestCase):
         snapshot = BrowserMonitor._response_snapshot(self.page, "old")
         self.assertNotIn("Forever", snapshot.text)
         self.assertNotIn("+1", snapshot.text)
-        self.assertNotIn("Forever", snapshot.html)
+        self.assertIn("Forever</a>", snapshot.html)
+        self.assertIn('href="https://www.wowhead.com/"', snapshot.html)
         self.assertIn("下一个任务不是找他接", snapshot.text)
         self.assertIn("<strong>", snapshot.html)
-        self.assertEqual(snapshot.html.count("<p>"), 3)
+        self.assertEqual(snapshot.html.count("<p>"), 4)
         self.assertEqual(self.page.locator('[data-d-component="badge"]').count(), 2)
         monitor = BrowserMonitor()
         monitor.set_use_browser_voice(False)
@@ -99,6 +100,49 @@ class BrowserLocalizationTests(unittest.TestCase):
         self.assertNotIn("javascript:", snapshot.html)
         self.assertIn("Name\tValue", snapshot.text)
         self.assertNotIn("https://", snapshot.text)
+
+    def test_pasted_image_galleries_survive_without_image_controls_in_narration(self):
+        from live_gpt.reply_images import ReplyImageMarkup
+
+        self.page.route("**/*", lambda route: route.abort())
+        reply = (Path(__file__).parent / "fixtures" / "chatgpt_image_reply.html").read_text(encoding="utf-8")
+        self.page.set_content(reply)
+        text, html = BrowserMonitor._response_content(self.page.locator('[data-dil-message-id]'))
+        parser = ReplyImageMarkup()
+        parser.feed(html)
+        expected = self.page.locator('img').evaluate_all("images => images.filter(image => !image.closest('[data-d-component=badge]')).map(image => image.src)")
+        self.assertGreater(len(expected), 3)
+        self.assertEqual([image[0] for image in parser.images.values()], expected)
+        self.assertIn("<table", html)
+        self.assertIn("死亡矿井", text)
+        self.assertNotIn("WCgamers", text)
+        self.assertNotIn("Add to Favorites", text)
+        self.assertNotIn("<button", html)
+
+    def test_images_resolve_relative_sources_and_keep_image_only_paragraphs(self):
+        self.page.route("**/*", lambda route: route.abort())
+        self.page.set_content('<base href="https://example.com/reply/"><div id="reply">'
+                              '<p><img src="picture.png?x=1&amp;y=2" alt="A &amp; B"></p>'
+                              '<img src="javascript:alert(1)"></div>')
+        text, html = BrowserMonitor._response_content(self.page.locator('#reply'))
+        self.assertEqual(text, "")
+        self.assertIn('<p><img src="https://example.com/reply/picture.png?x=1&amp;y=2" alt="A &amp; B"></p>', html)
+        self.assertNotIn("javascript:", html)
+
+    def test_loaded_blob_image_becomes_portable_embedded_image(self):
+        self.page.set_content('<div id="reply"><img alt="Preview"></div>')
+        self.page.locator('img').evaluate('''async image => {
+            const canvas = document.createElement('canvas');
+            canvas.width = 16; canvas.height = 8;
+            canvas.getContext('2d').fillRect(0, 0, 16, 8);
+            const blob = await new Promise(resolve => canvas.toBlob(resolve));
+            image.src = URL.createObjectURL(blob);
+            await image.decode();
+        }''')
+        text, html = BrowserMonitor._response_content(self.page.locator('#reply'))
+        self.assertEqual(text, "")
+        self.assertIn('src="data:image/png;base64,', html)
+        self.assertIn('width="16" height="8"', html)
 
     def test_citation_links_are_kept_in_html_but_excluded_from_narration(self):
         self.page.set_content('''<div data-markdown-text-style="assistant-message"><p>Reply text.
@@ -135,6 +179,42 @@ class BrowserLocalizationTests(unittest.TestCase):
         self.assertEqual(text, "Reply text.")
         self.assertIn('href="https://chatgpt.com/c/link-test"', html)
         self.assertIn("Forever +1 (ChatGPT)</a>", html)
+
+    def test_warcraft_wiki_badge_uses_favicon_domain_without_reading_its_label(self):
+        self.page.route("**/*", lambda route: route.abort())
+        self.page.set_content('''<div id="reply"><p>吉安娜因此失去了父亲，却保住了与萨尔之间脆弱的和平。
+            <span data-d-component="popover-trigger" role="button"><span data-d-component="box">
+            <span data-d-component="badge" data-d-hoverable>
+            <span data-d-component="favicon"><img src="https://www.google.com/s2/favicons?domain=https://warcraft.wiki.gg&amp;sz=32"></span>
+            <span><span data-d-stream-word>Warcraft </span><span data-d-stream-word>Wiki</span></span>
+            </span></span></span></p></div>''')
+        text, html = BrowserMonitor._response_content(self.page.locator('#reply'))
+        self.assertEqual(text, "吉安娜因此失去了父亲，却保住了与萨尔之间脆弱的和平。")
+        self.assertIn('href="https://warcraft.wiki.gg/"', html)
+        self.assertIn("Warcraft Wiki</a>", html)
+        self.assertNotIn("google.com", html)
+        self.assertNotIn("<img", html)
+        # When available, the actual article URL still takes precedence.
+        self.page.locator('[data-d-component="popover-trigger"]').evaluate('''node => {
+            node.__reactFiber$fixture = {memoizedProps: {
+                citation: {url: 'https://warcraft.wiki.gg/wiki/Jaina_Proudmoore', title: 'Jaina Proudmoore'}
+            }};
+        }''')
+        text, html = BrowserMonitor._response_content(self.page.locator('#reply'))
+        self.assertIn('href="https://warcraft.wiki.gg/wiki/Jaina_Proudmoore"', html)
+        self.assertIn("Warcraft Wiki", html)
+        self.assertNotIn("Warcraft", text)
+
+    def test_shared_chat_fallback_does_not_hide_different_citation_names(self):
+        self.page.route('https://chatgpt.com/c/multiple-sources', lambda route: route.fulfill(body='''
+            <div id="reply"><p>Reply.</p>
+            <span data-d-component="popover-trigger" role="button"><span data-d-component="badge" data-d-hoverable>First source</span></span>
+            <span data-d-component="popover-trigger" role="button"><span data-d-component="badge" data-d-hoverable>Warcraft Wiki</span></span></div>'''))
+        self.page.goto('https://chatgpt.com/c/multiple-sources')
+        text, html = BrowserMonitor._response_content(self.page.locator('#reply'))
+        self.assertEqual(text, "Reply.")
+        self.assertIn("First source (ChatGPT)</a>", html)
+        self.assertIn("Warcraft Wiki (ChatGPT)</a>", html)
 
     def test_regular_link_with_button_role_remains_clickable(self):
         self.page.set_content('''<div class="markdown"><p>Read <a role="button" href="https://example.com/docs">docs</a>.</p></div>''')
@@ -179,6 +259,16 @@ class BrowserLocalizationTests(unittest.TestCase):
         self.assertEqual(restarted["playCount"], 1)
         self.assertEqual(restarted["mediaCount"], 1)
         self.assertLess(restarted["playedTime"], resumed["playedTime"])
+        # Closing the overlay reply must stop even an Audio object outside DOM.
+        from live_gpt.browser import _ActiveReading, _MonitorState
+        monitor = BrowserMonitor()
+        state = _MonitorState(active_reading=_ActiveReading(
+            page=self.page, full_text="Reply", subtitles=()))
+        monitor.request_stop_reading(message="Playback stopped")
+        monitor._stop_active_reading(state)
+        self.assertTrue(self.page.evaluate("audio.paused"))
+        self.assertEqual(self.page.evaluate("audio.currentTime"), 0)
+        self.assertIsNone(state.active_reading)
 
     def test_read_aloud_tracker_accumulates_detached_chunks_between_polls(self):
         # Controlled positions allow several chunks to finish without a Python poll.

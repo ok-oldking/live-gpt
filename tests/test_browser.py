@@ -121,6 +121,30 @@ class BrowserDiscoveryTests(unittest.TestCase):
 
 
 class BrowserMonitorTests(unittest.TestCase):
+    def test_image_only_reply_finishes_without_reading_empty_text(self):
+        for browser_voice in (True, False):
+            with self.subTest(browser_voice=browser_voice):
+                monitor = BrowserMonitor()
+                monitor.set_use_browser_voice(browser_voice)
+                state = _MonitorState(active_response=_ActiveResponse(
+                    page=Mock(), turn_marker_before="old", started_at=90))
+                finished, speech = [], []
+                monitor.response_finished.connect(lambda ok, text: finished.append((ok, text)))
+                monitor.local_voice_requested.connect(speech.append)
+                snapshot = _ResponseSnapshot(True, False, True, "", "Finishing reply…",
+                    html='<p><img src="https://example.com/image.png"></p>')
+                with patch.object(monitor, "_response_snapshot", return_value=snapshot), \
+                        patch.object(monitor, "_click_read_aloud") as read_aloud, \
+                        patch("live_gpt.browser.time.monotonic", return_value=100) as clock:
+                    monitor._poll_active_response(state)
+                    self.assertIsNotNone(state.active_response)
+                    clock.return_value = 103
+                    monitor._poll_active_response(state)
+                self.assertEqual(finished, [(True, "Reply complete")])
+                self.assertEqual(speech, [])
+                read_aloud.assert_not_called()
+                self.assertIsNone(state.active_response)
+
     def test_sources_arriving_after_reply_text_are_published(self):
         monitor = BrowserMonitor()
         state = _MonitorState(active_response=_ActiveResponse(page=Mock(), turn_marker_before="old"))
@@ -900,7 +924,7 @@ class BrowserMonitorTests(unittest.TestCase):
         self.assertEqual(results, [(False, "Keep my prompt", "Could not send to ChatGPT: Screenshot upload failed")])
         page.locator.return_value.first.locator.return_value.locator.return_value.first.click.assert_not_called()
 
-    def test_still_thinking_announcements_require_continuous_web_confirmation(self) -> None:
+    def test_thinking_never_generates_spoken_announcements(self) -> None:
         for browser_voice in (False, True):
             with self.subTest(browser_voice=browser_voice):
                 monitor = BrowserMonitor()
@@ -921,7 +945,24 @@ class BrowserMonitorTests(unittest.TestCase):
                     for moment in (200, 259, 260):
                         clock.return_value = moment
                         monitor._poll_active_response(state)
-                self.assertEqual(notices, [] if browser_voice else ["Still thinking…"] * 3)
+                self.assertEqual(notices, [])
+
+    def test_reply_close_stops_browser_audio_and_cancels_pending_reading(self) -> None:
+        page = Mock()
+        monitor = BrowserMonitor()
+        state = _MonitorState(active_reading=_ActiveReading(page=page, full_text="Reply", subtitles=()),
+                              active_response=_ActiveResponse(page=page, turn_marker_before="old"))
+        finished = []
+        monitor.reading_finished.connect(lambda ok, text: finished.append((ok, text)))
+        monitor.request_stop_reading(message="Playback stopped")
+        monitor._stop_active_reading(state)
+        self.assertIsNone(state.active_reading)
+        self.assertIsNone(state.active_response)
+        self.assertIn("media.pause()", page.evaluate.call_args.args[0])
+        self.assertEqual(finished, [(False, "Playback stopped")])
+        with patch.object(monitor, "_click_read_aloud") as read:
+            monitor._poll_active_response(state)
+        read.assert_not_called()
 
     def test_reply_timeout_announces_error_before_closing_local_queue(self) -> None:
         monitor = BrowserMonitor()

@@ -356,7 +356,7 @@ class LocalSpeechThreadTests(unittest.TestCase):
 
         self.assertTrue(worker._sentences.empty())
 
-    def test_local_thinking_is_synthesized_once_before_reply_without_advancing_subtitles(self) -> None:
+    def test_local_thinking_stays_silent_while_reply_is_synthesized(self) -> None:
         import numpy as np
         from live_gpt.browser import BrowserMonitor, _ActiveResponse, _MonitorState, _ResponseSnapshot
 
@@ -394,7 +394,7 @@ class LocalSpeechThreadTests(unittest.TestCase):
             clock.return_value = 103
             monitor._poll_active_response(state)
 
-        # A later thinking phase in the same reply must not repeat the notice.
+        # Later thinking phases must remain silent, too.
         controller._on_response_update("正在思考…", "好了。")
         output = Mock()
         with patch.dict(
@@ -404,16 +404,16 @@ class LocalSpeechThreadTests(unittest.TestCase):
             worker.run()
         self.assertEqual(
             [call.args[1] for call in manager.synthesize_stream.call_args_list],
-            ["正在思考", "好了。"],
+            ["好了。"],
         )
-        self.assertEqual(output.write.call_count, 2)
+        self.assertEqual(output.write.call_count, 1)
         self.assertEqual(controller._local_voice_queued_sentences, ["好了。"])
         self.assertTrue(progress)
         self.assertTrue(all(update["text"] == "好了。" for update in progress))
         self.assertTrue(all(update["spoken_characters"] == len("好了。") for update in progress))
 
     def test_thinking_does_not_start_local_voice_for_browser_playback_or_recording(self) -> None:
-        for backend, interrupted in (("web", False), ("sovits", True)):
+        for backend, interrupted in (("web", False), ("sovits", True), ("sovits", False)):
             with self.subTest(backend=backend, interrupted=interrupted):
                 controller = TrayController.__new__(TrayController)
                 controller.config = {"playing_backend": backend}
@@ -424,9 +424,7 @@ class LocalSpeechThreadTests(unittest.TestCase):
                 start.assert_not_called()
                 controller.window.set_response_update.assert_called_once_with("正在思考", "")
 
-    def test_thinking_label_variants_are_deduplicated_and_reset_for_next_send(self) -> None:
-        from live_gpt.localization import tr
-
+    def test_thinking_label_variants_remain_silent_across_sends(self) -> None:
         for status in ("Thinking", "Thinking…", "Thinking...", "正在思考", "正在思考…", "思考中"):
             with self.subTest(status=status):
                 controller = TrayController.__new__(TrayController)
@@ -438,16 +436,13 @@ class LocalSpeechThreadTests(unittest.TestCase):
                 controller._local_speech_thread = worker
                 controller._on_response_update(status, "")
                 controller._on_response_update(status, "")
-                self.assertEqual(worker._sentences.get_nowait().text, tr(status))
                 self.assertTrue(worker._sentences.empty())
 
                 controller._handle_send_requested("Next question", None)
-                self.assertFalse(controller._local_voice_thinking_announced)
                 controller._on_response_update(status, "")
-                self.assertEqual(worker._sentences.get_nowait().text, tr(status))
                 self.assertTrue(worker._sentences.empty())
 
-    def test_thinking_queue_closes_when_response_fails_without_reply(self) -> None:
+    def test_thinking_failure_does_not_create_a_speech_worker(self) -> None:
         controller = TrayController.__new__(TrayController)
         controller.config = {"playing_backend": "sovits"}
         controller.window = Mock()
@@ -455,23 +450,21 @@ class LocalSpeechThreadTests(unittest.TestCase):
         controller._local_tts_configuration = Mock(return_value=(Mock(), "model", "speaker", "zh"))
         with patch.object(_QueuedLocalSpeechThread, "start") as start:
             controller._on_response_update("正在思考", "")
-        start.assert_called_once()
-        worker = controller._local_speech_thread
-        self.assertEqual(worker._sentences.get_nowait().text, "正在思考")
+        start.assert_not_called()
+        self.assertIsNone(controller._local_speech_thread)
         controller._on_response_finished(False, "Timed out")
-        self.assertIs(worker._sentences.get_nowait(), worker._FINISHED)
         controller.window.set_response_finished.assert_called_once_with(False, "Timed out")
 
-    def test_local_reminders_and_timeout_are_synthesized_in_interface_language(self) -> None:
+    def test_local_timeout_is_spoken_without_thinking_announcements(self) -> None:
         import numpy as np
         from live_gpt.localization import localization
         from live_gpt.browser import BrowserMonitor, _ActiveResponse, _MonitorState, _ResponseSnapshot
 
         original_language = localization.language
         self.addCleanup(localization.set_language, original_language)
-        for language, reminder, error in (
-            ("zh", "仍在思考…", "等待回复超时"),
-            ("en", "Still thinking…", "Timed out while waiting for a reply"),
+        for language, error in (
+            ("zh", "等待回复超时"),
+            ("en", "Timed out while waiting for a reply"),
         ):
             with self.subTest(language=language):
                 localization.set_language(language)
@@ -498,7 +491,7 @@ class LocalSpeechThreadTests(unittest.TestCase):
                         monitor._poll_active_response(state)
                 with patch.dict("sys.modules", {"sounddevice": SimpleNamespace(OutputStream=Mock(return_value=Mock()))}):
                     worker.run()
-                self.assertEqual([call.args[1] for call in manager.synthesize_stream.call_args_list], ["正在思考", reminder, reminder, error])
+                self.assertEqual([call.args[1] for call in manager.synthesize_stream.call_args_list], [error])
                 controller._on_local_speech_completed(True, "Playback complete")
                 controller.window.finish_reading.assert_called_once_with(False, "Timed out while waiting for ChatGPT's reply")
 
@@ -689,6 +682,40 @@ class ReplyDisplayTests(unittest.TestCase):
         self.window.set_reading_subtitle({"text": "Late reply", "fraction": 0.5})
         self.assertEqual(self.window.transcript_area.toPlainText(), "Next question")
         self.assertTrue(self.window.subtitle_panel.isHidden())
+
+    def test_close_stops_playback_and_late_callbacks_cannot_restart_it(self) -> None:
+        controller = TrayController.__new__(TrayController)
+        controller.window = self.window
+        controller.config = {"playing_backend": "sovits"}
+        controller.browser_monitor = Mock()
+        controller._pending_local_announcements = [("Old notice", False)]
+        worker = _QueuedLocalSpeechThread(Mock(), "model", "speaker", "en")
+        worker._output = Mock()
+        controller._local_speech_thread = worker
+        self.window.reply_closed.connect(controller._stop_reply_playback)
+        self.window.begin_reading("Reading aloud…")
+        self.window._expand_subtitle()
+        self.window.reply_close_button.click()
+        self.assertTrue(worker._cancel_event.is_set())
+        worker._output.abort.assert_called_once()
+        controller.browser_monitor.request_stop_reading.assert_called_once_with(message="Playback stopped")
+        self.assertTrue(controller._local_voice_interrupted)
+        self.assertEqual(controller._pending_local_announcements, [])
+        self.assertFalse(self.window._pet_playing)
+        self.assertFalse(self.window._pet_error)
+        self.window.transcript_area.setPlainText("New draft")
+        with patch.object(controller, "_ensure_local_speech_worker") as start:
+            controller._update_local_voice("Late reply.", True)
+            controller._speak_local_announcement("Old error", final=True)
+            self.window.begin_reading("Late playback")
+            controller._on_local_speech_completed(False, "Cancelled")
+            controller._on_browser_reading_finished(False, "Playback stopped")
+            controller._local_speech_finished()
+        start.assert_not_called()
+        self.assertEqual(self.window.transcript_area.toPlainText(), "New draft")
+        self.assertFalse(self.window._subtitle_mode_active)
+        self.assertFalse(self.window._pet_playing)
+        self.assertFalse(self.window._pet_error)
 
     def test_new_reply_clears_previous_html(self) -> None:
         self.window.set_response_links((("Quest source", "https://example.com/source"),))

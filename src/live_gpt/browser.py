@@ -256,7 +256,6 @@ class _ActiveResponse:
     last_status: str = ""
     last_text_changed_at: float = field(default_factory=time.monotonic)
     completion_candidate_at: float | None = None
-    last_thinking_notice_at: float | None = None
     last_html: str = ""
     last_links: tuple[tuple[str, str], ...] = ()
 
@@ -319,6 +318,7 @@ class BrowserMonitor(QThread):
             tuple[Any, Callable[[], None]] | None
         ) = None
         self._stop_reading_requested = False
+        self._stop_reading_message = "Playback stopped for recording"
         self._send_requests: Queue[_SendRequest] = Queue()
         self._attachment_requests: Queue[_AttachmentRequest] = Queue()
         self._dictation_requests: Queue[_DictationRequest] = Queue()
@@ -343,7 +343,8 @@ class BrowserMonitor(QThread):
         self._retry_connection_requested = True
         self._wake_event.set()
 
-    def request_stop_reading(self) -> None:
+    def request_stop_reading(self, *, message: str = "Playback stopped for recording") -> None:
+        self._stop_reading_message = message
         self._stop_reading_requested = True
         self._wake_event.set()
 
@@ -545,7 +546,7 @@ class BrowserMonitor(QThread):
         if not self._stop_reading_requested:
             return
         self._stop_reading_requested = False
-        # A reply still being generated must not start reading after the mic press.
+        # A dismissed reply or microphone press must not start future playback.
         state.active_response = None
         reading = state.active_reading
         if reading is None:
@@ -570,7 +571,7 @@ class BrowserMonitor(QThread):
         except Exception as error:
             logger.warning(f"Unable to stop ChatGPT playback cleanly: {error}")
         state.active_reading = None
-        self.reading_finished.emit(False, "Playback stopped for recording")
+        self.reading_finished.emit(False, self._stop_reading_message)
 
     def _try_connect(
         self,
@@ -1017,7 +1018,6 @@ class BrowserMonitor(QThread):
             # ChatGPT can replace/unmount the turn between locator calls.
             # Keep the last text and retry on the next worker-loop poll.
             response.completion_candidate_at = None
-            response.last_thinking_notice_at = None
             logger.debug("ChatGPT response DOM read timed out; retrying next poll")
             return
         except Exception as error:
@@ -1042,16 +1042,6 @@ class BrowserMonitor(QThread):
             state.active_response = None
             return
 
-        if snapshot.is_generating and self._is_thinking_status(snapshot.status):
-            if response.last_thinking_notice_at is None:
-                response.last_thinking_notice_at = now
-            elif now - response.last_thinking_notice_at >= 60:
-                if not self._use_browser_voice:
-                    self.local_voice_announcement.emit("Still thinking…")
-                response.last_thinking_notice_at = now
-        else:
-            response.last_thinking_notice_at = None
-
         if not snapshot.has_new_turn:
             response.completion_candidate_at = None
             if snapshot.status != response.last_status and (
@@ -1068,6 +1058,9 @@ class BrowserMonitor(QThread):
             response.last_links = snapshot.links
         if html_changed:
             response.last_html = snapshot.html
+            if not snapshot.text:
+                response.last_text_changed_at = now
+                response.completion_candidate_at = None
         if text_changed:
             logger.debug(
                 "ChatGPT response text changed "
@@ -1093,7 +1086,7 @@ class BrowserMonitor(QThread):
             self.local_voice_updated.emit(snapshot.text, False)
         completion_candidate = (
             snapshot.has_new_turn
-            and bool(snapshot.text)
+            and (bool(snapshot.text) or "<img " in snapshot.html)
             and not snapshot.is_generating
             and snapshot.has_completion_controls
         )
@@ -1121,6 +1114,11 @@ class BrowserMonitor(QThread):
             and response_age >= 2.0
         )
         if not is_complete:
+            return
+
+        if not snapshot.text:
+            self.response_finished.emit(True, "Reply complete")
+            state.active_response = None
             return
 
         if not self._use_browser_voice:

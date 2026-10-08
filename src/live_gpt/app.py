@@ -35,6 +35,7 @@ from PySide6.QtGui import (
     QPalette,
     QRegion,
     QTextCursor,
+    QTextDocument,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -79,6 +80,7 @@ from .pet import PetWidget, available_pets, default_pet_path
 from .pet_download import download_pet, pet_source
 from .logger import Logger, config_logger, shutdown_logger
 from .response_content import reply_code_blocks, reply_html_with_links
+from .reply_images import ImagePreviewDialog, ReplyImageLoader, ReplyImageMarkup
 from .hotkeys import GlobalHotkeyMonitor, HotkeyBinding, HotkeyEdit, shortcut_text
 from .screen_capture import CaptureSource, capture_webp, list_capture_sources
 from .window_focus import ForegroundWindowRestorer
@@ -2817,8 +2819,17 @@ class TranscriptEditor(LinkTextEdit):
 class ReplyDisplay(QTextBrowser):
     """Read-only HTML reply with links opened in a new browser tab."""
 
+    image_layout_changed = Signal()
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self._images: dict[str, tuple[str, str, QSize]] = {}
+        self._image_loader = ReplyImageLoader(self)
+        self._image_loader.ready.connect(self._image_loaded)
+        self._image_preview: ImagePreviewDialog | None = None
+        self._image_resize_timer = QTimer(self)
+        self._image_resize_timer.setSingleShot(True)
+        self._image_resize_timer.timeout.connect(self._resize_images)
         self._code_blocks: list[tuple[str, str]] = []
         self._copy_buttons: list[QPushButton] = []
         self._code_cards: list[QFrame] = []
@@ -2861,7 +2872,12 @@ class ReplyDisplay(QTextBrowser):
 
     def setHtml(self, html: str) -> None:  # noqa: N802
         formatted, self._code_blocks = reply_code_blocks(html, tr("Plain text"))
-        super().setHtml(formatted)
+        images = ReplyImageMarkup()
+        images.feed(formatted)
+        images.close()
+        self._images = images.images
+        super().setHtml("".join(images.parts))
+        self._resize_images()
         while len(self._copy_buttons) > len(self._code_blocks):
             self._copy_timers.pop().stop()
             button = self._copy_buttons.pop()
@@ -2960,15 +2976,75 @@ class ReplyDisplay(QTextBrowser):
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
         self._position_copy_buttons()
+        if hasattr(self, "_image_resize_timer"):
+            self._image_resize_timer.start(0)
 
-    @staticmethod
-    def _open_link(url: QUrl) -> None:
+    def loadResource(self, resource_type: int, name: QUrl):  # noqa: N802
+        if resource_type == QTextDocument.ResourceType.ImageResource:
+            image = self._images.get(name.toString())
+            if image is None:
+                return None
+            source, _label, size = image
+            loaded = self._image_loader.request(source)
+            return loaded if loaded is not None else self._image_loader.placeholder(
+                source, size.scaled(QSize(280, 190), Qt.AspectRatioMode.KeepAspectRatio))
+        return super().loadResource(resource_type, name)
+
+    def _image_loaded(self, source: str) -> None:
+        for name, (url, _label, size) in self._images.items():
+            if url == source:
+                image = self._image_loader.cache.get(source)
+                self.document().addResource(QTextDocument.ResourceType.ImageResource, QUrl(name),
+                    image if image is not None else self._image_loader.placeholder(
+                        source, size.scaled(QSize(280, 190), Qt.AspectRatioMode.KeepAspectRatio)))
+        self._resize_images()
+        self.document().markContentsDirty(0, self.document().characterCount())
+        self.image_layout_changed.emit()
+
+    def _resize_images(self) -> None:
+        block = self.document().begin()
+        while block.isValid():
+            iterator = block.begin()
+            while not iterator.atEnd():
+                fragment = iterator.fragment()
+                if fragment.isValid() and fragment.charFormat().isImageFormat():
+                    image_format = fragment.charFormat().toImageFormat()
+                    info = self._images.get(image_format.name())
+                    if info is not None:
+                        source, _label, original_size = info
+                        image = self._image_loader.cache.get(source)
+                        cursor = QTextCursor(self.document())
+                        cursor.setPosition(fragment.position())
+                        table = cursor.currentTable()
+                        columns = table.columns() if table else 1
+                        width = min(280, max(40, (self.viewport().width() - 32) // columns - 16))
+                        size = (image.size() if image is not None else original_size).scaled(
+                            QSize(width, 190), Qt.AspectRatioMode.KeepAspectRatio)
+                        if image_format.width() != size.width() or image_format.height() != size.height():
+                            image_format.setWidth(size.width())
+                            image_format.setHeight(size.height())
+                            cursor.setPosition(fragment.position() + fragment.length(), QTextCursor.MoveMode.KeepAnchor)
+                            cursor.setCharFormat(image_format)
+                iterator += 1
+            block = block.next()
+
+    def _open_link(self, url: QUrl) -> None:
+        if url.toString() in self._images:
+            source, label, _size = self._images[url.toString()]
+            if self._image_preview is not None:
+                self._image_preview.close()
+            preview = ImagePreviewDialog(self._image_loader, source, label, self)
+            self._image_preview = preview
+            preview.finished.connect(lambda _result: setattr(self, "_image_preview", None))
+            preview.show()
+            return
         if url.scheme().lower() in ("http", "https"):
             webbrowser.open_new_tab(url.toString())
 
 
 class OverlayWindow(QMainWindow):
     exit_requested = Signal()
+    reply_closed = Signal()
     dictation_requested = Signal()
     dictation_finish_requested = Signal()
     clear_requested = Signal()
@@ -3173,6 +3249,7 @@ class OverlayWindow(QMainWindow):
         self.subtitle_full_text.setObjectName("subtitleFullText")
         self.subtitle_full_text.setReadOnly(True)
         self.subtitle_full_text.setMouseTracking(True)
+        self.subtitle_full_text.image_layout_changed.connect(self._fit_expanded_subtitle_height)
         self.subtitle_full_text.hide()
         self._response_html = ""
         self._response_links: object = ()
@@ -3789,12 +3866,12 @@ class OverlayWindow(QMainWindow):
         self.schedule_auto_hide(5_000)
 
     def begin_reading(self, message: str) -> None:
+        if self._subtitle_dismissed:
+            return
         self._playback_input_timer.stop()
         self._pet_playing = True
         self._pet_error = False
         self._refresh_pet()
-        if self._subtitle_dismissed:
-            return
         self.show_for_auto_hide()
         self.transcript_area.begin_reading()
         self._subtitle_reading_active = True
@@ -4060,14 +4137,16 @@ class OverlayWindow(QMainWindow):
             self._set_subtitle_status(self._subtitle_status_text)
 
     def _collapse_subtitle_if_outside(self) -> None:
-        if not self._subtitle_expanded or self.pet._drag_offset is not None:
+        if (not self._subtitle_expanded or self.pet._drag_offset is not None
+                or self.subtitle_full_text._image_preview is not None):
             return
         if not self._pointer_hover_bounds().contains(QCursor.pos()):
             self._collapse_subtitle()
             self.schedule_auto_hide(5_000)
 
     def _close_reply(self) -> None:
-        self.dismiss_subtitle_mode(preserve_text=False)
+        if self.dismiss_subtitle_mode(preserve_text=False):
+            self.reply_closed.emit()
         self.transcript_area.setFocus()
 
     def dismiss_subtitle_mode(self, *, preserve_text: bool = True) -> bool:
@@ -4740,7 +4819,6 @@ class TrayController:
         self._local_voice_longest_text = ""
         self._local_voice_queued_sentences: list[str] = []
         self._local_voice_interrupted = False
-        self._local_voice_thinking_announced = False
         self._local_voice_error: str | None = None
         self._pending_local_announcements: list[tuple[str, bool]] = []
         self._stt_preload_thread: threading.Thread | None = None
@@ -4784,6 +4862,7 @@ class TrayController:
         self.application.setWindowIcon(self.icon)
         self.window.setWindowIcon(self.icon)
         self.window.exit_requested.connect(self._exit_application)
+        self.window.reply_closed.connect(self._stop_reply_playback)
         self.window.dictation_requested.connect(self.start_dictation)
         self.window.dictation_finish_requested.connect(self.finish_dictation)
         self.window.clear_requested.connect(self._handle_clear_requested)
@@ -5198,17 +5277,6 @@ class TrayController:
 
     def _on_response_update(self, status: str, text: str) -> None:
         self.window.set_response_update(status, text)
-        if (
-            self.config["playing_backend"] != "sovits"
-            or getattr(self, "_local_voice_interrupted", False)
-            or getattr(self, "_local_voice_thinking_announced", False)
-            or not BrowserMonitor._is_thinking_status(status)
-        ):
-            return
-        worker = self._ensure_local_speech_worker()
-        if worker is not None:
-            worker.enqueue_announcement(tr(status.strip()))
-            self._local_voice_thinking_announced = True
 
     def _on_response_finished(self, success: bool, message: str) -> None:
         self.window.set_response_finished(success, message)
@@ -5350,6 +5418,8 @@ class TrayController:
             self._speak_local_announcement(message, final=final)
 
     def _on_local_speech_completed(self, success: bool, message: str) -> None:
+        if getattr(self, "_local_voice_interrupted", False):
+            return
         if getattr(self, "_dictation_state", "idle") == "idle":
             error = getattr(self, "_local_voice_error", None)
             if error:
@@ -5358,6 +5428,8 @@ class TrayController:
                 self.window.finish_reading(success, message)
 
     def _on_browser_reading_finished(self, success: bool, message: str) -> None:
+        if getattr(self, "_local_voice_interrupted", False):
+            return
         if getattr(self, "_dictation_state", "idle") == "idle":
             self.window.finish_reading(success, message)
 
@@ -5416,6 +5488,16 @@ class TrayController:
         )
         self._schedule_dictation_screenshot_upload()
         self.browser_monitor.request_start_dictation(tab_id)
+
+    def _stop_reply_playback(self) -> None:
+        self._local_voice_interrupted = True
+        self._pending_local_announcements = []
+        self._local_voice_error = None
+        self.browser_monitor.request_stop_reading(message="Playback stopped")
+        worker = getattr(self, "_local_speech_thread", None)
+        if worker is not None:
+            worker.request_stop()
+        self.window.finish_reading(True, tr("Playback stopped"))
 
     def _stop_playback_for_recording(self) -> None:
         self.browser_monitor.request_stop_reading()
@@ -5789,7 +5871,6 @@ class TrayController:
         self.window.begin_response_display(text)
         self.window.set_status(tr("Sending to ChatGPT…"))
         self._local_voice_interrupted = False
-        self._local_voice_thinking_announced = False
         self._local_voice_error = None
         preserve_attachments = bool(
             pending_capture is not None and pending_capture.preuploaded

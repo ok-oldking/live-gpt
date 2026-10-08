@@ -119,9 +119,7 @@ Live GPT copies `sovits_server.py` into the selected installation and runs it wi
 streams speech through one audio output. Complete sentences enter the synthesis
 queue while ChatGPT is still generating its reply. If ChatGPT replaces an
 intermediate reply with a final answer, the changed sentences are also read.
-Local playback also reads the “Thinking” / “正在思考” status once per reply
-when the web page explicitly displays it. While that status remains visible,
-local playback says “Still thinking…” every minute in the interface language.
+The “Thinking” / “正在思考” status stays visible without being spoken.
 Reply timeouts and send errors are also spoken in the interface language.
 Screenshot uploads are checked before sending; failed uploads retry the same
 capture up to three total attempts. If all attempts fail, the prompt stays in
@@ -193,16 +191,26 @@ shows the current status. When **Read aloud** starts, the prompt is removed and
 both lines show the response. During playback, subtitles follow the browser
 media's progress and roll forward one line at a time. Hover over the subtitle
 area to expand a formatted HTML response with paragraphs, lists, tables, and links.
+Reply images load as thumbnails, preserving image galleries. Click an image to
+open it in a borderless, resizable window centered on the reply's screen.
+Scroll to zoom, then hold the left mouse button and drag the image to pan in any direction,
+and use **Fit image** to reset the view. The maximize button toggles between
+maximized and restored sizes; drag the header to move the window. Close it with
+**×** or **Esc** to return to the reply. Images and their controls are excluded from
+subtitles and speech.
 Code blocks use rounded cards with spacing above them and padding around the text.
 They keep their original line breaks and indentation, with a language label and
 a copy icon that copies only that block's text to the clipboard and briefly shows a checkmark.
 Its height fits the rendered content. Moving
 the pointer outside the whole overlay restores the two-line view at the current playback
 line. Use the **×** button in the expanded reply to close it and return to an empty
-message input. Citation badges such as “Forever +1” are excluded from subtitles
+message input. Closing the reply stops browser or local read-aloud, including
+queued speech. Citation badges such as “Forever +1” are excluded from subtitles
 and local speech, while their available source links appear in the expanded reply.
-If a closed citation exposes no source URL, its link is marked **(ChatGPT)** and
-opens the original conversation. Subtitle progress follows consumed
+If a closed citation exposes only its favicon's source domain, its link opens
+that website's home page. If neither an article URL nor a domain is exposed,
+the link is marked **(ChatGPT)** and opens the original conversation.
+Subtitle progress follows consumed
 audio, so pauses and buffering do not advance it. While streamed audio has no
 final duration, timing uses an estimate that counts both words and CJK characters
 and carries playback time across audio chunks. This remains approximate within
