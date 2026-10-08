@@ -203,6 +203,7 @@ class _ActiveResponse:
     last_status: str = ""
     last_text_changed_at: float = field(default_factory=time.monotonic)
     completion_candidate_at: float | None = None
+    last_thinking_notice_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -245,6 +246,7 @@ class BrowserMonitor(QThread):
     reading_finished = Signal(bool, str)
     local_voice_requested = Signal(str)
     local_voice_updated = Signal(str, bool)
+    local_voice_announcement = Signal(str)
     dictation_started = Signal(bool, str)
     dictation_finished = Signal(bool, str, str)
     clear_finished = Signal(bool, str)
@@ -660,6 +662,8 @@ class BrowserMonitor(QThread):
 
     def _handle_disconnect(self, state: _MonitorState) -> None:
         if state.active_response is not None:
+            if not self._use_browser_voice:
+                self.local_voice_announcement.emit("Browser disconnected")
             self.response_finished.emit(False, "Browser disconnected")
             state.active_response = None
         if state.active_reading is not None:
@@ -789,7 +793,7 @@ class BrowserMonitor(QThread):
                 if request.action == "replace":
                     if request.screenshot_webp is None:
                         raise RuntimeError("The screenshot data is empty")
-                    self._paste_screenshot(page, request.screenshot_webp)
+                    self._ensure_screenshot_uploaded(page, request.screenshot_webp)
                     logger.info(
                         "Pasted dictation screenshot into ChatGPT "
                         f"tab_id={request.tab_id!r}"
@@ -926,6 +930,8 @@ class BrowserMonitor(QThread):
         # turn stays unmounted. Transient failures must not extend it forever.
         now = time.monotonic()
         if now - response.started_at >= 600:
+            if not self._use_browser_voice:
+                self.local_voice_announcement.emit("Timed out while waiting for ChatGPT's reply")
             if not self._use_browser_voice and response.last_text:
                 self.local_voice_updated.emit(response.last_text, True)
             self.response_finished.emit(False, "Timed out while waiting for ChatGPT's reply")
@@ -941,10 +947,13 @@ class BrowserMonitor(QThread):
             # ChatGPT can replace/unmount the turn between locator calls.
             # Keep the last text and retry on the next worker-loop poll.
             response.completion_candidate_at = None
+            response.last_thinking_notice_at = None
             logger.debug("ChatGPT response DOM read timed out; retrying next poll")
             return
         except Exception as error:
             logger.error("Unable to read the ChatGPT response", error)
+            if not self._use_browser_voice:
+                self.local_voice_announcement.emit(f"Could not read ChatGPT's reply: {error}")
             if not self._use_browser_voice and response.last_text:
                 self.local_voice_updated.emit(response.last_text, True)
             self.response_finished.emit(
@@ -955,15 +964,29 @@ class BrowserMonitor(QThread):
             return
 
         if snapshot.error_message:
+            if not self._use_browser_voice:
+                self.local_voice_announcement.emit(snapshot.error_message)
             if not self._use_browser_voice and response.last_text:
                 self.local_voice_updated.emit(response.last_text, True)
             self.response_finished.emit(False, snapshot.error_message)
             state.active_response = None
             return
 
+        if snapshot.is_generating and self._is_thinking_status(snapshot.status):
+            if response.last_thinking_notice_at is None:
+                response.last_thinking_notice_at = now
+            elif now - response.last_thinking_notice_at >= 60:
+                if not self._use_browser_voice:
+                    self.local_voice_announcement.emit("Still thinking…")
+                response.last_thinking_notice_at = now
+        else:
+            response.last_thinking_notice_at = None
+
         if not snapshot.has_new_turn:
             response.completion_candidate_at = None
-            if snapshot.is_generating and snapshot.status != response.last_status:
+            if snapshot.status != response.last_status and (
+                snapshot.is_generating or self._is_thinking_status(response.last_status)
+            ):
                 response.last_status = snapshot.status
                 self.response_changed.emit(snapshot.status, response.last_text)
             return
@@ -1199,8 +1222,13 @@ class BrowserMonitor(QThread):
         if not preserve_attachments:
             cls._clear_chatgpt_attachments(page)
         composer.fill(text)
+        upload_attempts_left = 3
         if screenshot_webp is not None:
-            cls._paste_screenshot(page, screenshot_webp)
+            upload_attempts_left -= cls._ensure_screenshot_uploaded(
+                page, screenshot_webp, preserve=preserve_attachments
+            )
+        elif preserve_attachments and cls._screenshot_upload_state(page) != "missing":
+            cls._wait_for_screenshot_upload(page)
 
         # Project side panes can coexist with a background composer. Resolve
         # the submit control from the form we filled, excluding hidden copies.
@@ -1210,15 +1238,42 @@ class BrowserMonitor(QThread):
             'button#composer-submit-button[type="submit"]:visible, '
             'button[type="submit"]:visible'
         ).first
-        try:
-            send_button.wait_for(state="visible", timeout=5_000)
-            send_button.click(timeout=15_000)
-        except Exception:
-            # A limit can appear while attachments upload or Send becomes ready.
-            usage_error = cls._usage_limit_message(page)
-            if usage_error:
-                raise _UsageLimitError(usage_error) from None
-            raise
+        for _ in range(3):
+            try:
+                send_button.wait_for(state="visible", timeout=5_000)
+                send_button.click(timeout=15_000)
+                # Clicking a usable button does not prove ChatGPT accepted the prompt.
+                page.wait_for_function("""() => {
+                    const composer = [...document.querySelectorAll(
+                        '[data-composer-markdown], #prompt-textarea, textarea[name="prompt-textarea"], '
+                        + '[data-composer-surface="true"] [contenteditable="true"][role="textbox"]'
+                    )].find(element => element.getClientRects().length);
+                    if (!composer) return false;
+                    const text = composer.value ?? composer.innerText ?? '';
+                    const attachments = composer.closest('form')?.querySelector(
+                        '[data-composer-attachments] [class*="group/composer-attachment"]'
+                    );
+                    return !text.trim() && !attachments;
+                }""", timeout=5_000)
+                return
+            except Exception:
+                # A limit or failed upload can appear while Send becomes ready.
+                usage_error = cls._usage_limit_message(page)
+                if usage_error:
+                    raise _UsageLimitError(usage_error) from None
+                if cls._screenshot_upload_state(page) == "failed":
+                    if (
+                        screenshot_webp is not None
+                        and upload_attempts_left > 0
+                        and cls._read_composer_text(page) == text.strip()
+                    ):
+                        cls._clear_chatgpt_attachments(page)
+                        upload_attempts_left -= cls._ensure_screenshot_uploaded(
+                            page, screenshot_webp, attempts=upload_attempts_left
+                        )
+                        continue
+                    raise RuntimeError("Screenshot upload failed") from None
+                raise
 
     @classmethod
     def _clear_chatgpt_attachments(cls, page: Any) -> None:
@@ -1232,14 +1287,70 @@ class BrowserMonitor(QThread):
                 "刪除附件", "移除圖片", "刪除圖片",
             ) + ', '
             'button[data-testid*="remove"][data-testid*="file"], '
-            'button[data-testid*="remove"][data-testid*="attachment"]'
+            'button[data-testid*="remove"][data-testid*="attachment"], '
+            '[data-composer-attachments] button[aria-label^="Remove "], '
+            '[data-composer-attachments] button[aria-label^="移除"], '
+            '[data-composer-attachments] button[aria-label^="删除"]'
         )
         for _ in range(min(int(remove_buttons.count()), 20)):
             button = remove_buttons.last
             if not cls._locator_is_visible(button):
                 break
-            button.click(timeout=5_000)
+            # Attachment removal controls can be opacity-zero until hover.
+            button.evaluate("element => element.click()")
             page.wait_for_timeout(100)
+
+    @staticmethod
+    def _screenshot_upload_state(page: Any) -> str:
+        return page.locator(
+            '[data-composer-attachments]:visible, '
+            'form [class*="group/composer-attachment"]:visible'
+        ).evaluate_all("""elements => {
+            if (!elements.length) return 'missing';
+            const text = elements.map(element => element.textContent || '').join(' ');
+            if (/upload failed|failed to upload|上传失败|上傳失敗/i.test(text)) return 'failed';
+            if (/uploading|正在上传|正在上傳/i.test(text) || elements.some(element =>
+                element.querySelector('[role="progressbar"], [aria-busy="true"]')
+            )) return 'pending';
+            const images = elements.flatMap(element => [...element.querySelectorAll('img')]);
+            const form = elements[0].closest('form');
+            const send = form?.querySelector('button[type="submit"], button[data-testid="send-button"]');
+            if (send && (send.disabled || send.closest('[aria-disabled="true"]'))) return 'pending';
+            return images.some(img => img.complete && img.naturalWidth > 0) ? 'ready' : 'pending';
+        }""")
+
+    @classmethod
+    def _wait_for_screenshot_upload(cls, page: Any) -> None:
+        for _ in range(40):
+            usage_error = cls._usage_limit_message(page)
+            if usage_error:
+                raise _UsageLimitError(usage_error)
+            state = cls._screenshot_upload_state(page)
+            if state == "failed":
+                raise RuntimeError("Screenshot upload failed")
+            if state == "ready":
+                return
+            page.wait_for_timeout(250)
+        raise RuntimeError("Screenshot upload timed out")
+
+    @classmethod
+    def _ensure_screenshot_uploaded(
+        cls, page: Any, screenshot_webp: bytes, *, preserve: bool = False, attempts: int = 3,
+    ) -> int:
+        for attempt in range(attempts):
+            if not preserve or attempt:
+                if attempt:
+                    cls._clear_chatgpt_attachments(page)
+                cls._paste_screenshot(page, screenshot_webp)
+            try:
+                cls._wait_for_screenshot_upload(page)
+                return attempt + 1
+            except _UsageLimitError:
+                raise
+            except RuntimeError:
+                if attempt == attempts - 1:
+                    raise
+                logger.warning("Screenshot upload failed; retrying with the captured image")
 
     @staticmethod
     def _paste_screenshot(page: Any, screenshot_webp: bytes) -> None:
@@ -1485,6 +1596,8 @@ class BrowserMonitor(QThread):
                 status=usage_error,
                 error_message=usage_error,
             )
+        if cls._screenshot_upload_state(page) == "failed":
+            return _ResponseSnapshot(False, False, False, "", "Screenshot upload failed", error_message="Screenshot upload failed")
         turns = page.locator(ASSISTANT_TURN_SELECTOR)
         turn_count = int(turns.count())
         stop_button = page.locator(
@@ -1497,7 +1610,7 @@ class BrowserMonitor(QThread):
         ).first
         is_generating = cls._locator_is_visible(stop_button)
         live_labels = page.locator(
-            '[data-request-input-activity-root] [role="status"]'
+            '[data-request-input-activity-root] [role="status"]:visible'
         ).evaluate_all("elements => elements.map(element => element.textContent || '')")
         live_status = ""
         activity_labels = page.locator('[data-turn-key]').last.locator(
@@ -1530,7 +1643,7 @@ class BrowserMonitor(QThread):
                 is_generating=is_generating,
                 has_completion_controls=False,
                 text="",
-                status=live_status or ("Thinking…" if is_generating else "Waiting for ChatGPT…"),
+                status=live_status or ("ChatGPT is responding…" if is_generating else "Waiting for ChatGPT…"),
             )
 
         turn = turns.last
@@ -1545,10 +1658,9 @@ class BrowserMonitor(QThread):
                 is_generating=is_generating,
                 has_completion_controls=False,
                 text="",
-                status=live_status or ("Thinking…" if is_generating else "Waiting for ChatGPT…"),
+                status=live_status or ("ChatGPT is responding…" if is_generating else "Waiting for ChatGPT…"),
             )
 
-        turn_text = turn.inner_text(timeout=1_000).strip()
         markdown = turn.locator(
             '.markdown, [data-message-author-role="assistant"] .prose, '
             '[data-markdown-text-style="assistant-message"]'
@@ -1578,7 +1690,7 @@ class BrowserMonitor(QThread):
             is_generating=is_generating,
             has_completion_controls=int(completion_controls.count()) > 0,
             text=text,
-            status=live_status or cls._response_activity_status(turn_text, is_generating),
+            status=live_status or ("ChatGPT is responding…" if is_generating else "Finishing reply…"),
             links=links,
         )
 
@@ -1637,6 +1749,10 @@ class BrowserMonitor(QThread):
         if isinstance(clean_text, str):
             return clean_text.strip()
         return markdown.inner_text(timeout=1_000).strip()
+
+    @staticmethod
+    def _is_thinking_status(status: str) -> bool:
+        return status.strip().rstrip(".…。 ").casefold() in {"thinking", "正在思考", "思考中"}
 
     @staticmethod
     def _response_activity_status(turn_text: str, is_generating: bool) -> str:

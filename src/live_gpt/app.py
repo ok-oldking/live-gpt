@@ -121,7 +121,7 @@ DEFAULT_HOLD_MIC_HOTKEY = str(DEFAULT_CONFIG["hotkey_hold"])
 DEFAULT_HOLD_WITHOUT_SCREENSHOT_HOTKEY = str(
     DEFAULT_CONFIG["hotkey_hold_without_screenshot"]
 )
-MIN_VOICE_SEND_CHARACTERS = 2
+MIN_ENGLISH_VOICE_SEND_CHARACTERS = 2
 HOTKEY_CONFIG_KEYS = {
     "hold": "hotkey_hold",
     "hold_without_screenshot": "hotkey_hold_without_screenshot",
@@ -494,6 +494,11 @@ class _LocalSpeechThread(QThread):
         return waveform.reshape(-1, 1)
 
 
+@dataclass(frozen=True)
+class _LocalSpeechAnnouncement:
+    text: str
+
+
 class _QueuedLocalSpeechThread(QThread):
     """Synthesize growing response sentences through one audio output stream."""
 
@@ -518,6 +523,7 @@ class _QueuedLocalSpeechThread(QThread):
         self.language = language
         self._sentences: queue.Queue[object] = queue.Queue()
         self._full_text = ""
+        self._queue_finished = False
         self._cancel_event = threading.Event()
         self._output: object | None = None
 
@@ -529,8 +535,14 @@ class _QueuedLocalSpeechThread(QThread):
     def update_full_text(self, full_text: str) -> None:
         self._full_text = full_text
 
+    def enqueue_announcement(self, text: str) -> None:
+        if text.strip() and not self._queue_finished:
+            self._sentences.put(_LocalSpeechAnnouncement(text.strip()))
+
     def finish_queue(self) -> None:
-        self._sentences.put(self._FINISHED)
+        if not self._queue_finished:
+            self._queue_finished = True
+            self._sentences.put(self._FINISHED)
 
     def request_stop(self) -> None:
         self._cancel_event.set()
@@ -573,7 +585,8 @@ class _QueuedLocalSpeechThread(QThread):
                             )
                             generated.put(self._FINISHED)
                             return
-                        sentence = str(item)
+                        announcement = isinstance(item, _LocalSpeechAnnouncement)
+                        sentence = item.text if announcement else str(item)
                         sentence_index += 1
                         logger.debug(
                             "Sending sentence to local TTS "
@@ -591,13 +604,13 @@ class _QueuedLocalSpeechThread(QThread):
                             if self._cancel_event.is_set():
                                 generated.put(self._FINISHED)
                                 return
-                            generated.put((chunk, sentence))
+                            generated.put((chunk, sentence, announcement))
                             produced = True
                         if not produced:
                             raise RuntimeError(
                                 "The local TTS model generated no audio"
                             )
-                        generated.put((self._SENTENCE_DONE, sentence))
+                        generated.put((self._SENTENCE_DONE, sentence, announcement))
                 except Exception as error:
                     generated.put(error)
                     generated.put(self._FINISHED)
@@ -620,6 +633,8 @@ class _QueuedLocalSpeechThread(QThread):
                 if isinstance(item, Exception):
                     raise item
                 if item[0] is self._SENTENCE_DONE:
+                    if item[2]:
+                        continue
                     sentence = item[1]
                     already_reported = (
                         sentence_characters_reported
@@ -640,7 +655,7 @@ class _QueuedLocalSpeechThread(QThread):
                         }
                     )
                     continue
-                chunk, sentence = item
+                chunk, sentence, announcement = item
                 samples, chunk_rate, chunk_text = chunk
                 if output is None:
                     sample_rate = chunk_rate
@@ -667,7 +682,7 @@ class _QueuedLocalSpeechThread(QThread):
                 if len(waveform):
                     output.write(waveform)
                     audio_seconds += len(waveform) / sample_rate
-                if chunk_text:
+                if chunk_text and not announcement:
                     if sentence != progress_sentence:
                         progress_sentence = sentence
                         sentence_characters_reported = 0
@@ -2907,7 +2922,6 @@ class OverlayWindow(QMainWindow):
         self.capture_source_combo.setAccessibleName(tr("Screenshot source"))
         self.capture_source_combo.setMinimumWidth(150)
         self.capture_source_combo.setMaximumWidth(220)
-        self.capture_source_combo.addItem(tr("No screenshot"), None)
         self.capture_source_combo.setToolTip(
             tr("Choose a desktop or visible window to attach when sending")
         )
@@ -3466,17 +3480,21 @@ class OverlayWindow(QMainWindow):
         )
         self.capture_source_combo.blockSignals(True)
         self.capture_source_combo.clear()
-        self.capture_source_combo.addItem(tr("No screenshot"), None)
+        selected_index = next(
+            (index for index, source in enumerate(sources) if source.kind == "display"),
+            0,
+        )
         for source in sources:
             self.capture_source_combo.addItem(
                 translate_message(source.label) if source.kind == "display" else source.label, source
             )
         if selected_key:
-            for index in range(1, self.capture_source_combo.count()):
+            for index in range(self.capture_source_combo.count()):
                 source = self.capture_source_combo.itemData(index)
                 if isinstance(source, CaptureSource) and source.key == selected_key:
-                    self.capture_source_combo.setCurrentIndex(index)
+                    selected_index = index
                     break
+        self.capture_source_combo.setCurrentIndex(selected_index)
         self.capture_source_combo.blockSignals(False)
         self._apply_capture_source(
             self.capture_source_combo.currentIndex(),
@@ -4531,6 +4549,9 @@ class TrayController:
         self._local_voice_longest_text = ""
         self._local_voice_queued_sentences: list[str] = []
         self._local_voice_interrupted = False
+        self._local_voice_thinking_announced = False
+        self._local_voice_error: str | None = None
+        self._pending_local_announcements: list[tuple[str, bool]] = []
         self._stt_preload_thread: threading.Thread | None = None
         self._local_tts_preload_thread: threading.Thread | None = None
         self._migrate_legacy_hotkeys()
@@ -4599,13 +4620,13 @@ class TrayController:
             self.window.set_browser_status
         )
         self.browser_monitor.send_finished.connect(
-            self.window.set_send_result
+            self._on_send_finished
         )
         self.browser_monitor.response_changed.connect(
-            self.window.set_response_update
+            self._on_response_update
         )
         self.browser_monitor.response_finished.connect(
-            self.window.set_response_finished
+            self._on_response_finished
         )
         self.browser_monitor.reading_started.connect(
             self.window.begin_reading
@@ -4618,6 +4639,9 @@ class TrayController:
         )
         self.browser_monitor.local_voice_updated.connect(
             self._update_local_voice
+        )
+        self.browser_monitor.local_voice_announcement.connect(
+            self._speak_local_announcement
         )
         self.browser_monitor.dictation_started.connect(
             self._on_dictation_started
@@ -4936,6 +4960,77 @@ class TrayController:
             consumed = len(text)
         return sentences, consumed
 
+    def _ensure_local_speech_worker(self, *, display_playback: bool = True) -> _QueuedLocalSpeechThread | None:
+        if self._local_speech_thread is None:
+            configuration = self._local_tts_configuration()
+            if configuration is None:
+                return None
+            manager, model_key, speaker, language = configuration
+            worker = _QueuedLocalSpeechThread(manager, model_key, speaker, language)
+            self._local_speech_thread = worker
+            if display_playback:
+                worker.started.connect(self.window.begin_reading)
+                worker.progress.connect(self.window.set_reading_subtitle)
+            worker.completed.connect(self._on_local_speech_completed)
+            worker.finished.connect(self._local_speech_finished)
+            worker.start()
+        worker = self._local_speech_thread
+        return worker if isinstance(worker, _QueuedLocalSpeechThread) else None
+
+    def _speak_local_announcement(self, message: str, *, final: bool = False) -> None:
+        if (
+            getattr(self, "config", {}).get("playing_backend") != "sovits"
+            or getattr(self, "_local_voice_interrupted", False)
+        ):
+            return
+        worker = self._local_speech_thread
+        if isinstance(worker, _QueuedLocalSpeechThread) and worker._queue_finished:
+            pending = getattr(self, "_pending_local_announcements", [])
+            pending.append((message, final))
+            self._pending_local_announcements = pending
+            return
+        worker = self._ensure_local_speech_worker(display_playback=not final)
+        if worker is not None:
+            worker.enqueue_announcement(translate_message(message))
+            if final:
+                worker.finish_queue()
+
+    def _on_send_finished(self, success: bool, text: str, message: str) -> None:
+        self.window.set_send_result(success, text, message)
+        if not success:
+            self._local_voice_error = message
+            worker = self._local_speech_thread
+            self._speak_local_announcement(
+                message, final=worker is None or getattr(worker, "_queue_finished", False)
+            )
+
+    def _on_response_update(self, status: str, text: str) -> None:
+        self.window.set_response_update(status, text)
+        if (
+            self.config["playing_backend"] != "sovits"
+            or getattr(self, "_local_voice_interrupted", False)
+            or getattr(self, "_local_voice_thinking_announced", False)
+            or not BrowserMonitor._is_thinking_status(status)
+        ):
+            return
+        worker = self._ensure_local_speech_worker()
+        if worker is not None:
+            worker.enqueue_announcement(tr(status.strip()))
+            self._local_voice_thinking_announced = True
+
+    def _on_response_finished(self, success: bool, message: str) -> None:
+        self.window.set_response_finished(success, message)
+        # An announcement can start playback before any reply text exists.
+        # Close that queue even if the browser fails without producing text.
+        worker = self._local_speech_thread
+        if not success:
+            self._local_voice_error = message
+            pending = getattr(self, "_pending_local_announcements", [])
+            if pending:
+                pending[-1] = (pending[-1][0], True)
+            if isinstance(worker, _QueuedLocalSpeechThread):
+                worker.finish_queue()
+
     def _update_local_voice(self, text: str, final: bool) -> None:
         if getattr(self, "_local_voice_interrupted", False):
             return
@@ -4965,19 +5060,8 @@ class TrayController:
         response_replaced = matched_count < min(len(sentences), len(queued_sentences))
         new_sentences = sentences[matched_count:]
         if new_sentences and self._local_speech_thread is None:
-            configuration = self._local_tts_configuration()
-            if configuration is None:
+            if self._ensure_local_speech_worker() is None:
                 return
-            manager, model_key, speaker, language = configuration
-            worker = _QueuedLocalSpeechThread(
-                manager, model_key, speaker, language
-            )
-            self._local_speech_thread = worker
-            worker.started.connect(self.window.begin_reading)
-            worker.progress.connect(self.window.set_reading_subtitle)
-            worker.completed.connect(self._on_local_speech_completed)
-            worker.finished.connect(self._local_speech_finished)
-            worker.start()
 
         worker = self._local_speech_thread
         if isinstance(worker, _QueuedLocalSpeechThread):
@@ -5068,10 +5152,18 @@ class TrayController:
         self._local_voice_queued_sentences = []
         if worker is not None:
             worker.deleteLater()
+        pending = getattr(self, "_pending_local_announcements", [])
+        self._pending_local_announcements = []
+        for message, final in pending:
+            self._speak_local_announcement(message, final=final)
 
     def _on_local_speech_completed(self, success: bool, message: str) -> None:
         if getattr(self, "_dictation_state", "idle") == "idle":
-            self.window.finish_reading(success, message)
+            error = getattr(self, "_local_voice_error", None)
+            if error:
+                self.window.finish_reading(False, error)
+            else:
+                self.window.finish_reading(success, message)
 
     def _on_browser_reading_finished(self, success: bool, message: str) -> None:
         if getattr(self, "_dictation_state", "idle") == "idle":
@@ -5197,7 +5289,7 @@ class TrayController:
 
         self._pending_dictation_capture = _PendingDictationCapture(
             source=source,
-            screenshot=None,
+            screenshot=screenshot,
             preuploaded=True,
         )
         self._dictation_attachment_tab_id = tab_id
@@ -5373,10 +5465,13 @@ class TrayController:
             return
 
         recognized_text = text.strip()
+        minimum_characters = (
+            MIN_ENGLISH_VOICE_SEND_CHARACTERS if recognized_text.isascii() else 1
+        )
         voice_text_too_short = bool(
             not was_cancelled
             and recognized_text
-            and len(recognized_text) < MIN_VOICE_SEND_CHARACTERS
+            and len(recognized_text) < minimum_characters
         )
         if was_cancelled:
             self._discard_preuploaded_dictation_screenshot()
@@ -5385,7 +5480,7 @@ class TrayController:
             self._short_voice_text = (
                 recognized_text if voice_text_too_short else None
             )
-            self.window.set_transcript(text)
+            self.window.set_transcript(recognized_text)
             self.window.set_microphone_state(
                 "saved",
                 (
@@ -5397,7 +5492,7 @@ class TrayController:
         should_send = (
             getattr(self, "_dictation_send_on_finish", False)
             and not was_cancelled and not restart
-            and len(recognized_text) >= MIN_VOICE_SEND_CHARACTERS
+            and len(recognized_text) >= minimum_characters
         )
         if should_send:
             self.window.request_send_from_hotkey(
@@ -5439,8 +5534,8 @@ class TrayController:
         text: str,
         capture_source: CaptureSource | None,
     ) -> None:
-        normalized_text = text.strip()
-        if normalized_text == getattr(self, "_short_voice_text", None):
+        text = text.strip()
+        if text == getattr(self, "_short_voice_text", None):
             self.window.set_status(
                 tr("Voice input must contain at least 2 characters to send"),
                 error=True,
@@ -5502,6 +5597,8 @@ class TrayController:
         self.window.begin_response_display(text)
         self.window.set_status(tr("Sending to ChatGPT…"))
         self._local_voice_interrupted = False
+        self._local_voice_thinking_announced = False
+        self._local_voice_error = None
         preserve_attachments = bool(
             pending_capture is not None and pending_capture.preuploaded
         )

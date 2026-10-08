@@ -66,7 +66,10 @@ class BrowserUsageLimitTests(unittest.TestCase):
         page = Mock()
         button = page.locator.return_value.first.locator.return_value.locator.return_value.first
         button.click.side_effect = RuntimeError("Send disabled")
-        with patch.object(BrowserMonitor, "_usage_limit_message", side_effect=["", self.message]):
+        with (
+            patch.object(BrowserMonitor, "_usage_limit_message", side_effect=["", self.message]),
+            patch.object(BrowserMonitor, "_screenshot_upload_state", return_value="missing"),
+        ):
             with self.assertRaisesRegex(_UsageLimitError, "5-hour Work usage limit"):
                 BrowserMonitor._send_to_chatgpt_page(page, "Prompt", preserve_attachments=True)
 
@@ -609,13 +612,14 @@ class BrowserMonitorTests(unittest.TestCase):
 
         page.locator.side_effect = locate
 
-        BrowserMonitor._send_to_chatgpt_page(
-            page,
-            "Describe this screenshot",
-            b"png bytes",
-        )
+        with patch.object(BrowserMonitor, "_wait_for_screenshot_upload"):
+            BrowserMonitor._send_to_chatgpt_page(
+                page,
+                "Describe this screenshot",
+                b"png bytes",
+            )
 
-        remove_button.click.assert_called_once_with(timeout=5_000)
+        remove_button.evaluate.assert_called_once_with("element => element.click()")
         composer.fill.assert_called_once_with("Describe this screenshot")
         file_input.set_input_files.assert_called_once_with(
             {
@@ -640,7 +644,10 @@ class BrowserMonitorTests(unittest.TestCase):
 
         page.locator.side_effect = locate
 
-        with patch.object(BrowserMonitor, "_clear_chatgpt_attachments") as clear:
+        with (
+            patch.object(BrowserMonitor, "_clear_chatgpt_attachments") as clear,
+            patch.object(BrowserMonitor, "_wait_for_screenshot_upload"),
+        ):
             BrowserMonitor._send_to_chatgpt_page(
                 page,
                 "Dictated prompt",
@@ -661,12 +668,80 @@ class BrowserMonitorTests(unittest.TestCase):
         with (
             patch.object(BrowserMonitor, "_clear_chatgpt_attachments") as clear,
             patch.object(BrowserMonitor, "_paste_screenshot") as paste,
+            patch.object(BrowserMonitor, "_wait_for_screenshot_upload"),
         ):
             monitor.request_replace_attachment(str(id(page)), b"webp bytes")
             monitor._process_attachment_requests(browser, FakePlaywrightError)
 
         clear.assert_called_once_with(page)
         paste.assert_called_once_with(page, b"webp bytes")
+
+    def test_failed_preupload_retries_original_bytes_before_sending(self) -> None:
+        page = Mock()
+        with (
+            patch.object(BrowserMonitor, "_wait_for_screenshot_upload", side_effect=[RuntimeError("Screenshot upload failed"), None]),
+            patch.object(BrowserMonitor, "_clear_chatgpt_attachments") as clear,
+            patch.object(BrowserMonitor, "_paste_screenshot") as paste,
+        ):
+            BrowserMonitor._ensure_screenshot_uploaded(page, b"original capture", preserve=True)
+        clear.assert_called_once_with(page)
+        paste.assert_called_once_with(page, b"original capture")
+
+    def test_failed_upload_never_sends_or_starts_response_monitor(self) -> None:
+        page = Mock(url="https://chatgpt.com/c/test")
+        page.is_closed.return_value = False
+        monitor = BrowserMonitor()
+        state = _MonitorState()
+        results = []
+        monitor.send_finished.connect(lambda *args: results.append(args))
+        with (
+            patch.object(monitor, "_assistant_turn_marker", return_value="old"),
+            patch.object(BrowserMonitor, "_usage_limit_message", return_value=""),
+            patch.object(BrowserMonitor, "_clear_chatgpt_attachments"),
+            patch.object(BrowserMonitor, "_paste_screenshot") as paste,
+            patch.object(BrowserMonitor, "_wait_for_screenshot_upload", side_effect=RuntimeError("Screenshot upload failed")),
+        ):
+            monitor.request_send(str(id(page)), "Keep my prompt", b"original")
+            monitor._process_send_requests(Mock(contexts=[Mock(pages=[page])]), FakePlaywrightError, state)
+        self.assertEqual(paste.call_count, 3)
+        self.assertIsNone(state.active_response)
+        self.assertEqual(results, [(False, "Keep my prompt", "Could not send to ChatGPT: Screenshot upload failed")])
+        page.locator.return_value.first.locator.return_value.locator.return_value.first.click.assert_not_called()
+
+    def test_still_thinking_announcements_require_continuous_web_confirmation(self) -> None:
+        for browser_voice in (False, True):
+            with self.subTest(browser_voice=browser_voice):
+                monitor = BrowserMonitor()
+                monitor.set_use_browser_voice(browser_voice)
+                state = _MonitorState(active_response=_ActiveResponse(page=Mock(), turn_marker_before="old", started_at=0))
+                notices = []
+                monitor.local_voice_announcement.connect(notices.append)
+                thinking = _ResponseSnapshot(False, True, False, "", "正在思考")
+                searching = _ResponseSnapshot(False, True, False, "", "Searching the web")
+                with patch.object(monitor, "_response_snapshot", return_value=thinking) as snapshot, patch("live_gpt.browser.time.monotonic") as clock:
+                    for moment in (0, 59, 60, 119, 120):
+                        clock.return_value = moment
+                        monitor._poll_active_response(state)
+                    snapshot.return_value = searching
+                    clock.return_value = 150
+                    monitor._poll_active_response(state)
+                    snapshot.return_value = thinking
+                    for moment in (200, 259, 260):
+                        clock.return_value = moment
+                        monitor._poll_active_response(state)
+                self.assertEqual(notices, [] if browser_voice else ["Still thinking…"] * 3)
+
+    def test_reply_timeout_announces_error_before_closing_local_queue(self) -> None:
+        monitor = BrowserMonitor()
+        monitor.set_use_browser_voice(False)
+        state = _MonitorState(active_response=_ActiveResponse(page=Mock(), turn_marker_before=None, started_at=0, last_text="Partial"))
+        events = []
+        monitor.local_voice_announcement.connect(lambda message: events.append(("notice", message)))
+        monitor.local_voice_updated.connect(lambda *_args: events.append(("final",)))
+        monitor.response_finished.connect(lambda *_args: events.append(("error",)))
+        with patch("live_gpt.browser.time.monotonic", return_value=600):
+            monitor._poll_active_response(state)
+        self.assertEqual(events, [("notice", "Timed out while waiting for ChatGPT's reply"), ("final",), ("error",)])
 
     def test_recording_request_stops_active_browser_playback(self) -> None:
         page = Mock()

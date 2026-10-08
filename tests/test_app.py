@@ -354,6 +354,190 @@ class LocalSpeechThreadTests(unittest.TestCase):
 
         self.assertTrue(worker._sentences.empty())
 
+    def test_local_thinking_is_synthesized_once_before_reply_without_advancing_subtitles(self) -> None:
+        import numpy as np
+        from live_gpt.browser import BrowserMonitor, _ActiveResponse, _MonitorState, _ResponseSnapshot
+
+        manager = Mock()
+        manager.display_name = "Test TTS"
+        manager.continuous_audio_stream = True
+        manager.synthesize_stream.side_effect = lambda _model, sentence, *_args: (
+            (np.ones(20, dtype=np.float32), 24000, sentence),
+        )
+        controller = TrayController.__new__(TrayController)
+        controller.config = {"playing_backend": "sovits"}
+        controller.window = Mock()
+        controller._local_voice_longest_text = ""
+        controller._local_voice_queued_sentences = []
+        worker = _QueuedLocalSpeechThread(manager, "model", "speaker", "zh")
+        controller._local_speech_thread = worker
+        progress = []
+        worker.progress.connect(progress.append)
+        monitor = BrowserMonitor()
+        monitor.set_use_browser_voice(False)
+        monitor.response_changed.connect(controller._on_response_update)
+        monitor.local_voice_updated.connect(controller._update_local_voice)
+        state = _MonitorState(active_response=_ActiveResponse(
+            page=Mock(), turn_marker_before="old", started_at=90,
+        ))
+        thinking = _ResponseSnapshot(False, True, False, "", "正在思考")
+        reply = _ResponseSnapshot(True, False, True, "好了。", "Finishing reply…")
+        with (
+            patch.object(monitor, "_response_snapshot", side_effect=[thinking, thinking, reply, reply]),
+            patch("live_gpt.browser.time.monotonic", return_value=100) as clock,
+        ):
+            monitor._poll_active_response(state)
+            monitor._poll_active_response(state)
+            monitor._poll_active_response(state)
+            clock.return_value = 103
+            monitor._poll_active_response(state)
+
+        # A later thinking phase in the same reply must not repeat the notice.
+        controller._on_response_update("正在思考…", "好了。")
+        output = Mock()
+        with patch.dict(
+            "sys.modules",
+            {"sounddevice": SimpleNamespace(OutputStream=Mock(return_value=output))},
+        ):
+            worker.run()
+        self.assertEqual(
+            [call.args[1] for call in manager.synthesize_stream.call_args_list],
+            ["正在思考", "好了。"],
+        )
+        self.assertEqual(output.write.call_count, 2)
+        self.assertEqual(controller._local_voice_queued_sentences, ["好了。"])
+        self.assertTrue(progress)
+        self.assertTrue(all(update["text"] == "好了。" for update in progress))
+        self.assertTrue(all(update["spoken_characters"] == len("好了。") for update in progress))
+
+    def test_thinking_does_not_start_local_voice_for_browser_playback_or_recording(self) -> None:
+        for backend, interrupted in (("web", False), ("sovits", True)):
+            with self.subTest(backend=backend, interrupted=interrupted):
+                controller = TrayController.__new__(TrayController)
+                controller.config = {"playing_backend": backend}
+                controller.window = Mock()
+                controller._local_voice_interrupted = interrupted
+                with patch.object(controller, "_ensure_local_speech_worker") as start:
+                    controller._on_response_update("正在思考", "")
+                start.assert_not_called()
+                controller.window.set_response_update.assert_called_once_with("正在思考", "")
+
+    def test_thinking_label_variants_are_deduplicated_and_reset_for_next_send(self) -> None:
+        from live_gpt.localization import tr
+
+        for status in ("Thinking", "Thinking…", "Thinking...", "正在思考", "正在思考…", "思考中"):
+            with self.subTest(status=status):
+                controller = TrayController.__new__(TrayController)
+                controller.config = {"playing_backend": "sovits"}
+                controller.window = Mock()
+                controller.browser_monitor = Mock()
+                controller.selected_chatgpt_tab_id = "selected-tab"
+                worker = _QueuedLocalSpeechThread(Mock(), "model", "speaker", "auto")
+                controller._local_speech_thread = worker
+                controller._on_response_update(status, "")
+                controller._on_response_update(status, "")
+                self.assertEqual(worker._sentences.get_nowait().text, tr(status))
+                self.assertTrue(worker._sentences.empty())
+
+                controller._handle_send_requested("Next question", None)
+                self.assertFalse(controller._local_voice_thinking_announced)
+                controller._on_response_update(status, "")
+                self.assertEqual(worker._sentences.get_nowait().text, tr(status))
+                self.assertTrue(worker._sentences.empty())
+
+    def test_thinking_queue_closes_when_response_fails_without_reply(self) -> None:
+        controller = TrayController.__new__(TrayController)
+        controller.config = {"playing_backend": "sovits"}
+        controller.window = Mock()
+        controller._local_speech_thread = None
+        controller._local_tts_configuration = Mock(return_value=(Mock(), "model", "speaker", "zh"))
+        with patch.object(_QueuedLocalSpeechThread, "start") as start:
+            controller._on_response_update("正在思考", "")
+        start.assert_called_once()
+        worker = controller._local_speech_thread
+        self.assertEqual(worker._sentences.get_nowait().text, "正在思考")
+        controller._on_response_finished(False, "Timed out")
+        self.assertIs(worker._sentences.get_nowait(), worker._FINISHED)
+        controller.window.set_response_finished.assert_called_once_with(False, "Timed out")
+
+    def test_local_reminders_and_timeout_are_synthesized_in_interface_language(self) -> None:
+        import numpy as np
+        from live_gpt.localization import localization
+        from live_gpt.browser import BrowserMonitor, _ActiveResponse, _MonitorState, _ResponseSnapshot
+
+        original_language = localization.language
+        self.addCleanup(localization.set_language, original_language)
+        for language, reminder, error in (
+            ("zh", "仍在思考…", "等待回复超时"),
+            ("en", "Still thinking…", "Timed out while waiting for a reply"),
+        ):
+            with self.subTest(language=language):
+                localization.set_language(language)
+                manager = Mock(display_name="Test TTS", continuous_audio_stream=True)
+                manager.synthesize_stream.side_effect = lambda _model, sentence, *_args: (
+                    (np.ones(20, dtype=np.float32), 24000, sentence),
+                )
+                controller = TrayController.__new__(TrayController)
+                controller.config = {"playing_backend": "sovits"}
+                controller.window = Mock()
+                worker = _QueuedLocalSpeechThread(manager, "model", "speaker", "auto")
+                controller._local_speech_thread = worker
+                controller._local_voice_longest_text = ""
+                controller._local_voice_queued_sentences = []
+                monitor = BrowserMonitor()
+                monitor.set_use_browser_voice(False)
+                monitor.response_changed.connect(controller._on_response_update)
+                monitor.local_voice_announcement.connect(controller._speak_local_announcement)
+                monitor.response_finished.connect(controller._on_response_finished)
+                state = _MonitorState(active_response=_ActiveResponse(page=Mock(), turn_marker_before=None, started_at=0))
+                with patch.object(monitor, "_response_snapshot", return_value=_ResponseSnapshot(False, True, False, "", "正在思考")), patch("live_gpt.browser.time.monotonic") as clock:
+                    for moment in (0, 60, 120, 600):
+                        clock.return_value = moment
+                        monitor._poll_active_response(state)
+                with patch.dict("sys.modules", {"sounddevice": SimpleNamespace(OutputStream=Mock(return_value=Mock()))}):
+                    worker.run()
+                self.assertEqual([call.args[1] for call in manager.synthesize_stream.call_args_list], ["正在思考", reminder, reminder, error])
+                controller._on_local_speech_completed(True, "Playback complete")
+                controller.window.finish_reading.assert_called_once_with(False, "Timed out while waiting for ChatGPT's reply")
+
+    def test_local_send_error_is_spoken_without_hiding_preserved_prompt(self) -> None:
+        from live_gpt.localization import localization
+        original_language = localization.language
+        self.addCleanup(localization.set_language, original_language)
+        localization.set_language("zh")
+        controller = TrayController.__new__(TrayController)
+        controller.config = {"playing_backend": "sovits"}
+        controller.window = Mock()
+        controller._local_speech_thread = None
+        controller._local_tts_configuration = Mock(return_value=(Mock(), "model", "speaker", "auto"))
+        message = "Could not send to ChatGPT: Screenshot upload failed"
+        with patch.object(_QueuedLocalSpeechThread, "start"):
+            controller._on_send_finished(False, "Keep my prompt", message)
+        worker = controller._local_speech_thread
+        self.assertEqual(worker._sentences.get_nowait().text, "无法发送：截图上传失败")
+        self.assertIs(worker._sentences.get_nowait(), worker._FINISHED)
+        worker.started.emit("Playing")
+        controller.window.begin_reading.assert_not_called()
+        controller.window.set_send_result.assert_called_once_with(False, "Keep my prompt", message)
+
+    def test_error_waiting_for_finished_audio_closes_its_new_queue(self) -> None:
+        controller = TrayController.__new__(TrayController)
+        controller.config = {"playing_backend": "sovits"}
+        controller.window = Mock()
+        worker = _QueuedLocalSpeechThread(Mock(), "model", "speaker", "auto")
+        controller._local_speech_thread = worker
+        worker.finish_queue()
+        controller._local_tts_configuration = Mock(return_value=(Mock(), "model", "speaker", "auto"))
+        message = "Timed out while waiting for ChatGPT's reply"
+        controller._speak_local_announcement(message)
+        controller._on_response_finished(False, message)
+        with patch.object(_QueuedLocalSpeechThread, "start"):
+            controller._local_speech_finished()
+        worker = controller._local_speech_thread
+        self.assertTrue(worker._queue_finished)
+        self.assertIsNot(worker._sentences.get_nowait(), worker._FINISHED)
+        self.assertIs(worker._sentences.get_nowait(), worker._FINISHED)
+
 
 class TranscriptEditorTests(unittest.TestCase):
     @classmethod
@@ -1489,7 +1673,7 @@ class TrayControllerBrowserTests(unittest.TestCase):
         finally:
             window.close()
 
-    def test_capture_selector_keeps_no_screenshot_first(self) -> None:
+    def test_capture_selector_defaults_to_desktop_without_no_screenshot_option(self) -> None:
         window = OverlayWindow()
         source = CaptureSource(
             "display:1",
@@ -1503,9 +1687,10 @@ class TrayControllerBrowserTests(unittest.TestCase):
         try:
             window.set_capture_sources([source])
 
-            self.assertEqual(window.capture_source_combo.itemText(0), "No screenshot")
-            self.assertIsNone(window.capture_source_combo.itemData(0))
-            self.assertEqual(window.capture_source_combo.itemData(1), source)
+            self.assertEqual(window.capture_source_combo.count(), 1)
+            self.assertEqual(window.capture_source_combo.itemText(0), "Screenshot desktop")
+            self.assertEqual(window.capture_source_combo.currentData(), source)
+            self.assertTrue(window.transcript_area._screenshot_selected)
         finally:
             window.close()
 
@@ -1538,8 +1723,53 @@ class TrayControllerBrowserTests(unittest.TestCase):
             self.assertEqual(window.capture_source_combo.currentData(), second)
             self.assertEqual(preferences, [])
 
-            window.capture_source_combo.setCurrentIndex(1)
+            window.capture_source_combo.setCurrentIndex(0)
             self.assertEqual(preferences, [first.key])
+        finally:
+            window.close()
+
+    def test_capture_selector_restores_saved_window_or_falls_back_to_desktop(self) -> None:
+        desktop = CaptureSource(
+            "display:1", "Screenshot desktop", "display", 0, 0, 1920, 1080,
+        )
+        saved_window = CaptureSource(
+            "window:1", "Saved window", "window", 0, 0, 1200, 900, hwnd=1,
+        )
+        for saved_key, expected in (
+            ("", desktop),
+            ("window:missing", desktop),
+            (saved_window.key, saved_window),
+        ):
+            with self.subTest(saved_key=saved_key):
+                window = OverlayWindow()
+                preferences: list[str] = []
+                window.capture_source_selected.connect(preferences.append)
+                try:
+                    window.set_preferred_capture_source(saved_key)
+                    window.set_capture_sources([desktop, saved_window])
+
+                    self.assertEqual(window.capture_source_combo.currentData(), expected)
+                    self.assertEqual(preferences, [])
+                finally:
+                    window.close()
+
+    def test_capture_selector_falls_back_to_desktop_when_selected_window_disappears(self) -> None:
+        window = OverlayWindow()
+        desktop = CaptureSource(
+            "display:1", "Screenshot desktop", "display", 0, 0, 1920, 1080,
+        )
+        selected_window = CaptureSource(
+            "window:1", "Selected window", "window", 0, 0, 1200, 900, hwnd=1,
+        )
+        try:
+            window.set_preferred_capture_source(selected_window.key)
+            window.set_capture_sources([desktop, selected_window])
+            self.assertEqual(window.capture_source_combo.currentData(), selected_window)
+
+            window.set_capture_sources([desktop])
+
+            self.assertEqual(window.capture_source_combo.currentData(), desktop)
+            self.assertTrue(window.transcript_area._screenshot_selected)
         finally:
             window.close()
 
@@ -1606,7 +1836,7 @@ class TrayControllerBrowserTests(unittest.TestCase):
                 ]
             )
             window.set_capture_sources([source])
-            window.capture_source_combo.setCurrentIndex(1)
+            window.capture_source_combo.setCurrentIndex(0)
             window.set_transcript("Explain this")
 
             self.assertFalse(
@@ -1651,7 +1881,7 @@ class TrayControllerBrowserTests(unittest.TestCase):
                 [{"id": "tab", "title": "ChatGPT", "url": "https://chatgpt.com"}]
             )
             window.set_capture_sources([source])
-            window.capture_source_combo.setCurrentIndex(1)
+            window.capture_source_combo.setCurrentIndex(0)
 
             self.assertEqual(window.transcript_area.toPlainText(), "")
             self.assertFalse(window.send_button.isHidden())
@@ -1786,7 +2016,7 @@ class TrayControllerBrowserTests(unittest.TestCase):
                 [{"id": "tab", "title": "ChatGPT", "url": "https://chatgpt.com"}]
             )
             window.set_capture_sources([source])
-            window.capture_source_combo.setCurrentIndex(1)
+            window.capture_source_combo.setCurrentIndex(0)
             window.set_transcript("Explain this")
 
             window.send_button.click()
@@ -1949,7 +2179,7 @@ class TrayControllerBrowserTests(unittest.TestCase):
         controller.browser_monitor.request_send.assert_called_once_with(
             "selected-tab",
             "Dictated text",
-            None,
+            b"hold-screenshot",
             preserve_attachments=True,
         )
 
@@ -2183,6 +2413,13 @@ class TrayControllerBrowserTests(unittest.TestCase):
             (True, False, "Hello", True, "finishing", True),
             (False, True, "Hello", True, "finishing", False),
             (True, True, "A", True, "finishing", False),
+            (True, True, "  A \n", True, "finishing", False),
+            (True, True, "  OK \n", True, "finishing", True),
+            (True, True, " 好 \n", True, "finishing", True),
+            (True, False, "あ", True, "finishing", True),
+            (True, True, "é", True, "finishing", True),
+            (True, True, "ع", True, "finishing", True),
+            (True, True, " \t\n　", True, "finishing", False),
             (True, True, "", True, "finishing", False),
             (True, True, "Hello", False, "finishing", False),
             (True, True, "Hello", True, "cancelling", False),
@@ -2196,6 +2433,8 @@ class TrayControllerBrowserTests(unittest.TestCase):
                 controller._dictation_input_held = False
                 controller._dictation_state = state
                 controller._on_dictation_finished(success, text, "Finished")
+                if success and state != "cancelling":
+                    controller.window.set_transcript.assert_called_once_with(text.strip())
                 if expected:
                     controller.window.request_send_from_hotkey.assert_called_once_with(screenshot)
                 else:
@@ -2230,6 +2469,35 @@ class TrayControllerBrowserTests(unittest.TestCase):
 
         controller.window.send_requested.emit.assert_not_called()
         self.assertIsNone(controller._short_voice_text)
+
+    def test_one_non_english_character_is_trimmed_and_can_be_sent_manually(self) -> None:
+        controller = TrayController.__new__(TrayController)
+        controller.window = Mock()
+        controller.browser_monitor = Mock()
+        controller.selected_chatgpt_tab_id = "selected-tab"
+        controller._dictation_input_held = False
+
+        controller._on_dictation_finished(True, "　 好 \n", "Finished")
+
+        controller.window.set_transcript.assert_called_once_with("好")
+        controller.window.set_microphone_state.assert_called_once_with("saved", "Finished")
+        controller.window.request_send_from_hotkey.assert_not_called()
+        self.assertIsNone(controller._short_voice_text)
+        controller._handle_send_requested("　 好 \n", None)
+        controller.browser_monitor.request_send.assert_called_once_with("selected-tab", "好", None)
+        controller.window.begin_response_display.assert_called_once_with("好")
+
+    def test_send_trims_surrounding_whitespace_and_keeps_internal_spacing(self) -> None:
+        controller = TrayController.__new__(TrayController)
+        controller.window = Mock()
+        controller.browser_monitor = Mock()
+        controller.selected_chatgpt_tab_id = "selected-tab"
+
+        controller._handle_send_requested(" \nHello  world\nSecond line\t ", None)
+
+        controller.browser_monitor.request_send.assert_called_once_with(
+            "selected-tab", "Hello  world\nSecond line", None,
+        )
 
     def test_unchanged_one_character_voice_result_cannot_be_sent(self) -> None:
         controller = TrayController.__new__(TrayController)

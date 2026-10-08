@@ -21,9 +21,11 @@ incoming replies, and Read Aloud, then hides five seconds after playback ends.
 If dictation produces text, the overlay stays visible so that text can be
 reviewed or sent; enabling auto-hide does not hide unsent text or interrupt
 dictation, response generation, playback, or an expanded subtitle. Text recorded with the UI microphone stays in the input until you explicitly
-send it. Recording hotkeys automatically send successful dictation. Voice recognition must produce
-at least two non-whitespace characters before it can be sent. A one-character
-result remains in the editor for correction; manually typed one-character
+send it. Recording hotkeys automatically send successful dictation. English (ASCII)
+voice input must contain at least two characters; non-English input can be sent
+with one character. Leading and trailing whitespace is trimmed from dictation
+and sent prompts. A one-character English voice result remains in the editor
+for correction; manually typed one-character
 messages are still allowed.
 Click or double-click the tray icon, or choose **Show Live GPT** from its menu,
 to reveal the overlay and turn auto-hide off. Its controls stay visible until
@@ -64,11 +66,12 @@ These browser interactions run without intentionally bringing its window to
 the foreground. A send initiated inside the overlay restores focus to the
 previous app; a global-hotkey send leaves focus unchanged.
 
-The screenshot selector starts with **No screenshot**, followed by one choice
-for each desktop display and then visible windows ordered from largest to
-smallest. A window is listed only when its area is greater than one eighth of
-the display containing it. When sending, Live GPT removes existing ChatGPT
-image attachments and, unless **No screenshot** is selected, captures the
+The screenshot selector lists one choice for each desktop display and then
+visible windows ordered from largest to smallest. It restores the last selected
+source when available and defaults to **Screenshot desktop** when no source was
+saved or the saved source is unavailable. A window is listed only when its area
+is greater than one eighth of the display containing it. When sending with a
+screenshot, Live GPT removes existing ChatGPT image attachments, captures the
 chosen source, scales its longest edge down to 1920 pixels when necessary, and
 uploads it as lossless WebP before clicking Send. Window capture uses the
 BitBlt/PrintWindow approach with full-content rendering enabled.
@@ -116,6 +119,13 @@ Live GPT copies `sovits_server.py` into the selected installation and runs it wi
 streams speech through one audio output. Complete sentences enter the synthesis
 queue while ChatGPT is still generating its reply. If ChatGPT replaces an
 intermediate reply with a final answer, the changed sentences are also read.
+Local playback also reads the “Thinking” / “正在思考” status once per reply
+when the web page explicitly displays it. While that status remains visible,
+local playback says “Still thinking…” every minute in the interface language.
+Reply timeouts and send errors are also spoken in the interface language.
+Screenshot uploads are checked before sending; failed uploads retry the same
+capture up to three total attempts. If all attempts fail, the prompt stays in
+the editor and the app reports the upload error instead of waiting for a reply.
 
 The STT catalog includes Mandarin and English models. Recording settings can
 install the Sherpa runtime and download models into the working directory's
@@ -131,8 +141,8 @@ Click a shortcut field and press a key or combination to change it;
 left and right Alt, Ctrl, and Shift are recognized separately.
 Use the **×** inside a shortcut field to clear it and disable that action.
 Cleared shortcuts stay empty after restarting; changes are saved automatically.
-Recording shortcuts automatically send successful dictation of at least two
-characters; the UI microphone always requires manual sending. Starting either
+Recording shortcuts automatically send successful dictation meeting the
+character minimum above; the UI microphone always requires manual sending. Starting either
 recording shortcut stops active local or
 browser voice playback. The shortcuts work while the
 overlay is hidden or unfocused. Live GPT observes their key state without

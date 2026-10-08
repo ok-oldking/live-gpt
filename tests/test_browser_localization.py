@@ -79,6 +79,7 @@ class BrowserLocalizationTests(unittest.TestCase):
                     </form>
                     <div role="dialog">
                       <form onsubmit="window.sentText=document.querySelector('#active').innerText;
+                                      document.querySelector('#active').textContent='';
                                       window.sendCount++; return false">
                         <div data-composer-surface="true">
                           <div id="active" contenteditable="true" role="textbox" oninput="
@@ -110,7 +111,8 @@ class BrowserLocalizationTests(unittest.TestCase):
                 <button type="submit">Other send</button>
             </form>
             <form data-thread-find-composer="true" data-composer-placement="home"
-                  onsubmit="window.sendCount++; return false">
+                  onsubmit="window.sendCount++; window.sentText=this.querySelector('[data-composer-markdown]').innerText;
+                            this.querySelector('[data-composer-markdown]').textContent=''; return false">
                 <div data-composer-markdown contenteditable="true" role="textbox"
                      aria-multiline="true" aria-label="使用 ChatGPT Work"></div>
                 <button type="button" onclick="window.wrongSent=true">听写</button>
@@ -121,7 +123,8 @@ class BrowserLocalizationTests(unittest.TestCase):
         BrowserMonitor._send_to_chatgpt_page(self.page, "Send this message", preserve_attachments=True)
         self.assertEqual(self.page.evaluate("window.sendCount"), 1)
         self.assertFalse(self.page.evaluate("window.wrongSent"))
-        self.assertEqual(BrowserMonitor._read_composer_text(self.page), "Send this message")
+        self.assertEqual(self.page.evaluate("window.sentText"), "Send this message")
+        self.assertEqual(BrowserMonitor._read_composer_text(self.page), "")
         BrowserMonitor._clear_chatgpt_composer(self.page)
         self.assertEqual(BrowserMonitor._read_composer_text(self.page), "")
 
@@ -217,6 +220,102 @@ class BrowserLocalizationTests(unittest.TestCase):
         self.page.locator('[data-d-component="shimmer-text"]').evaluate(
             "element => element.textContent='Searching the web'")
         self.assertEqual(BrowserMonitor._response_snapshot(self.page, "old").status, "Searching the web")
+
+    def test_generation_and_reply_text_do_not_invent_thinking_status(self):
+        self.page.set_content('''
+            <div data-turn-key="new">
+              <div data-markdown-text-style="assistant-message">正在思考是一个状态标签。</div>
+            </div>
+            <button data-testid="stop-button">Stop</button>
+        ''')
+        snapshot = BrowserMonitor._response_snapshot(self.page, "old")
+        self.assertEqual(snapshot.status, "ChatGPT is responding…")
+        self.page.locator('[data-turn-key]').evaluate('element => element.remove()')
+        self.assertEqual(BrowserMonitor._response_snapshot(self.page, "old").status, "ChatGPT is responding…")
+
+    def test_failed_screenshot_is_reuploaded_before_send(self):
+        from unittest.mock import patch
+        self.page.set_content('''
+          <form data-thread-find-composer="true" onsubmit="window.sentText=this.querySelector('[data-composer-markdown]').innerText;
+              window.sendCount++; this.querySelector('[data-composer-markdown]').textContent='';
+              this.querySelector('[data-composer-attachments]').innerHTML=''; return false">
+            <div data-composer-attachments></div>
+            <div contenteditable="true" role="textbox" data-composer-markdown></div>
+            <button type="submit">Send</button>
+          </form>
+        ''')
+        self.page.evaluate('window.sendCount=0')
+        failed = '''<span class="group/composer-attachment"><span>Upload failed</span>
+            <span>live-gpt-screenshot.webp</span><button type="button" aria-label="Remove live-gpt-screenshot.webp"
+            style="opacity:0;pointer-events:none" onclick="this.parentElement.remove()">X</button></span>'''
+        ready = '''<span class="group/composer-attachment"><img
+            src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7">
+            <button type="button" aria-label="Remove live-gpt-screenshot.webp"
+            onclick="this.parentElement.remove()">X</button></span>'''
+        attachments = self.page.locator('[data-composer-attachments]')
+        attachments.evaluate('(element, html) => element.innerHTML=html', failed)
+        snapshot = BrowserMonitor._response_snapshot(self.page, None)
+        self.assertFalse(snapshot.is_generating)
+        self.assertEqual(snapshot.error_message, "Screenshot upload failed")
+        with patch.object(BrowserMonitor, "_paste_screenshot", side_effect=lambda _page, _bytes:
+                attachments.evaluate('(element, html) => element.innerHTML=html', ready)) as paste:
+            BrowserMonitor._send_to_chatgpt_page(self.page, "My prompt", b"same screenshot", preserve_attachments=True)
+        paste.assert_called_once_with(self.page, b"same screenshot")
+        self.assertEqual(self.page.evaluate('window.sendCount'), 1)
+        self.assertEqual(self.page.evaluate('window.sentText'), "My prompt")
+
+    def test_upload_failure_after_retries_preserves_prompt_and_never_submits(self):
+        from unittest.mock import patch
+        self.page.set_content('''<form data-thread-find-composer="true" onsubmit="window.sendCount++;return false">
+          <div data-composer-attachments></div>
+          <div data-composer-markdown contenteditable="true" role="textbox"></div>
+          <button type="submit">Send</button></form>''')
+        self.page.evaluate('window.sendCount=0')
+        failed = '''<span class="group/composer-attachment">上传失败
+          <button type="button" aria-label="Remove live-gpt-screenshot.webp"
+          onclick="this.parentElement.remove()">X</button></span>'''
+        with patch.object(BrowserMonitor, "_paste_screenshot", side_effect=lambda _page, _bytes:
+                self.page.locator('[data-composer-attachments]').evaluate('(element, html) => element.innerHTML=html', failed)) as paste:
+            with self.assertRaisesRegex(RuntimeError, "Screenshot upload failed"):
+                BrowserMonitor._send_to_chatgpt_page(self.page, "Keep my prompt", b"same screenshot")
+        self.assertEqual(paste.call_count, 3)
+        self.assertEqual(self.page.evaluate('window.sendCount'), 0)
+        self.assertEqual(BrowserMonitor._read_composer_text(self.page), "Keep my prompt")
+
+    def test_clicking_send_without_accepting_prompt_does_not_start_response(self):
+        self.page.set_content('''<form data-thread-find-composer="true" onsubmit="return false">
+          <div data-composer-markdown contenteditable="true" role="textbox"></div>
+          <button type="submit">Send</button></form>''')
+        from playwright.sync_api import TimeoutError
+        with self.assertRaises(TimeoutError):
+            BrowserMonitor._send_to_chatgpt_page(self.page, "Unaccepted prompt")
+        self.assertEqual(BrowserMonitor._read_composer_text(self.page), "Unaccepted prompt")
+
+    def test_upload_failure_while_send_is_clicked_reuploads_without_duplicate_message(self):
+        from unittest.mock import patch
+        self.page.set_content('''<form data-thread-find-composer="true" onsubmit="
+          if (++window.submitCount === 1) {
+            this.querySelector('[data-composer-attachments]').innerHTML=window.failedHtml;
+          } else {
+            window.acceptedCount++;
+            this.querySelector('[data-composer-markdown]').textContent='';
+            this.querySelector('[data-composer-attachments]').innerHTML='';
+          } return false">
+          <div data-composer-attachments></div>
+          <div data-composer-markdown contenteditable="true" role="textbox"></div>
+          <button type="submit">Send</button></form>''')
+        self.page.evaluate('window.submitCount=0;window.acceptedCount=0')
+        failed = '''<span class="group/composer-attachment">Upload failed
+          <button type="button" aria-label="Remove live-gpt-screenshot.webp"
+          onclick="this.parentElement.remove()">X</button></span>'''
+        self.page.evaluate('html => window.failedHtml=html', failed)
+        ready = '''<span class="group/composer-attachment"><img
+          src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"></span>'''
+        with patch.object(BrowserMonitor, "_paste_screenshot", side_effect=lambda _page, _bytes:
+                self.page.locator('[data-composer-attachments]').evaluate('(element, html) => element.innerHTML=html', ready)) as paste:
+            BrowserMonitor._send_to_chatgpt_page(self.page, "My prompt", b"same screenshot")
+        self.assertEqual(paste.call_count, 2)
+        self.assertEqual(self.page.evaluate('window.acceptedCount'), 1)
 
     def test_cadenced_shimmer_status_ignores_sweep_and_streams_updates(self):
         from live_gpt.browser import _ActiveResponse, _MonitorState

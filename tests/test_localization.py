@@ -159,7 +159,7 @@ class LocalizationTests(unittest.TestCase):
             self.assertEqual(overlay.dictation_state_label.text(), "Listening…\n\nSettings 用户说的话")
             overlay.set_status("Could not send to ChatGPT: unavailable", error=True)
             localization.set_language("zh")
-            self.assertEqual(overlay.transcript_area.placeholderText(), "无法发送到 ChatGPT：unavailable")
+            self.assertEqual(overlay.transcript_area.placeholderText(), "无法发送：unavailable")
             self.assertEqual(
                 overlay.transcript_area.palette().color(QPalette.ColorRole.PlaceholderText).name(),
                 "#ff667a",
