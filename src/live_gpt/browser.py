@@ -25,6 +25,7 @@ from .browser_windows import (
     windows_default_browser_executable,
 )
 from .logger import Logger
+from .response_content import RESPONSE_CONTENT_SCRIPT
 
 
 logger = Logger.get_logger(__name__)
@@ -119,17 +120,64 @@ DICTATION_CANCEL_SELECTORS = (
 )
 _MEDIA_TRACKER_SCRIPT = """
 () => {
-    if (window.__liveGptMediaTrackerInstalled) return;
-    window.__liveGptMediaTrackerInstalled = true;
+    // Each Read aloud click starts a fresh session, including on reused audio.
     window.__liveGptReadAloudTracker = {
         media: null,
-        playCount: 0
+        playCount: 0,
+        mediaCount: 0,
+        playedTime: 0,
+        lastTime: 0,
+        source: ''
     };
+    if (window.__liveGptMediaTrackerInstalled === 2) return;
+    window.__liveGptMediaTrackerInstalled = 2;
+    const sources = new Map();
+    window.__liveGptMediaSources = sources;
+    const originalCreateURL = URL.createObjectURL;
+    URL.createObjectURL = function(object) {
+        const url = originalCreateURL.call(this, object);
+        if (typeof MediaSource !== 'undefined' && object instanceof MediaSource) {
+            sources.set(url, new WeakRef(object));
+            if (sources.size > 128) sources.delete(sources.keys().next().value);
+        }
+        return url;
+    };
+    const sample = () => {
+        const tracker = window.__liveGptReadAloudTracker;
+        const media = tracker.media;
+        if (!media) return;
+        const current = Number.isFinite(media.currentTime) ? media.currentTime : 0;
+        const source = media.currentSrc || media.src || '';
+        if (source !== tracker.source || (!media.seeking && current < tracker.lastTime - 0.05)) {
+            tracker.mediaCount += 1;
+            tracker.lastTime = 0;
+        }
+        // Only consumed audio advances the estimate; pauses and buffering do not.
+        if (!media.seeking) tracker.playedTime += Math.max(current - tracker.lastTime, 0);
+        tracker.lastTime = current;
+        tracker.source = source;
+    };
+    window.__liveGptSampleMedia = sample;
+    const observed = new WeakSet();
     const originalPlay = HTMLMediaElement.prototype.play;
     HTMLMediaElement.prototype.play = function(...args) {
+        sample();
         const tracker = window.__liveGptReadAloudTracker;
-        tracker.media = this;
+        if (tracker.media !== this) {
+            tracker.media = this;
+            tracker.mediaCount += 1;
+            tracker.lastTime = Number.isFinite(this.currentTime) ? this.currentTime : 0;
+            tracker.source = this.currentSrc || this.src || '';
+        }
         tracker.playCount += 1;
+        if (!observed.has(this)) {
+            observed.add(this);
+            for (const event of ['timeupdate', 'pause', 'waiting', 'ended', 'emptied', 'seeking', 'seeked']) {
+                this.addEventListener(event, () => {
+                    if (window.__liveGptReadAloudTracker.media === this) sample();
+                });
+            }
+        }
         return originalPlay.apply(this, args);
     };
 }
@@ -142,8 +190,14 @@ _MEDIA_PROGRESS_SCRIPT = """
             !item.paused || item.currentTime > 0
         );
     if (!media) return null;
+    window.__liveGptSampleMedia?.();
+    const source = window.__liveGptMediaSources?.get(media.currentSrc || media.src)?.deref();
     return {
         playCount: tracker?.playCount || 0,
+        mediaCount: tracker?.mediaCount || 0,
+        playedTime: tracker?.playedTime || 0,
+        // A growing MediaSource duration describes the buffered prefix only.
+        durationIsFinal: !source || source.readyState === 'ended',
         currentTime: Number.isFinite(media.currentTime)
             ? media.currentTime : 0,
         duration: Number.isFinite(media.duration)
@@ -163,7 +217,6 @@ class _MonitorState:
     settings_attempted: bool = False
     retry_endpoint: str | None = None
     last_tabs: list[dict[str, str]] | None = None
-    media_reset_pages: set[str] = field(default_factory=set)
     active_response: _ActiveResponse | None = None
     active_reading: _ActiveReading | None = None
 
@@ -204,6 +257,8 @@ class _ActiveResponse:
     last_text_changed_at: float = field(default_factory=time.monotonic)
     completion_candidate_at: float | None = None
     last_thinking_notice_at: float | None = None
+    last_html: str = ""
+    last_links: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -215,6 +270,7 @@ class _ResponseSnapshot:
     status: str
     links: tuple[tuple[str, str], ...] = ()
     error_message: str = ""
+    html: str = ""
 
 
 @dataclass
@@ -228,11 +284,14 @@ class _ActiveReading:
     audio_seen: bool = False
     playback_started_at: float | None = None
     last_play_count: int = 0
+    last_media_time: float = 0.0
+    completed_media_time: float = 0.0
     quiet_since: float | None = None
 
 
 class BrowserMonitor(QThread):
     response_links_changed = Signal(object)
+    response_html_changed = Signal(str)
     debug_connection_changed = Signal(bool)
     """Own Playwright on a worker thread and publish live ChatGPT tab state."""
 
@@ -552,6 +611,7 @@ class BrowserMonitor(QThread):
             state.browser = playwright.chromium.connect_over_cdp(
                 endpoint,
                 timeout=0,
+                no_defaults=True,
             )
         except Exception as error:
             if self._stop_requested:
@@ -578,7 +638,6 @@ class BrowserMonitor(QThread):
             self._connection_pending.clear()
 
         state.retry_endpoint = None
-        state.media_reset_pages.clear()
         state.settings_opened = False
         state.settings_attempted = False
         self.debug_connection_changed.emit(True)
@@ -610,14 +669,24 @@ class BrowserMonitor(QThread):
         try:
             if state.discovery_session is None:
                 state.discovery_session = state.browser.new_browser_cdp_session()
-            # A sync API round trip dispatches pending page/navigation events.
-            # Reading contexts/pages alone uses cached data and can stall forever
-            # when no matching page exists to trigger another Playwright call.
-            state.discovery_session.send("Target.getTargets")
+            # This browser-level call both pumps page/navigation events and
+            # supplies titles without evaluating JavaScript in a tab. Frozen
+            # or busy renderers must not restart a connection just approved.
+            target_snapshot = state.discovery_session.send("Target.getTargets")
         except playwright_error:
             self._handle_disconnect(state)
             return
-        tabs = self._collect_chatgpt_tabs(state.browser, playwright_error, state.media_reset_pages)
+        target_titles: dict[str, str] = {}
+        if isinstance(target_snapshot, dict):
+            for target in target_snapshot.get("targetInfos", []):
+                if not isinstance(target, dict) or target.get("type") != "page":
+                    continue
+                url, title = target.get("url"), target.get("title")
+                if isinstance(url, str) and isinstance(title, str) and title.strip():
+                    target_titles[url] = title.strip()
+        tabs = self._collect_chatgpt_tabs(
+            state.browser, playwright_error, target_titles, state.last_tabs,
+        )
         if tabs is None:
             self._handle_disconnect(state)
         elif tabs != state.last_tabs:
@@ -628,7 +697,8 @@ class BrowserMonitor(QThread):
     def _collect_chatgpt_tabs(
         browser: Any,
         playwright_error: type[Exception],
-        media_reset_pages: set[str],
+        target_titles: dict[str, str],
+        previous_tabs: list[dict[str, str]] | None = None,
     ) -> list[dict[str, str]] | None:
         try:
             contexts = list(browser.contexts)
@@ -636,6 +706,7 @@ class BrowserMonitor(QThread):
             return None
 
         tabs: list[dict[str, str]] = []
+        previous = {tab["id"]: tab for tab in previous_tabs or []}
         for context in contexts:
             try:
                 pages = list(context.pages)
@@ -646,17 +717,17 @@ class BrowserMonitor(QThread):
                     if page.is_closed() or not is_chatgpt_url(page.url):
                         continue
                     page_id = str(id(page))
-                    if page_id not in media_reset_pages:
-                        page.emulate_media(color_scheme="null")
-                        media_reset_pages.add(page_id)
-                    title = page.title().strip() or "ChatGPT"
+                    url = page.url
+                    old_tab = previous.get(page_id, {})
+                    title = target_titles.get(url) or (
+                        old_tab.get("title") if old_tab.get("url") == url else None
+                    ) or "ChatGPT"
                     tabs.append(
-                        {"id": page_id, "title": title, "url": page.url}
+                        {"id": page_id, "title": title, "url": url}
                     )
                 except playwright_error:
                     continue
 
-        media_reset_pages.intersection_update(tab["id"] for tab in tabs)
         tabs.sort(key=lambda tab: tab["title"].casefold())
         return tabs
 
@@ -671,7 +742,6 @@ class BrowserMonitor(QThread):
             state.active_reading = None
         state.browser = None
         state.discovery_session = None
-        state.media_reset_pages.clear()
         self.debug_connection_changed.emit(False)
         self._set_status("Browser disconnected")
         if state.last_tabs != []:
@@ -992,6 +1062,12 @@ class BrowserMonitor(QThread):
             return
 
         text_changed = snapshot.text != response.last_text
+        html_changed = snapshot.html != response.last_html
+        links_changed = snapshot.links != response.last_links
+        if links_changed:
+            response.last_links = snapshot.links
+        if html_changed:
+            response.last_html = snapshot.html
         if text_changed:
             logger.debug(
                 "ChatGPT response text changed "
@@ -1009,7 +1085,10 @@ class BrowserMonitor(QThread):
         ):
             response.last_status = snapshot.status
             self.response_changed.emit(snapshot.status, snapshot.text)
+        if links_changed or text_changed:
             self.response_links_changed.emit(snapshot.links)
+        if html_changed:
+            self.response_html_changed.emit(snapshot.html)
         if text_changed and not self._use_browser_voice and snapshot.text:
             self.local_voice_updated.emit(snapshot.text, False)
         completion_candidate = (
@@ -1114,9 +1193,17 @@ class BrowserMonitor(QThread):
                 reading.quiet_since = None
 
             if reading.playback_started_at is not None:
-                playback_elapsed = now - reading.playback_started_at
+                playback_elapsed = self._finite_float(media.get("playedTime"))
+                if playback_elapsed is None:
+                    if current_time < reading.last_media_time - 0.05:
+                        reading.completed_media_time += reading.last_media_time
+                    reading.last_media_time = current_time
+                    playback_elapsed = reading.completed_media_time + current_time
                 is_full_response_audio = (
                     duration is not None
+                    and media.get("durationIsFinal") is not False
+                    and int(media.get("mediaCount") or 1) == 1
+                    and reading.completed_media_time == 0.0
                     and duration >= estimated_duration * 0.35
                 )
                 if is_full_response_audio:
@@ -1137,11 +1224,17 @@ class BrowserMonitor(QThread):
             )
             if is_playing:
                 reading.quiet_since = None
-            elif reading.audio_seen:
+            elif reading.audio_seen and bool(media.get("ended")):
                 if reading.quiet_since is None:
                     reading.quiet_since = now
                 finished = now - reading.quiet_since >= 4.0
+                if finished:
+                    fraction = 1.0
+            else:
+                # Paused or stalled audio is still an active reading session.
+                reading.quiet_since = None
         elif reading.audio_seen:
+            fraction = reading.last_progress_fraction
             if reading.quiet_since is None:
                 reading.quiet_since = now
             finished = now - reading.quiet_since >= 4.0
@@ -1663,13 +1756,13 @@ class BrowserMonitor(QThread):
 
         markdown = turn.locator(
             '.markdown, [data-message-author-role="assistant"] .prose, '
-            '[data-markdown-text-style="assistant-message"]'
+            '[data-markdown-text-style="assistant-message"], '
+            '[data-markdown-copy="contents"]:has([data-dil-message-id])'
         ).last
-        text = (
-            cls._clean_markdown_text(markdown)
-            if int(markdown.count()) > 0
-            else cls._response_text_from_turn(cls._clean_markdown_text(turn))
-        )
+        has_markdown = int(markdown.count()) > 0
+        text, reply_html = cls._response_content(markdown if has_markdown else turn)
+        if not has_markdown:
+            text = cls._response_text_from_turn(text)
         completion_controls = turn.locator(
             'button[data-testid="copy-turn-action-button"], '
             + _label_selectors("button", "Copy response", "复制回复", "複製回覆")
@@ -1692,6 +1785,7 @@ class BrowserMonitor(QThread):
             text=text,
             status=live_status or ("ChatGPT is responding…" if is_generating else "Finishing reply…"),
             links=links,
+            html=reply_html,
         )
 
     @staticmethod
@@ -1721,34 +1815,17 @@ class BrowserMonitor(QThread):
         return "\n".join(lines).strip()
 
     @staticmethod
-    def _clean_markdown_text(markdown: Any) -> str:
-        clean_text = markdown.evaluate(
-            """
-            element => {
-                const clone = element.cloneNode(true);
-                clone.querySelectorAll([
-                    '[data-markdown-copy="exclude"]',
-                    '[data-d-component="shimmer-text"]',
-                    '[class*="cadencedShimmer-"]',
-                    '[aria-hidden="true"]',
-                    '[data-testid="webpage-citation-pill"]',
-                    '[data-testid="webpage-citation-card"]',
-                    'span[data-search-result-target]:has([data-testid="chatgpt-citation"])',
-                    '[data-testid="chatgpt-citation"]',
-                    '[data-content-reference-start]',
-                    'button[aria-label="Copy table"]',
-                    'button[aria-label="复制表格"]',
-                    'button[aria-label="複製表格"]',
-                    'svg',
-                    '.sr-only'
-                ].join(',')).forEach(item => item.remove());
-                return clone.innerText || clone.textContent || '';
-            }
-            """
-        )
+    def _response_content(markdown: Any) -> tuple[str, str]:
+        clean_text = markdown.evaluate(RESPONSE_CONTENT_SCRIPT)
+        if isinstance(clean_text, dict):
+            return str(clean_text.get("text", "")).strip(), str(clean_text.get("html", ""))
         if isinstance(clean_text, str):
-            return clean_text.strip()
-        return markdown.inner_text(timeout=1_000).strip()
+            return clean_text.strip(), ""
+        return markdown.inner_text(timeout=1_000).strip(), ""
+
+    @classmethod
+    def _clean_markdown_text(cls, markdown: Any) -> str:
+        return cls._response_content(markdown)[0]
 
     @staticmethod
     def _is_thinking_status(status: str) -> bool:
@@ -1826,8 +1903,15 @@ class BrowserMonitor(QThread):
 
     @staticmethod
     def _estimated_reading_duration(text: str) -> float:
-        word_count = max(len(text.split()), 1)
-        return max(word_count / 1.9, 2.0)
+        # CJK speech units do not depend on spaces. A paragraph of Chinese
+        # must not be treated as one English word (a two-second response).
+        cjk = r"[\u3400-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]"
+        character_count = len(re.findall(cjk, text))
+        other_text = re.sub(cjk, " ", text)
+        word_count = len(re.findall(r"[^\W_]+(?:['’][^\W_]+)*", other_text))
+        pauses = len(re.findall(r"[.!?。！？;；\n]", text)) * 0.3
+        pauses += len(re.findall(r"[,，、:：]", text)) * 0.12
+        return max(word_count / 1.9 + character_count / 3.5 + pauses, 2.0)
 
     @staticmethod
     def _finite_float(value: object) -> float | None:

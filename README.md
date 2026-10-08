@@ -192,11 +192,23 @@ ChatGPT responds, its first line shows the sent prompt and its second line
 shows the current status. When **Read aloud** starts, the prompt is removed and
 both lines show the response. During playback, subtitles follow the browser
 media's progress and roll forward one line at a time. Hover over the subtitle
-area to expand a full-response view whose height fits the wrapped text. Moving
+area to expand a formatted HTML response with paragraphs, lists, tables, and links.
+Code blocks use rounded cards with spacing above them and padding around the text.
+They keep their original line breaks and indentation, with a language label and
+a copy icon that copies only that block's text to the clipboard and briefly shows a checkmark.
+Its height fits the rendered content. Moving
 the pointer outside the whole overlay restores the two-line view at the current playback
-line. Left-click it to return to input mode. If
-ChatGPT does not expose its media element, subtitle timing falls back to an
-estimate. Press the microphone or its hotkey to dismiss subtitles and dictate
+line. Use the **×** button in the expanded reply to close it and return to an empty
+message input. Citation badges such as “Forever +1” are excluded from subtitles
+and local speech, while their available source links appear in the expanded reply.
+If a closed citation exposes no source URL, its link is marked **(ChatGPT)** and
+opens the original conversation. Subtitle progress follows consumed
+audio, so pauses and buffering do not advance it. While streamed audio has no
+final duration, timing uses an estimate that counts both words and CJK characters
+and carries playback time across audio chunks. This remains approximate within
+sentences because browser playback does not provide word timestamps. If ChatGPT
+does not expose its media element, timing falls back to an elapsed-time estimate.
+Press the microphone or its hotkey to dismiss subtitles and dictate
 another prompt. Press
 **Enter** to send a prompt or **Shift+Enter** to insert a newline. With no
 screenshot selected, the send actions remain hidden while the editor is empty.
@@ -204,7 +216,9 @@ screenshot selected, the send actions remain hidden while the editor is empty.
 At startup, Live GPT connects through Playwright to a local Chromium browser
 that was started with remote debugging enabled. It discovers ChatGPT tabs and
 lists them by page title beside the **Live GPT** heading, refreshing the list as
-tabs open, close, or navigate. When no debuggable browser is available, Live GPT
+tabs open, close, or navigate. Tab titles come from the browser's target list,
+so a busy or frozen ChatGPT page does not stall discovery after approval.
+When no debuggable browser is available, Live GPT
 opens the current user's `edge://inspect/#remote-debugging` or
 `chrome://inspect/#remote-debugging` settings page. Live GPT turns on **Allow
 remote debugging for this browser instance** through Windows accessibility,
@@ -218,9 +232,9 @@ requests from creating a stack of dialogs. After choosing **Deny**, click
 If opening or enabling the debugging settings fails, Live GPT stops automatic
 setup attempts. Click **Enable Debugging** to retry after correcting the issue;
 it checks that the browser address bar is accessible before opening a new tab.
-Attached
-ChatGPT pages retain the browser's native color-scheme
-preference. Live GPT does not launch the browser with debugging flags or create
+Attached ChatGPT pages retain the browser's native color-scheme and focus
+settings through Playwright's `no_defaults` connection option (Playwright 1.62+).
+Live GPT does not launch the browser with debugging flags or create
 a separate profile. The optional `LIVE_GPT_CDP_ENDPOINT` environment variable
 can point the app at a specific CDP HTTP or WebSocket endpoint.
 
@@ -253,8 +267,8 @@ pointer. Move the pointer onto another monitor to transfer the overlay there.
 If the overlay is larger than that screen's usable area, its top-left corner
 stays on-screen so its controls remain reachable.
 
-Click a response to edit, select, copy, or clear it without losing its text.
-HTTP(S) links open in the default browser. Holding the microphone for at least
+Select and copy text directly from the formatted reply. Its HTTP(S) links open
+in a new tab in the default browser. Holding the microphone for at least
 0.5 seconds clears the previous input; shorter taps preserve it.
 
 Hover anywhere over the overlay to expand the input vertically to fit its

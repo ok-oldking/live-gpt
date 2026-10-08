@@ -6,6 +6,7 @@ import re
 import sys
 import threading
 import time
+import webbrowser
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,6 +33,7 @@ from PySide6.QtGui import (
     QKeySequence,
     QMouseEvent,
     QPalette,
+    QRegion,
     QTextCursor,
 )
 from PySide6.QtWidgets import (
@@ -61,6 +63,7 @@ from PySide6.QtWidgets import (
     QStackedWidget,
     QSpinBox,
     QSystemTrayIcon,
+    QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
@@ -75,6 +78,7 @@ from .localization import UiTranslations, localization, resolve_language, transl
 from .pet import PetWidget, available_pets, default_pet_path
 from .pet_download import download_pet, pet_source
 from .logger import Logger, config_logger, shutdown_logger
+from .response_content import reply_code_blocks, reply_html_with_links
 from .hotkeys import GlobalHotkeyMonitor, HotkeyBinding, HotkeyEdit, shortcut_text
 from .screen_capture import CaptureSource, capture_webp, list_capture_sources
 from .window_focus import ForegroundWindowRestorer
@@ -92,6 +96,7 @@ EXIT_ICON_PATH = ASSET_DIRECTORY / "exit.svg"
 SEND_ICON_PATH = ASSET_DIRECTORY / "send.svg"
 SPEAKER_ICON_PATH = ASSET_DIRECTORY / "speaker.svg"
 CHECK_ICON_PATH = ASSET_DIRECTORY / "check.svg"
+COPY_ICON_PATH = ASSET_DIRECTORY / "copy.svg"
 SETTINGS_ICON_PATH = ASSET_DIRECTORY / "settings.svg"
 SHORTCUTS_ICON_PATH = ASSET_DIRECTORY / "shortcuts.svg"
 SCREENSHOT_ICON_PATH = ASSET_DIRECTORY / "screenshot.svg"
@@ -2809,6 +2814,159 @@ class TranscriptEditor(LinkTextEdit):
         self._position_action_buttons()
 
 
+class ReplyDisplay(QTextBrowser):
+    """Read-only HTML reply with links opened in a new browser tab."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._code_blocks: list[tuple[str, str]] = []
+        self._copy_buttons: list[QPushButton] = []
+        self._code_cards: list[QFrame] = []
+        self._copy_timers: list[QTimer] = []
+        self._code_positions: dict[int, int] = {}
+        self.setOpenLinks(False)
+        self.setOpenExternalLinks(False)
+        self.anchorClicked.connect(self._open_link)
+        self.document().setDefaultStyleSheet("""
+            p { margin-top: 0; margin-bottom: 12px; }
+            a { color: #66dcff; text-decoration: underline; }
+            th { background-color: #243352; font-weight: bold; }
+            td, th { padding: 6px; }
+            pre { white-space: pre-wrap; }
+            code { font-family: Consolas, monospace; }
+            blockquote { margin-left: 16px; color: #c1cbe0; }
+        """)
+        self.viewport().setStyleSheet("background: transparent;")
+        self.verticalScrollBar().valueChanged.connect(self._position_copy_buttons)
+        self.horizontalScrollBar().valueChanged.connect(self._position_copy_buttons)
+        self._copy_position_timer = QTimer(self)
+        self._copy_position_timer.setSingleShot(True)
+        self._copy_position_timer.timeout.connect(self._position_copy_buttons)
+        self.document().documentLayout().documentSizeChanged.connect(
+            lambda _size: self._copy_position_timer.start(0)
+        )
+        localization.changed.connect(self._translate_copy_controls)
+
+    def _translate_copy_controls(self) -> None:
+        for button, timer in zip(self._copy_buttons, self._copy_timers):
+            self._set_copy_feedback(button, timer.isActive())
+
+    @staticmethod
+    def _set_copy_feedback(button: QPushButton, copied: bool) -> None:
+        button.setText("")
+        button.setIcon(QIcon(str(CHECK_ICON_PATH if copied else COPY_ICON_PATH)))
+        label = tr("Copied!") if copied else tr("Copy code")
+        button.setToolTip(label)
+        button.setAccessibleName(label)
+
+    def setHtml(self, html: str) -> None:  # noqa: N802
+        formatted, self._code_blocks = reply_code_blocks(html, tr("Plain text"))
+        super().setHtml(formatted)
+        while len(self._copy_buttons) > len(self._code_blocks):
+            self._copy_timers.pop().stop()
+            button = self._copy_buttons.pop()
+            button.hide()
+            button.deleteLater()
+            card = self._code_cards.pop()
+            card.hide()
+            card.deleteLater()
+        while len(self._copy_buttons) < len(self._code_blocks):
+            index = len(self._copy_buttons)
+            card = QFrame(self)
+            card.setObjectName("replyCodeCard")
+            card.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+            card.setStyleSheet("background-color: #17223b; border: none; border-radius: 18px;")
+            card.lower()
+            self._code_cards.append(card)
+            button = QPushButton(self.viewport())
+            button.setObjectName("replyCodeCopyButton")
+            button.setFixedSize(36, 36)
+            button.setIconSize(QSize(22, 22))
+            button.setAccessibleName(tr("Copy code"))
+            button.setToolTip(tr("Copy code"))
+            button.setStyleSheet("""
+                QPushButton { padding: 0; min-width: 0; min-height: 0;
+                    color: #f5f7ff; background: transparent;
+                    border: none; border-radius: 10px; }
+                QPushButton:hover { background: #344768; }
+            """)
+            button.clicked.connect(lambda _checked=False, index=index: self._copy_code(index))
+            timer = QTimer(button)
+            timer.setSingleShot(True)
+            timer.timeout.connect(lambda button=button: self._set_copy_feedback(button, False))
+            self._copy_buttons.append(button)
+            self._copy_timers.append(timer)
+        for button, timer in zip(self._copy_buttons, self._copy_timers):
+            timer.stop()
+            self._set_copy_feedback(button, False)
+        self._code_positions = {}
+        block = self.document().begin()
+        while block.isValid():
+            iterator = block.begin()
+            while not iterator.atEnd():
+                fragment = iterator.fragment()
+                if fragment.isValid():
+                    for name in fragment.charFormat().anchorNames():
+                        if name.startswith("live-gpt-code-"):
+                            self._code_positions.setdefault(int(name.removeprefix("live-gpt-code-")), fragment.position())
+                iterator += 1
+            block = block.next()
+        self._position_copy_buttons()
+
+    def _copy_code(self, index: int) -> None:
+        if 0 <= index < len(self._code_blocks):
+            QApplication.clipboard().setText(self._code_blocks[index][1])
+            self._set_copy_feedback(self._copy_buttons[index], True)
+            self._copy_timers[index].start(1500)
+
+    def _position_copy_buttons(self, *_args: object) -> None:
+        for index, button in enumerate(getattr(self, "_copy_buttons", ())):
+            card = self._code_cards[index]
+            position = self._code_positions.get(index)
+            if position is None:
+                button.hide()
+                card.hide()
+                continue
+            cursor = QTextCursor(self.document())
+            cursor.setPosition(position)
+            table = cursor.currentTable()
+            if table is None:
+                button.hide()
+                card.hide()
+                continue
+            bounds = self.document().documentLayout().frameBoundingRect(table)
+            header_bounds = self.cursorRect(cursor)
+            header_format = table.cellAt(0, 0).format().toTableCellFormat()
+            last_cell = table.cellAt(table.rows() - 1, 0)
+            code_end = self.cursorRect(last_cell.lastCursorPosition())
+            code_format = last_cell.format().toTableCellFormat()
+            left = header_bounds.left() - int(header_format.leftPadding())
+            top = header_bounds.top() - int(header_format.topPadding())
+            height = code_end.bottom() + 1 + int(code_format.bottomPadding()) - top
+            code_bounds = QRect(left, top, int(bounds.width()), height)
+            viewport_origin = self.viewport().pos()
+            card_bounds = code_bounds.translated(viewport_origin)
+            card.setGeometry(card_bounds)
+            visible_bounds = self.viewport().geometry().translated(-card.pos())
+            card.setMask(QRegion(card.rect()).intersected(QRegion(visible_bounds)))
+            card.setVisible(self.viewport().geometry().intersects(card_bounds))
+            x = min(code_bounds.right() - button.width() - 16,
+                    self.viewport().width() - button.width() - 4)
+            y = self.cursorRect(cursor).top() - 8
+            button.move(max(4, x), y)
+            button.setVisible(y + button.height() > 0 and y < self.viewport().height())
+            button.raise_()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._position_copy_buttons()
+
+    @staticmethod
+    def _open_link(url: QUrl) -> None:
+        if url.scheme().lower() in ("http", "https"):
+            webbrowser.open_new_tab(url.toString())
+
+
 class OverlayWindow(QMainWindow):
     exit_requested = Signal()
     dictation_requested = Signal()
@@ -3011,11 +3169,23 @@ class OverlayWindow(QMainWindow):
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
         )
         self.subtitle_line_two.setWordWrap(False)
-        self.subtitle_full_text = LinkTextEdit()
+        self.subtitle_full_text = ReplyDisplay()
         self.subtitle_full_text.setObjectName("subtitleFullText")
         self.subtitle_full_text.setReadOnly(True)
         self.subtitle_full_text.setMouseTracking(True)
         self.subtitle_full_text.hide()
+        self._response_html = ""
+        self._response_links: object = ()
+        self._displayed_reply_content: tuple[str, str] | None = None
+        self.reply_close_button = QPushButton()
+        self.reply_close_button.setObjectName("replyCloseButton")
+        self.reply_close_button.setIcon(QIcon(str(EXIT_ICON_PATH)))
+        self.reply_close_button.setIconSize(QSize(16, 16))
+        self.reply_close_button.setFixedSize(32, 32)
+        self.reply_close_button.setAccessibleName(tr("Close reply"))
+        self.reply_close_button.setToolTip(tr("Close reply"))
+        self.reply_close_button.clicked.connect(self._close_reply)
+        self.reply_close_button.hide()
         self._reading_full_text = ""
         self._reading_fraction = 0.0
         self._reading_spoken_characters = 0
@@ -3031,6 +3201,7 @@ class OverlayWindow(QMainWindow):
         self._subtitle_hover_origin: QPoint | None = None
         subtitle_layout.addWidget(self.subtitle_line_one, 1)
         subtitle_layout.addWidget(self.subtitle_line_two, 1)
+        subtitle_layout.addWidget(self.reply_close_button, 0, Qt.AlignmentFlag.AlignRight)
         subtitle_layout.addWidget(self.subtitle_full_text, 1)
         self.subtitle_panel.hide()
         self._subtitle_hover_widgets = (
@@ -3039,6 +3210,7 @@ class OverlayWindow(QMainWindow):
             self.subtitle_line_two,
             self.subtitle_full_text,
             self.subtitle_full_text.viewport(),
+            self.reply_close_button,
         )
         for widget in self._subtitle_hover_widgets:
             widget.setMouseTracking(True)
@@ -3196,7 +3368,7 @@ class OverlayWindow(QMainWindow):
                 font-size: 22px;
                 font-weight: 600;
             }
-            QPlainTextEdit#subtitleFullText {
+            QTextBrowser#subtitleFullText {
                 color: #f5f7ff;
                 background: transparent;
                 border: none;
@@ -3239,6 +3411,7 @@ class OverlayWindow(QMainWindow):
             }
             QPushButton#sendButton,
             QPushButton#clearButton,
+            QPushButton#replyCloseButton,
             QPushButton#sendWithoutScreenshotButton {
                 min-width: 32px;
                 min-height: 32px;
@@ -3469,7 +3642,16 @@ class OverlayWindow(QMainWindow):
 
     def set_response_links(self, links: object) -> None:
         self.transcript_area.response_links = links
-        self.subtitle_full_text.response_links = links
+        if self._subtitle_dismissed:
+            return
+        self._response_links = links
+        self._update_expanded_subtitle()
+
+    def set_response_html(self, reply_html: str) -> None:
+        if self._subtitle_dismissed:
+            return
+        self._response_html = reply_html
+        self._update_expanded_subtitle()
 
     def set_capture_sources(self, sources: list[CaptureSource]) -> None:
         selected = self.capture_source_combo.currentData()
@@ -3549,6 +3731,9 @@ class OverlayWindow(QMainWindow):
         self._subtitle_hover_origin = None
         self._sent_message_text = " ".join(sent_text.split())
         self._reading_full_text = ""
+        self._response_html = ""
+        self._displayed_reply_content = None
+        self._response_links = ()
         self._reading_fraction = 0.0
         self._reading_spoken_characters = 0
         self._subtitle_line_index = -1
@@ -3771,23 +3956,27 @@ class OverlayWindow(QMainWindow):
         else:
             self.subtitle_line_one.setText(message)
             self.subtitle_line_two.clear()
-        full_text = self._reading_full_text or message
-        if (
-            not self._subtitle_expanded
-            and self.subtitle_full_text.toPlainText() != full_text
-        ):
-            self.subtitle_full_text.setPlainText(full_text)
+        if not self._subtitle_expanded:
+            self._render_full_reply()
+
+    def _render_full_reply(self) -> bool:
+        text = self._reading_full_text or self._subtitle_status_text
+        reply_html = reply_html_with_links(self._response_html, text, self._response_links, tr("Sources"))
+        content = (reply_html, "")
+        if content == self._displayed_reply_content:
+            return False
+        self._displayed_reply_content = content
+        self.subtitle_full_text.setHtml(reply_html)
+        return True
 
     def _update_expanded_subtitle(self) -> None:
         if not self._subtitle_expanded:
             return
-        text = self._reading_full_text or self._subtitle_status_text
-        if self.subtitle_full_text.toPlainText() == text:
-            return
         scrollbar = self.subtitle_full_text.verticalScrollBar()
         previous_value = scrollbar.value()
         was_at_bottom = previous_value >= scrollbar.maximum() - 1
-        self.subtitle_full_text.setPlainText(text)
+        if not self._render_full_reply():
+            return
         if was_at_bottom and self._subtitle_reading_started:
             scrollbar.setValue(scrollbar.maximum())
         else:
@@ -3801,12 +3990,12 @@ class OverlayWindow(QMainWindow):
         self._subtitle_expanded = True
         self._subtitle_outside_timer.start()
         self._subtitle_collapsed_geometry = QRect(self.geometry())
-        self.subtitle_full_text.setPlainText(
-            self._reading_full_text or self._subtitle_status_text
-        )
+        self._render_full_reply()
         self.subtitle_line_one.hide()
         self.subtitle_line_two.hide()
         self.subtitle_full_text.show()
+        self.reply_close_button.show()
+        self.subtitle_panel.layout().activate()
         self._fit_expanded_subtitle_height()
 
     def _fit_expanded_subtitle_height(self) -> None:
@@ -3818,15 +4007,13 @@ class OverlayWindow(QMainWindow):
             return
         available = self.screen().availableGeometry()
         collapsed = self._subtitle_collapsed_geometry
-        content_width = max(self.subtitle_panel.width() - 40, 1)
-        text = self._reading_full_text or self._subtitle_status_text
+        content_width = max(self.subtitle_full_text.viewport().width(), 1)
         metrics = self.subtitle_full_text.fontMetrics()
-        text_height = metrics.boundingRect(
-            QRect(0, 0, content_width, 16_777_215),
-            Qt.TextFlag.TextWordWrap,
-            text,
-        ).height()
-        panel_height = max(text_height, metrics.lineSpacing()) + 32
+        document = self.subtitle_full_text.document().clone()
+        document.setTextWidth(content_width)
+        text_height = int(document.size().height())
+        document.deleteLater()
+        panel_height = max(text_height, metrics.lineSpacing()) + 32 + self.reply_close_button.height()
         fixed_chrome_height = max(
             self.height() - self.subtitle_panel.height(),
             0,
@@ -3855,6 +4042,7 @@ class OverlayWindow(QMainWindow):
             return
         self._subtitle_expanded = False
         self.subtitle_full_text.hide()
+        self.reply_close_button.hide()
         self.subtitle_line_one.show()
         self.subtitle_line_two.show()
         if self._subtitle_collapsed_geometry is not None:
@@ -3878,7 +4066,11 @@ class OverlayWindow(QMainWindow):
             self._collapse_subtitle()
             self.schedule_auto_hide(5_000)
 
-    def dismiss_subtitle_mode(self) -> bool:
+    def _close_reply(self) -> None:
+        self.dismiss_subtitle_mode(preserve_text=False)
+        self.transcript_area.setFocus()
+
+    def dismiss_subtitle_mode(self, *, preserve_text: bool = True) -> bool:
         if not self._subtitle_mode_active:
             return False
         self._collapse_subtitle()
@@ -3889,8 +4081,9 @@ class OverlayWindow(QMainWindow):
         self.subtitle_panel.hide()
         self.dictation_panel.hide()
         response_text = self._reading_full_text or self.transcript_area.toPlainText()
-        self.transcript_area.begin_composing(preserve_text=True)
-        self.transcript_area.setPlainText(response_text)
+        self.transcript_area.begin_composing()
+        if preserve_text:
+            self.transcript_area.setPlainText(response_text)
         self.transcript_area.show()
         self.microphone_button.setVisible(True)
         self.set_status(tr("Hold the microphone or enter a message"))
@@ -4371,10 +4564,8 @@ class OverlayWindow(QMainWindow):
                 event_type == QEvent.Type.MouseButtonPress
                 and event.button() == Qt.MouseButton.LeftButton
             ):
-                if watched in (self.subtitle_full_text, self.subtitle_full_text.viewport()):
-                    position = event.position().toPoint()
-                    if self.subtitle_full_text._link_at(position):
-                        return False
+                if self._subtitle_expanded:
+                    return False
                 if self.dismiss_subtitle_mode():
                     event.accept()
                     return True
@@ -4615,6 +4806,7 @@ class TrayController:
         )
         self.browser_monitor.tabs_changed.connect(self.window.set_chatgpt_tabs)
         self.browser_monitor.response_links_changed.connect(self.window.set_response_links)
+        self.browser_monitor.response_html_changed.connect(self.window.set_response_html)
         self.browser_monitor.debug_connection_changed.connect(self.window.set_debug_connection)
         self.browser_monitor.status_changed.connect(
             self.window.set_browser_status

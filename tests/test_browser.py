@@ -121,6 +121,143 @@ class BrowserDiscoveryTests(unittest.TestCase):
 
 
 class BrowserMonitorTests(unittest.TestCase):
+    def test_sources_arriving_after_reply_text_are_published(self):
+        monitor = BrowserMonitor()
+        state = _MonitorState(active_response=_ActiveResponse(page=Mock(), turn_marker_before="old"))
+        sources = (("Forever +1", "https://example.com/quest"),)
+        updates = []
+        monitor.response_links_changed.connect(updates.append)
+        with patch.object(monitor, "_response_snapshot", side_effect=[
+            _ResponseSnapshot(True, True, False, "Reply", "Writing…"),
+            _ResponseSnapshot(True, True, False, "Reply", "Writing…", links=sources),
+        ]):
+            monitor._poll_active_response(state)
+            monitor._poll_active_response(state)
+        self.assertEqual(updates, [(), sources])
+
+    def test_formatting_change_is_published_without_repeating_speech(self):
+        monitor = BrowserMonitor()
+        monitor.set_use_browser_voice(False)
+        state = _MonitorState(active_response=_ActiveResponse(page=Mock(), turn_marker_before="old"))
+        html_updates, speech = [], []
+        monitor.response_html_changed.connect(html_updates.append)
+        monitor.local_voice_updated.connect(lambda text, final: speech.append((text, final)))
+        with patch.object(monitor, "_response_snapshot", side_effect=[
+            _ResponseSnapshot(True, True, False, "Reply", "Writing…", html="<p>Reply</p>"),
+            _ResponseSnapshot(True, True, False, "Reply", "Writing…", html="<p><strong>Reply</strong></p>"),
+        ]):
+            monitor._poll_active_response(state)
+            monitor._poll_active_response(state)
+        self.assertEqual(html_updates, ["<p>Reply</p>", "<p><strong>Reply</strong></p>"])
+        self.assertEqual(speech, [("Reply", False)])
+
+    def test_reading_estimate_counts_cjk_without_spaces(self):
+        estimate = BrowserMonitor._estimated_reading_duration
+        self.assertAlmostEqual(estimate("中" * 140), 40.0)
+        self.assertAlmostEqual(estimate("あ" * 140), 40.0)
+        self.assertAlmostEqual(estimate("한" * 140), 40.0)
+        self.assertAlmostEqual(estimate("Hello world " + "中" * 35), 10 + 2 / 1.9)
+        self.assertGreater(estimate("Hello, world! This is a reply."),
+                           estimate("Hello world This is a reply"))
+
+    def test_streamed_cjk_subtitles_use_consumed_audio_not_wall_time(self):
+        monitor = BrowserMonitor()
+        page = Mock()
+        page.evaluate.return_value = {
+            "playCount": 1, "mediaCount": 1, "playedTime": 3.5,
+            "currentTime": 3.5, "duration": 20, "durationIsFinal": False,
+            "paused": False, "ended": False,
+        }
+        state = _MonitorState(active_reading=_ActiveReading(
+            page=page, full_text="中" * 140, subtitles=(), started_at=0,
+        ))
+        updates = []
+        monitor.reading_changed.connect(updates.append)
+        with patch("live_gpt.browser.time.monotonic", return_value=10) as clock:
+            monitor._poll_active_reading(state)
+            self.assertAlmostEqual(updates[-1]["fraction"], 3.5 / 40)
+            # Buffering has consumed no more audio even after a long wait.
+            clock.return_value = 30
+            monitor._poll_active_reading(state)
+            self.assertEqual(len(updates), 1)
+            self.assertIsNotNone(state.active_reading)
+            # Once the stream has its full duration, use the actual timeline.
+            page.evaluate.return_value.update(duration=50, durationIsFinal=True)
+            monitor._poll_active_reading(state)
+            self.assertAlmostEqual(updates[-1]["fraction"], 3.5 / 50)
+
+    def test_subtitles_freeze_during_pause_and_resume_at_audio_position(self):
+        monitor = BrowserMonitor()
+        page = Mock()
+        media = {
+            "playCount": 1, "currentTime": 5, "duration": None,
+            "paused": False, "ended": False,
+        }
+        page.evaluate.return_value = media
+        state = _MonitorState(active_reading=_ActiveReading(
+            page=page, full_text="word " * 76, subtitles=(), started_at=0,
+        ))
+        updates = []
+        monitor.reading_changed.connect(updates.append)
+        with patch("live_gpt.browser.time.monotonic", return_value=10) as clock:
+            monitor._poll_active_reading(state)
+            self.assertAlmostEqual(updates[-1]["fraction"], 5 / 40)
+            media["paused"] = True
+            clock.return_value = 20
+            monitor._poll_active_reading(state)
+            clock.return_value = 100
+            monitor._poll_active_reading(state)
+            self.assertEqual(len(updates), 1)
+            self.assertIsNotNone(state.active_reading)
+            media.update(playCount=2, currentTime=6, paused=False)
+            monitor._poll_active_reading(state)
+            self.assertAlmostEqual(updates[-1]["fraction"], 6 / 40)
+
+    def test_chunked_audio_progress_accumulates_across_time_resets(self):
+        monitor = BrowserMonitor()
+        page = Mock()
+        media = {
+            "playCount": 1, "currentTime": 8, "duration": 10,
+            "paused": False, "ended": False,
+        }
+        page.evaluate.return_value = media
+        state = _MonitorState(active_reading=_ActiveReading(
+            page=page, full_text="word " * 76, subtitles=(),
+        ))
+        updates = []
+        monitor.reading_changed.connect(updates.append)
+        monitor._poll_active_reading(state)
+        self.assertAlmostEqual(updates[-1]["fraction"], 8 / 40)
+        media.update(playCount=2, currentTime=1)
+        monitor._poll_active_reading(state)
+        self.assertAlmostEqual(updates[-1]["fraction"], 9 / 40)
+        # The browser tracker also accounts for chunks between Python polls.
+        media.update(mediaCount=3, playedTime=21, currentTime=1, duration=20)
+        monitor._poll_active_reading(state)
+        self.assertAlmostEqual(updates[-1]["fraction"], 21 / 40)
+
+    def test_streamed_audio_completion_shows_final_subtitle(self):
+        monitor = BrowserMonitor()
+        page = Mock()
+        media = {
+            "playCount": 1, "playedTime": 5, "currentTime": 5,
+            "duration": None, "paused": False, "ended": False,
+        }
+        page.evaluate.return_value = media
+        state = _MonitorState(active_reading=_ActiveReading(
+            page=page, full_text="word " * 76, subtitles=(), started_at=0,
+        ))
+        updates = []
+        monitor.reading_changed.connect(updates.append)
+        with patch("live_gpt.browser.time.monotonic", return_value=10) as clock:
+            monitor._poll_active_reading(state)
+            media.update(paused=True, ended=True)
+            monitor._poll_active_reading(state)
+            clock.return_value = 15
+            monitor._poll_active_reading(state)
+        self.assertEqual(updates[-1]["fraction"], 1.0)
+        self.assertIsNone(state.active_reading)
+
     def test_stalled_browser_operation_interrupts_driver(self):
         monitor = BrowserMonitor()
         loop, stop_transport = Mock(), Mock()
@@ -322,13 +459,20 @@ class BrowserMonitorTests(unittest.TestCase):
         browser = Mock(contexts=[context])
         state = _MonitorState(browser=browser)
         session = browser.new_browser_cdp_session.return_value
+        snapshot = {"targetInfos": [{"type": "page", "url": "https://chatgpt.com/", "title": "New conversation"}]}
         monitor._refresh_tabs(state, FakePlaywrightError)
         self.assertEqual(updates, [[]])
         # Model events becoming visible only when a sync API call pumps them.
-        session.send.side_effect = lambda _: context.pages.append(page)
+        def open_page(_method):
+            context.pages.append(page)
+            return snapshot
+        session.send.side_effect = open_page
         monitor._refresh_tabs(state, FakePlaywrightError)
         self.assertEqual(updates, [[]])
-        session.send.side_effect = lambda _: setattr(page, "url", "https://chatgpt.com/")
+        def navigate(_method):
+            page.url = "https://chatgpt.com/"
+            return snapshot
+        session.send.side_effect = navigate
         monitor._refresh_tabs(state, FakePlaywrightError)
         self.assertEqual(updates[-1], [{"id": str(id(page)), "title": "New conversation", "url": "https://chatgpt.com/"}])
         monitor._refresh_tabs(state, FakePlaywrightError)
@@ -338,6 +482,49 @@ class BrowserMonitorTests(unittest.TestCase):
         session.send.side_effect = lambda _: context.pages.clear()
         monitor._refresh_tabs(state, FakePlaywrightError)
         self.assertEqual(updates[-1], [])
+        page.title.assert_not_called()
+        page.emulate_media.assert_not_called()
+
+    def test_approved_connection_discovers_tabs_without_renderer_calls(self):
+        monitor = BrowserMonitor()
+        page = Mock(url="https://chatgpt.com/c/conversation")
+        page.is_closed.return_value = False
+        page.title.side_effect = RuntimeError("Renderer is unresponsive")
+        page.emulate_media.side_effect = RuntimeError("Renderer is unresponsive")
+        browser = Mock(contexts=[Mock(pages=[page])])
+        browser.new_browser_cdp_session.return_value.send.return_value = {"targetInfos": [
+            {"type": "page", "url": page.url, "title": "Conversation"},
+        ]}
+        playwright = Mock()
+        playwright.chromium.connect_over_cdp.return_value = browser
+        state = _MonitorState()
+        updates = []
+        monitor.tabs_changed.connect(updates.append)
+        with patch("live_gpt.browser.discover_cdp_endpoint", return_value="http://127.0.0.1:9222"):
+            monitor._try_connect(playwright, FakePlaywrightError, state)
+        monitor._refresh_tabs(state, FakePlaywrightError)
+        self.assertEqual(updates, [[{"id": str(id(page)), "title": "Conversation", "url": page.url}]])
+        self.assertIs(state.browser, browser)
+        page.title.assert_not_called()
+        page.emulate_media.assert_not_called()
+        playwright.chromium.connect_over_cdp.assert_called_once_with(
+            "http://127.0.0.1:9222", timeout=0, no_defaults=True,
+        )
+
+    def test_browser_target_title_changes_are_published(self):
+        monitor = BrowserMonitor()
+        page = Mock(url="https://chatgpt.com/c/conversation")
+        page.is_closed.return_value = False
+        browser = Mock(contexts=[Mock(pages=[page])])
+        browser.new_browser_cdp_session.return_value.send.side_effect = [
+            {"targetInfos": [{"type": "page", "url": page.url, "title": title}]} for title in ("Old title", "New title")
+        ]
+        state = _MonitorState(browser=browser)
+        updates = []
+        monitor.tabs_changed.connect(updates.append)
+        monitor._refresh_tabs(state, FakePlaywrightError)
+        monitor._refresh_tabs(state, FakePlaywrightError)
+        self.assertEqual([tabs[0]["title"] for tabs in updates], ["Old title", "New title"])
 
     def test_discovery_failure_clears_connection_and_session(self):
         monitor = BrowserMonitor()
@@ -398,6 +585,7 @@ class BrowserMonitorTests(unittest.TestCase):
         chromium.connect_over_cdp.assert_called_with(
             "http://127.0.0.1:9222",
             timeout=0,
+            no_defaults=True,
         )
 
     @patch("live_gpt.browser.discover_cdp_endpoint")
@@ -503,28 +691,32 @@ class BrowserMonitorTests(unittest.TestCase):
 
         loop.call_soon_threadsafe.assert_called_once_with(stop_transport)
 
-    def test_native_color_scheme_is_restored_once_per_page(self) -> None:
+    def test_missing_browser_title_keeps_previous_title_without_page_calls(self) -> None:
         page = Mock()
         page.is_closed.return_value = False
         page.url = "https://chatgpt.com/c/conversation"
         page.title.return_value = "Conversation"
         browser = Mock()
         browser.contexts = [Mock(pages=[page])]
-        reset_pages: set[str] = set()
-
         first = BrowserMonitor._collect_chatgpt_tabs(
             browser,
             FakePlaywrightError,
-            reset_pages,
+            {page.url: "Conversation"},
         )
         second = BrowserMonitor._collect_chatgpt_tabs(
             browser,
             FakePlaywrightError,
-            reset_pages,
+            {},
+            first,
         )
 
         self.assertEqual(first, second)
-        page.emulate_media.assert_called_once_with(color_scheme="null")
+        self.assertEqual(first[0]["title"], "Conversation")
+        page.title.assert_not_called()
+        page.emulate_media.assert_not_called()
+        page.url = "https://chatgpt.com/c/new-conversation"
+        changed = BrowserMonitor._collect_chatgpt_tabs(browser, FakePlaywrightError, {}, first)
+        self.assertEqual(changed[0]["title"], "ChatGPT")
 
     def test_send_request_targets_selected_chatgpt_page(self) -> None:
         composer = Mock()

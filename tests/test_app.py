@@ -13,12 +13,14 @@ from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QEvent, QPoint, QRect, Qt  # noqa: E402
+from PySide6.QtCore import QEvent, QPoint, QRect, Qt, QUrl  # noqa: E402
 from PySide6.QtGui import QKeySequence, QPalette  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
     QApplication,
+    QPlainTextEdit,
     QPushButton,
+    QTextBrowser,
     QSystemTrayIcon,
 )
 
@@ -624,6 +626,161 @@ class TranscriptEditorTests(unittest.TestCase):
             QTest.mouseClick(self.editor.viewport(), Qt.MouseButton.LeftButton, pos=point)
             self.assertEqual(open_url.call_args.args[0].toString(), url)
 
+
+
+class ReplyDisplayTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.application = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        self.window = OverlayWindow()
+        self.window.set_chatgpt_tabs([{"id": "tab", "title": "ChatGPT", "url": "https://chatgpt.com"}])
+        self.window.show()
+        self.window.begin_response_display("Question")
+        self.window.set_response_update("Writing…", "Results\nRead these docs.\nName\tValue\nOne\t2")
+        self.window.set_response_html('<h2>Results</h2><p>Read <strong>these</strong> '
+                                      '<a href="https://example.com/docs">docs</a>.</p>'
+                                      '<table border="1" cellpadding="6"><tr><th>Name</th><th>Value</th></tr>'
+                                      '<tr><td>One</td><td>2</td></tr></table>')
+        self.window._expand_subtitle()
+        QApplication.processEvents()
+
+    def tearDown(self) -> None:
+        self.window.close()
+        self.window.deleteLater()
+
+    def test_reply_renders_html_and_selection_does_not_dismiss_it(self) -> None:
+        display = self.window.subtitle_full_text
+        self.assertIsInstance(display, QTextBrowser)
+        self.assertNotIsInstance(display, QPlainTextEdit)
+        self.assertTrue(display.isReadOnly())
+        self.assertIsNotNone(display.document().find("Name").currentTable())
+        self.assertGreater(display.document().find("these").charFormat().fontWeight(), 400)
+        QTest.mouseClick(display.viewport(), Qt.MouseButton.LeftButton, pos=QPoint(20, 20))
+        display.selectAll()
+        self.assertTrue(display.textCursor().hasSelection())
+        self.assertTrue(self.window._subtitle_mode_active)
+        self.assertTrue(self.window.transcript_area.isHidden())
+        self.assertTrue(self.window.reply_close_button.isVisible())
+
+    @patch("live_gpt.app.webbrowser.open_new_tab")
+    def test_reply_link_opens_new_tab_and_keeps_reply_visible(self, open_tab) -> None:
+        display = self.window.subtitle_full_text
+        cursor = display.document().find("docs")
+        cursor.setPosition(cursor.selectionStart() + 1)
+        point = display.cursorRect(cursor).center()
+        QTest.mouseClick(display.viewport(), Qt.MouseButton.LeftButton, pos=point)
+        open_tab.assert_called_once_with("https://example.com/docs")
+        self.assertTrue(self.window._subtitle_mode_active)
+        display.anchorClicked.emit(QUrl("javascript:alert(1)"))
+        open_tab.assert_called_once()
+
+    def test_close_returns_to_empty_input_and_late_updates_keep_draft(self) -> None:
+        self.window.reply_close_button.click()
+        self.assertFalse(self.window._subtitle_mode_active)
+        self.assertTrue(self.window.subtitle_panel.isHidden())
+        self.assertFalse(self.window.transcript_area.isHidden())
+        self.assertFalse(self.window.transcript_area.isReadOnly())
+        self.assertEqual(self.window.transcript_area.toPlainText(), "")
+        self.window.transcript_area.setPlainText("Next question")
+        self.window.set_response_update("Writing…", "Late reply")
+        self.window.set_response_html("<p>Late reply</p>")
+        self.window.set_reading_subtitle({"text": "Late reply", "fraction": 0.5})
+        self.assertEqual(self.window.transcript_area.toPlainText(), "Next question")
+        self.assertTrue(self.window.subtitle_panel.isHidden())
+
+    def test_new_reply_clears_previous_html(self) -> None:
+        self.window.set_response_links((("Quest source", "https://example.com/source"),))
+        self.window.begin_response_display("Next question")
+        self.window.set_response_update("Writing…", "Next answer")
+        self.window._expand_subtitle()
+        self.assertEqual(self.window.subtitle_full_text.toPlainText(), "Next answer")
+        self.assertNotIn("example.com/docs", self.window.subtitle_full_text.toHtml())
+        self.assertNotIn("example.com/source", self.window.subtitle_full_text.toHtml())
+
+    @patch("live_gpt.app.webbrowser.open_new_tab")
+    def test_collected_sources_are_visible_clickable_and_not_in_subtitles(self, open_tab) -> None:
+        display = self.window.subtitle_full_text
+        reply_text = self.window._reading_full_text
+        self.window.set_response_links((("Forever +1", "https://example.com/quest"),))
+        QApplication.processEvents()
+        cursor = display.document().find("Forever +1")
+        self.assertFalse(cursor.isNull())
+        self.assertEqual(cursor.charFormat().anchorHref(), "https://example.com/quest")
+        cursor.setPosition(cursor.selectionStart() + 1)
+        QTest.mouseClick(display.viewport(), Qt.MouseButton.LeftButton, pos=display.cursorRect(cursor).center())
+        open_tab.assert_called_once_with("https://example.com/quest")
+        self.assertEqual(self.window._reading_full_text, reply_text)
+        self.assertNotIn("Forever", " ".join(self.window._subtitle_lines()))
+
+    def test_playback_progress_preserves_html_and_scroll_position(self) -> None:
+        self.window.set_response_html("<p>Paragraph</p>" * 100)
+        QApplication.processEvents()
+        display = self.window.subtitle_full_text
+        scrollbar = display.verticalScrollBar()
+        self.assertGreater(scrollbar.maximum(), 0)
+        scrollbar.setValue(scrollbar.maximum() // 2)
+        value, revision = scrollbar.value(), display.document().revision()
+        self.window.set_reading_subtitle({"text": "Paragraph\n" * 100, "fraction": 0.2})
+        self.assertEqual(display.document().revision(), revision)
+        self.assertEqual(scrollbar.value(), value)
+        self.assertTrue(self.window.reply_close_button.isVisible())
+
+    def test_macro_copy_button_copies_only_exact_code_and_keeps_reply_open(self) -> None:
+        macro = "#showtooltip 神圣打击\n/startattack\n/cast 神圣打击"
+        self.window.set_response_html('<p>Macro:</p><pre data-live-gpt-language="Plain text"><code>'
+                                      + macro + '</code></pre><p>Paste it into the game.</p>')
+        QApplication.processEvents()
+        display = self.window.subtitle_full_text
+        self.assertIn(macro, display.toPlainText())
+        self.assertEqual(len(display._copy_buttons), 1)
+        self.assertFalse(display.document().find("Plain text").charFormat().fontUnderline())
+        button = display._copy_buttons[0]
+        self.assertEqual(button.text(), "")
+        self.assertFalse(button.icon().isNull())
+        icon_before_copy = button.icon().cacheKey()
+        self.assertTrue(button.isVisible())
+        self.assertTrue(display.viewport().rect().contains(button.geometry().center()))
+        QApplication.clipboard().setText("Previous clipboard")
+        QTest.mouseClick(button, Qt.MouseButton.LeftButton)
+        self.assertEqual(QApplication.clipboard().text(), macro)
+        self.assertNotEqual(button.icon().cacheKey(), icon_before_copy)
+        self.assertTrue(self.window._subtitle_mode_active)
+        self.assertTrue(self.window.transcript_area.isHidden())
+
+    def test_multiple_code_blocks_copy_independently_and_updates_remove_old_buttons(self) -> None:
+        self.window.set_response_html('<pre><code>First\n  indented</code></pre>'
+                                      '<pre data-live-gpt-language="SQL"><code>SELECT 1;</code></pre>')
+        QApplication.processEvents()
+        display = self.window.subtitle_full_text
+        self.assertEqual(len(display._copy_buttons), 2)
+        display._copy_buttons[1].click()
+        self.assertEqual(QApplication.clipboard().text(), "SELECT 1;")
+        display._copy_buttons[0].click()
+        self.assertEqual(QApplication.clipboard().text(), "First\n  indented")
+        self.window.set_response_html('<pre><code>Updated</code></pre>')
+        self.assertEqual(len(display._copy_buttons), 1)
+        display._copy_buttons[0].click()
+        self.assertEqual(QApplication.clipboard().text(), "Updated")
+        self.window.begin_response_display("Next question")
+        self.assertEqual(display._copy_buttons, [])
+
+    def test_code_copy_button_moves_with_scrolling(self) -> None:
+        self.window.set_response_html('<p>Introduction</p>' * 30 + '<pre><code>copy me</code></pre>'
+                                      + '<p>Closing paragraph</p>' * 30)
+        QApplication.processEvents()
+        display = self.window.subtitle_full_text
+        button = display._copy_buttons[0]
+        cursor = display.document().find("copy me")
+        display.setTextCursor(cursor)
+        display.ensureCursorVisible()
+        QApplication.processEvents()
+        self.assertTrue(button.isVisible())
+        old_y = button.y()
+        scrollbar = display.verticalScrollBar()
+        scrollbar.setValue(scrollbar.value() + 20)
+        self.assertEqual(button.y(), old_y - 20)
 
 
 class SettingsDialogTests(unittest.TestCase):

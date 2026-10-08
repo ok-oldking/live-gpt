@@ -1,12 +1,16 @@
 """DOM regressions; run with LIVE_GPT_TEST_BROWSER=msedge (or chrome)."""
 from __future__ import annotations
 
+import base64
+import io
 import os
+from pathlib import Path
 import unittest
+import wave
 
 from playwright.sync_api import sync_playwright
 
-from live_gpt.browser import BrowserMonitor
+from live_gpt.browser import BrowserMonitor, _MEDIA_PROGRESS_SCRIPT, _MEDIA_TRACKER_SCRIPT
 
 
 @unittest.skipUnless(os.environ.get("LIVE_GPT_TEST_BROWSER"), "Browser channel not selected")
@@ -26,6 +30,202 @@ class BrowserLocalizationTests(unittest.TestCase):
     def setUp(self):
         self.page = self.browser.new_page()
         self.addCleanup(self.page.close)
+
+    def test_tab_discovery_works_with_frozen_chatgpt_renderer(self):
+        from live_gpt.browser import _MonitorState
+        from playwright.sync_api import Error
+
+        self.page.route('https://chatgpt.com/c/frozen-test', lambda route: route.fulfill(
+            body='<title>Frozen conversation</title><p>Reply</p>',
+        ))
+        self.page.goto('https://chatgpt.com/c/frozen-test')
+        session = self.page.context.new_cdp_session(self.page)
+        session.send('Page.setWebLifecycleState', {'state': 'frozen'})
+        try:
+            monitor = BrowserMonitor()
+            state = _MonitorState(browser=self.browser)
+            monitor._refresh_tabs(state, Error)
+            tab = next(tab for tab in state.last_tabs if tab['url'] == self.page.url)
+            self.assertEqual(tab['title'], 'Frozen conversation')
+            self.assertIs(state.browser, self.browser)
+        finally:
+            session.send('Page.setWebLifecycleState', {'state': 'active'})
+            session.detach()
+
+    def test_pasted_dil_citation_badges_are_excluded_from_subtitles_and_speech(self):
+        from unittest.mock import patch
+        from live_gpt.browser import _ActiveResponse, _MonitorState
+
+        reply = (Path(__file__).parent / "fixtures" / "chatgpt_citation_reply.html").read_text(encoding="utf-8")
+        self.page.set_content('<div data-turn-key="new"><div data-chatgpt-search-unit-key="new:assistant">'
+                              + reply + '</div><button aria-label="Copy response">Copy</button></div>')
+        snapshot = BrowserMonitor._response_snapshot(self.page, "old")
+        self.assertNotIn("Forever", snapshot.text)
+        self.assertNotIn("+1", snapshot.text)
+        self.assertNotIn("Forever", snapshot.html)
+        self.assertIn("下一个任务不是找他接", snapshot.text)
+        self.assertIn("<strong>", snapshot.html)
+        self.assertEqual(snapshot.html.count("<p>"), 3)
+        self.assertEqual(self.page.locator('[data-d-component="badge"]').count(), 2)
+        monitor = BrowserMonitor()
+        monitor.set_use_browser_voice(False)
+        speech, subtitles = [], []
+        monitor.local_voice_updated.connect(lambda text, final: speech.append((text, final)))
+        monitor.response_changed.connect(lambda _status, text: subtitles.append(text))
+        state = _MonitorState(active_response=_ActiveResponse(page=self.page, turn_marker_before="old", started_at=90))
+        with patch("live_gpt.browser.time.monotonic", return_value=100) as clock:
+            monitor._poll_active_response(state)
+            clock.return_value = 103
+            monitor._poll_active_response(state)
+        self.assertEqual(subtitles, [snapshot.text])
+        self.assertEqual(speech, [(snapshot.text, False), (snapshot.text, True)])
+
+    def test_reply_html_preserves_tables_links_and_formatting(self):
+        self.page.set_content('''<div data-turn-key="new">
+            <div data-markdown-text-style="assistant-message"><h2>Results</h2>
+            <p>Read <strong>these</strong> <a href="https://example.com/docs?x=1&amp;y=2">docs</a>.</p>
+            <table><tr><th>Name</th><th>Value</th></tr><tr><td>One</td><td>2</td></tr></table>
+            <ul><li>First</li><li>Second</li></ul><pre><code>x &lt; 2\nprint(x)</code></pre>
+            <p><a href="javascript:alert(1)">Bad link</a></p>
+            </div><button aria-label="Copy response">Copy</button></div>''')
+        snapshot = BrowserMonitor._response_snapshot(self.page, "old")
+        self.assertIn("<h2>Results</h2>", snapshot.html)
+        self.assertIn("<strong>these</strong>", snapshot.html)
+        self.assertIn('<a href="https://example.com/docs?x=1&amp;y=2" target="_blank"', snapshot.html)
+        self.assertIn("<table ", snapshot.html)
+        self.assertIn("<th>Name</th>", snapshot.html)
+        self.assertIn("<li>First</li>", snapshot.html)
+        self.assertIn("<pre><code>x &lt; 2\nprint(x)</code></pre>", snapshot.html)
+        self.assertNotIn("javascript:", snapshot.html)
+        self.assertIn("Name\tValue", snapshot.text)
+        self.assertNotIn("https://", snapshot.text)
+
+    def test_citation_links_are_kept_in_html_but_excluded_from_narration(self):
+        self.page.set_content('''<div data-markdown-text-style="assistant-message"><p>Reply text.
+            <span data-d-component="popover-trigger" role="button"><span data-d-component="badge" data-d-hoverable>
+            <a href="https://example.com/quest">Forever +1</a></span></span></p></div>''')
+        text, html = BrowserMonitor._response_content(self.page.locator('[data-markdown-text-style]'))
+        self.assertEqual(text, "Reply text.")
+        self.assertIn('href="https://example.com/quest"', html)
+        self.assertIn("Forever +1</a>", html)
+
+    def test_closed_citation_popover_source_props_become_links(self):
+        self.page.set_content('''<div data-markdown-text-style="assistant-message"><p>Reply text.
+            <span data-d-component="popover-trigger" role="button"><span data-d-component="badge" data-d-hoverable>
+            Forever +1</span></span></p></div>''')
+        self.page.locator('[data-d-component="popover-trigger"]').evaluate('''node => {
+            node.__reactFiber$fixture = {memoizedProps: {children: null}, return: {
+                memoizedProps: {citation: {sources: [{url: 'https://example.com/quest', title: 'Quest guide'},
+                    {url: 'https://example.org/quest', title: 'Another guide'}]}}
+            }};
+        }''')
+        text, html = BrowserMonitor._response_content(self.page.locator('[data-markdown-text-style]'))
+        self.assertEqual(text, "Reply text.")
+        self.assertIn('href="https://example.com/quest"', html)
+        self.assertIn('href="https://example.org/quest"', html)
+        self.assertIn("Quest guide</a>", html)
+
+    def test_citation_without_exposed_url_links_to_original_chat(self):
+        self.page.route('https://chatgpt.com/c/link-test', lambda route: route.fulfill(body='''
+            <div data-markdown-text-style="assistant-message"><p>Reply text.
+            <span data-d-component="popover-trigger" role="button"><span data-d-component="badge" data-d-hoverable>
+            Forever +1</span></span></p></div>'''))
+        self.page.goto('https://chatgpt.com/c/link-test')
+        text, html = BrowserMonitor._response_content(self.page.locator('[data-markdown-text-style]'))
+        self.assertEqual(text, "Reply text.")
+        self.assertIn('href="https://chatgpt.com/c/link-test"', html)
+        self.assertIn("Forever +1 (ChatGPT)</a>", html)
+
+    def test_regular_link_with_button_role_remains_clickable(self):
+        self.page.set_content('''<div class="markdown"><p>Read <a role="button" href="https://example.com/docs">docs</a>.</p></div>''')
+        text, html = BrowserMonitor._response_content(self.page.locator('.markdown'))
+        self.assertEqual(text, "Read docs.")
+        self.assertIn('href="https://example.com/docs"', html)
+
+    def test_read_aloud_tracker_follows_real_detached_audio_and_pauses(self):
+        buffer = io.BytesIO()
+        with wave.open(buffer, "wb") as audio:
+            audio.setnchannels(1)
+            audio.setsampwidth(2)
+            audio.setframerate(8000)
+            audio.writeframes(b"\x00\x00" * 24000)
+        url = "data:audio/wav;base64," + base64.b64encode(buffer.getvalue()).decode()
+        self.page.evaluate(_MEDIA_TRACKER_SCRIPT)
+        self.page.evaluate("url => { window.audio = new Audio(url); return audio.play(); }", url)
+        self.page.wait_for_function("audio.currentTime > 0.2")
+        media = self.page.evaluate(_MEDIA_PROGRESS_SCRIPT)
+        self.assertEqual(media["playCount"], 1)
+        self.assertEqual(media["mediaCount"], 1)
+        self.assertGreater(media["playedTime"], 0.1)
+        self.assertAlmostEqual(media["duration"], 3)
+        self.page.evaluate("audio.pause()")
+        paused = self.page.evaluate(_MEDIA_PROGRESS_SCRIPT)
+        self.page.wait_for_timeout(150)
+        self.assertAlmostEqual(self.page.evaluate(_MEDIA_PROGRESS_SCRIPT)["playedTime"],
+                               paused["playedTime"])
+        self.page.evaluate("audio.play()")
+        self.page.wait_for_function("audio.currentTime > 0.5")
+        resumed = self.page.evaluate(_MEDIA_PROGRESS_SCRIPT)
+        self.assertEqual(resumed["playCount"], 2)
+        self.assertEqual(resumed["mediaCount"], 1)
+        self.assertGreater(resumed["playedTime"], paused["playedTime"])
+        # A new reading in the same tab must not reuse the previous clock.
+        self.page.evaluate("audio.pause()")
+        self.page.evaluate(_MEDIA_TRACKER_SCRIPT)
+        self.assertIsNone(self.page.evaluate(_MEDIA_PROGRESS_SCRIPT))
+        self.page.evaluate("audio.currentTime = 0; audio.play()")
+        self.page.wait_for_function("audio.currentTime > 0.1")
+        restarted = self.page.evaluate(_MEDIA_PROGRESS_SCRIPT)
+        self.assertEqual(restarted["playCount"], 1)
+        self.assertEqual(restarted["mediaCount"], 1)
+        self.assertLess(restarted["playedTime"], resumed["playedTime"])
+
+    def test_read_aloud_tracker_accumulates_detached_chunks_between_polls(self):
+        # Controlled positions allow several chunks to finish without a Python poll.
+        self.page.evaluate("""() => {
+            HTMLMediaElement.prototype.play = function() { return Promise.resolve(); };
+            window.makeChunk = () => {
+                const audio = new Audio();
+                audio.position = 0;
+                Object.defineProperty(audio, 'currentTime', {get: () => audio.position});
+                return audio;
+            };
+        }""")
+        self.page.evaluate(_MEDIA_TRACKER_SCRIPT)
+        self.page.evaluate("""() => {
+            const first = makeChunk();
+            first.play();
+            first.position = 4;
+            first.dispatchEvent(new Event('ended'));
+            const second = makeChunk();
+            second.play();
+            second.position = 3;
+            second.dispatchEvent(new Event('ended'));
+            const third = makeChunk();
+            third.play();
+            third.position = 2;
+        }""")
+        progress = self.page.evaluate(_MEDIA_PROGRESS_SCRIPT)
+        self.assertEqual(progress["playCount"], 3)
+        self.assertEqual(progress["mediaCount"], 3)
+        self.assertEqual(progress["playedTime"], 9)
+
+    def test_read_aloud_tracker_does_not_trust_a_growing_stream_duration(self):
+        self.page.evaluate(_MEDIA_TRACKER_SCRIPT)
+        self.page.evaluate("""() => {
+            window.stream = new MediaSource();
+            window.audio = new Audio(URL.createObjectURL(stream));
+            window.__liveGptReadAloudTracker.media = audio;
+            audio.load();
+        }""")
+        self.page.wait_for_function("stream.readyState === 'open'")
+        self.assertFalse(self.page.evaluate(_MEDIA_PROGRESS_SCRIPT)["durationIsFinal"])
+        # With no encoded buffers the source closes on the next browser task;
+        # inspect the completed stream in the same task as endOfStream().
+        completed = self.page.evaluate(
+            "() => { stream.endOfStream(); return (" + _MEDIA_PROGRESS_SCRIPT + ")(); }"
+        )
+        self.assertTrue(completed["durationIsFinal"])
 
     def test_work_usage_banner_keeps_reset_details_and_omits_action_buttons(self):
         title = "You’ve reached your 5-hour Work usage limit"
@@ -435,6 +635,20 @@ class BrowserLocalizationTests(unittest.TestCase):
                 self.assertEqual(
                     self.page.locator('[data-markdown-copy="exclude"]').count(), 1
                 )
+
+    def test_browser_code_card_preserves_macro_lines_and_language_for_copy(self):
+        from live_gpt.response_content import reply_code_blocks
+
+        reply = (Path(__file__).parent / "fixtures" / "chatgpt_code_reply.html").read_text(encoding="utf-8")
+        self.page.set_content(reply)
+        text, html = BrowserMonitor._response_content(self.page.locator('.markdown'))
+        _formatted, blocks = reply_code_blocks(html, "Plain text")
+        self.assertEqual(blocks, [("Plain text", "#showtooltip 神圣打击\n/startattack\n/cast 神圣打击")])
+        self.assertNotIn("Plain text", text)
+        self.assertNotIn("Wrap", text)
+        self.assertNotIn("Copy", text)
+        self.assertIn("/startattack\n/cast 神圣打击", text)
+        self.assertEqual(self.page.locator('button[aria-label="Copy"]').count(), 1)
 
     def test_completion_and_read_aloud_menu_in_each_language(self):
         for copy, more, read in (
