@@ -66,6 +66,10 @@ class _UsageLimitError(RuntimeError):
     """ChatGPT cannot accept the prompt until its usage allowance resets."""
 
 
+class _DictationStartCancelled(RuntimeError):
+    """The hold ended before browser dictation finished starting."""
+
+
 def _label_selectors(element: str, *labels: str) -> str:
     """Match localized controls when ChatGPT exposes no stable test ID."""
     return ", ".join(f'{element}[aria-label="{label}"]' for label in labels)
@@ -253,6 +257,8 @@ class _AttachmentRequest:
 class _DictationRequest:
     action: str
     tab_id: str
+    screenshot_webp: bytes | None = None
+    cancelled: threading.Event | None = None
 
 
 @dataclass(frozen=True)
@@ -338,6 +344,7 @@ class BrowserMonitor(QThread):
         self._clear_requests: Queue[_ClearRequest] = Queue()
         self._wake_event = threading.Event()
         self._dictation_initial_text: dict[str, str] = {}
+        self._dictation_start_cancelled: threading.Event | None = None
         self._last_status = ""
         self._use_browser_voice = True
 
@@ -407,11 +414,18 @@ class BrowserMonitor(QThread):
         self._attachment_requests.put(_AttachmentRequest("clear", tab_id))
         self._wake_event.set()
 
-    def request_start_dictation(self, tab_id: str) -> None:
+    def request_start_dictation(
+        self, tab_id: str, screenshot_webp: bytes | None = None,
+    ) -> threading.Event:
+        cancelled = threading.Event()
         self._dictation_requests.put(
-            _DictationRequest(action="start", tab_id=tab_id)
+            _DictationRequest(
+                action="start", tab_id=tab_id, screenshot_webp=screenshot_webp,
+                cancelled=cancelled,
+            )
         )
         self._wake_event.set()
+        return cancelled
 
     def request_finish_dictation(self, tab_id: str) -> None:
         self._dictation_requests.put(
@@ -812,6 +826,10 @@ class BrowserMonitor(QThread):
             except Empty:
                 return
 
+            if request.action == "start" and request.cancelled is not None and request.cancelled.is_set():
+                self.dictation_finished.emit(True, "", "Dictation cancelled")
+                continue
+
             if browser is None:
                 self._emit_dictation_failure(
                     request.action,
@@ -831,11 +849,30 @@ class BrowserMonitor(QThread):
                 )
                 continue
 
+            initial_text = ""
+            screenshot_pasted = False
+            start_attempted = False
             try:
                 if request.action == "start":
+                    self._dictation_start_cancelled = request.cancelled
+                    self._check_dictation_start_cancelled()
                     self._cancel_existing_dictation(page)
+                    # Clear a previous prompt's screenshot before installing
+                    # this one; attachment requests use a separate queue.
+                    self._process_attachment_requests(browser, playwright_error)
+                    self._check_dictation_start_cancelled()
                     initial_text = self._read_composer_text(page)
+                    if request.screenshot_webp is not None:
+                        self._check_dictation_start_cancelled()
+                        self._clear_chatgpt_attachments(page)
+                        self._check_dictation_start_cancelled()
+                        screenshot_pasted = True
+                        self._paste_screenshot(page, request.screenshot_webp)
+                        self._wait_for_screenshot_attachment(page)
+                    self._check_dictation_start_cancelled()
+                    start_attempted = True
                     self._start_browser_dictation(page)
+                    self._check_dictation_start_cancelled()
                     self._dictation_initial_text[request.tab_id] = initial_text
                     self.dictation_started.emit(
                         True,
@@ -870,14 +907,44 @@ class BrowserMonitor(QThread):
                         "Dictation cancelled",
                     )
             except Exception as error:
+                if request.action == "start" and (
+                    isinstance(error, _DictationStartCancelled)
+                    or (request.cancelled is not None and request.cancelled.is_set())
+                ):
+                    try:
+                        if not self._stop_requested:
+                            if start_attempted and self._cancel_existing_dictation(page):
+                                composer = page.locator(CHATGPT_COMPOSER_SELECTOR).first
+                                composer.fill(initial_text, timeout=5_000)
+                            if screenshot_pasted:
+                                self._clear_chatgpt_attachments(page)
+                    except Exception as cleanup_error:
+                        logger.error("Unable to cancel browser dictation startup", cleanup_error)
+                        self._emit_dictation_failure(
+                            "start", f"Could not cancel browser dictation: {cleanup_error}",
+                        )
+                    else:
+                        self.dictation_finished.emit(True, initial_text, "Dictation cancelled")
+                    continue
                 logger.error(
                     f"Unable to {request.action} browser dictation",
                     error,
                 )
+                if not self._stop_requested and (
+                    start_attempted or request.action in ("finish", "cancel")
+                ):
+                    try:
+                        if self._cancel_existing_dictation(page):
+                            composer = page.locator(CHATGPT_COMPOSER_SELECTOR).first
+                            composer.fill(initial_text, timeout=5_000)
+                    except Exception as cleanup_error:
+                        logger.warning(f"Could not reset browser dictation after failure: {cleanup_error}")
                 self._emit_dictation_failure(
                     request.action,
                     f"Could not {request.action} browser dictation: {error}",
                 )
+            finally:
+                self._dictation_start_cancelled = None
 
     def _emit_dictation_failure(self, action: str, message: str) -> None:
         if action == "start":
@@ -1449,7 +1516,10 @@ class BrowserMonitor(QThread):
             '[data-composer-attachments]:visible, '
             'form [class*="group/composer-attachment"]:visible'
         ).evaluate_all("""elements => {
-            if (!elements.length) return 'missing';
+            if (!elements.length || elements.every(element =>
+                element.matches('[data-composer-attachments]')
+                && !element.childElementCount && !element.textContent.trim()
+            )) return 'missing';
             const text = elements.map(element => element.textContent || '').join(' ');
             if (/upload failed|failed to upload|上传失败|上傳失敗/i.test(text)) return 'failed';
             if (/uploading|正在上传|正在上傳/i.test(text) || elements.some(element =>
@@ -1475,6 +1545,25 @@ class BrowserMonitor(QThread):
                 return
             page.wait_for_timeout(250)
         raise RuntimeError("Screenshot upload timed out")
+
+    def _wait_for_screenshot_attachment(self, page: Any) -> None:
+        """Confirm the image appeared before switching the composer to dictation."""
+        deadline = time.monotonic() + 10
+        with self._browser_operation(10):
+            for _ in range(50):
+                self._check_dictation_start_cancelled()
+                if time.monotonic() >= deadline:
+                    break
+                usage_error = self._usage_limit_message(page)
+                if usage_error:
+                    raise _UsageLimitError(usage_error)
+                state = self._screenshot_upload_state(page)
+                if state in ("pending", "ready"):
+                    return
+                if state == "failed":
+                    raise RuntimeError("Screenshot upload failed")
+                page.wait_for_timeout(200)
+        raise RuntimeError("Screenshot attachment did not appear")
 
     @classmethod
     def _ensure_screenshot_uploaded(
@@ -1537,23 +1626,54 @@ class BrowserMonitor(QThread):
         )
         return str(text or "").strip()
 
+    def _check_dictation_start_cancelled(self) -> None:
+        if self._stop_requested or (
+            self._dictation_start_cancelled is not None
+            and self._dictation_start_cancelled.is_set()
+        ):
+            raise _DictationStartCancelled("Dictation cancelled")
+
+    def _click_dictation_control(
+        self, page: Any, button: Any, *, starting: bool = False,
+    ) -> None:
+        """Click a ready dictation control even while its layout is animating."""
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if starting:
+                self._check_dictation_start_cancelled()
+            elif self._stop_requested:
+                raise RuntimeError("Dictation cancelled")
+            if button.evaluate("""element =>
+                !!element.getClientRects().length && !element.disabled
+                && !element.closest('[inert], [aria-disabled="true"]')
+                && element.getAttribute('aria-busy') !== 'true'
+            """):
+                if starting:
+                    self._check_dictation_start_cancelled()
+                # Upload animations can keep the button moving. Readiness is
+                # checked above; force skips the layout-stability wait while
+                # preserving a real pointer click for microphone activation.
+                button.click(timeout=1_000, force=True, no_wait_after=True)
+                return
+            page.wait_for_timeout(100)
+        raise RuntimeError("ChatGPT's dictation control is not ready")
+
     def _start_browser_dictation(self, page: Any) -> None:
+        self._check_dictation_start_cancelled()
         button = self._first_visible_locator(
-            page,
-            DICTATION_START_SELECTORS,
-            timeout=5_000,
+            page, DICTATION_START_SELECTORS, timeout=5_000,
         )
+        self._check_dictation_start_cancelled()
         if button is None:
             raise RuntimeError("ChatGPT's dictation microphone was not found")
-        # The composer can schedule unrelated navigation after this click.
-        # Confirm listening through the dictation controls below instead.
-        button.click(timeout=5_000, no_wait_after=True)
+        self._click_dictation_control(page, button, starting=True)
 
         end_button = self._first_visible_locator(
             page,
             DICTATION_END_SELECTORS,
             timeout=10_000,
         )
+        self._check_dictation_start_cancelled()
         if end_button is None:
             if self._stop_requested:
                 raise RuntimeError("Dictation cancelled")
@@ -1571,7 +1691,7 @@ class BrowserMonitor(QThread):
             return False
 
         logger.info("Cancelling stale ChatGPT dictation before starting")
-        cancel_button.click(timeout=5_000, no_wait_after=True)
+        self._click_dictation_control(page, cancel_button)
         if not self._wait_for_dictation_controls_hidden(page):
             raise RuntimeError("ChatGPT's stale dictation did not cancel")
         return True
@@ -1593,7 +1713,7 @@ class BrowserMonitor(QThread):
                 timeout=2_000,
             )
         if button is not None:
-            button.click(timeout=5_000, no_wait_after=True)
+            self._click_dictation_control(page, button)
             if not self._wait_for_dictation_controls_hidden(page):
                 raise RuntimeError("ChatGPT's dictation did not cancel")
         elif not self._stop_requested:
@@ -1630,7 +1750,7 @@ class BrowserMonitor(QThread):
             if self._stop_requested:
                 return initial_text
             raise RuntimeError("ChatGPT's dictation Done button was not found")
-        button.click(timeout=5_000, no_wait_after=True)
+        self._click_dictation_control(page, button)
 
         initial_text = initial_text.strip()
         text = initial_text
@@ -1699,6 +1819,8 @@ class BrowserMonitor(QThread):
     ) -> Any | None:
         deadline = time.monotonic() + timeout / 1_000
         while time.monotonic() < deadline and not self._stop_requested:
+            if self._dictation_start_cancelled is not None and self._dictation_start_cancelled.is_set():
+                return None
             for selector in selectors:
                 locator = page.locator(selector).last
                 if self._locator_is_visible(locator):

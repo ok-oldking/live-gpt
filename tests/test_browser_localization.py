@@ -834,6 +834,105 @@ class BrowserLocalizationTests(unittest.TestCase):
         self.assertEqual(monitor._cancel_browser_dictation(self.page, "原文"), "原文")
         self.assertIsNone(self.page.evaluate("window.wrongControl"))
 
+    def test_screenshot_upload_starts_before_dictation_click(self):
+        from playwright.sync_api import Error
+
+        self.page.set_content('''<form onsubmit="return false">
+            <div id="prompt-textarea" contenteditable="true">Original text</div>
+            <div data-composer-attachments></div>
+            <input type="file" accept="image/*" onchange="
+                window.events.push('file-selected');
+                setTimeout(() => {
+                    document.querySelector('[data-composer-attachments]').innerHTML =
+                        '<span class=&quot;group/composer-attachment&quot;><span role=&quot;progressbar&quot;>Uploading</span></span>';
+                    window.events.push('upload-started');
+                }, 800)">
+            <button type="button" aria-label="Dictate" onclick="
+                window.events.push('dictation-started');
+                window.uploadStateAtClick = !!document.querySelector('[role=progressbar]');
+                this.hidden=true; document.querySelector('#done').hidden=false">Dictate</button>
+            <button type="button" id="done" aria-label="Stop dictation" hidden>Stop</button>
+        </form>''')
+        self.page.evaluate("window.events=[]")
+        monitor = BrowserMonitor()
+        self.assertEqual(monitor._screenshot_upload_state(self.page), "missing")
+        results = []
+        monitor.dictation_started.connect(lambda *args: results.append(args))
+        # Page lookup uses the URL as well as the identity. Route a local
+        # ChatGPT fixture so this test needs no account or microphone.
+        html = self.page.content()
+        self.page.route("https://chatgpt.com/c/dictation-order", lambda route: route.fulfill(
+            body=html, content_type="text/html",
+        ))
+        self.page.goto("https://chatgpt.com/c/dictation-order")
+        self.page.evaluate("window.events=[]")
+        monitor.request_start_dictation(str(id(self.page)), b"screenshot")
+        monitor._process_dictation_requests(self.browser, Error)
+        self.assertEqual(self.page.evaluate("window.events"), [
+            "file-selected", "upload-started", "dictation-started",
+        ])
+        self.assertTrue(self.page.evaluate("window.uploadStateAtClick"))
+        self.assertEqual(results, [(True, "Browser dictation is listening")])
+        self.assertEqual(monitor._dictation_initial_text[str(id(self.page))], "Original text")
+
+    def test_moving_microphone_waits_for_readiness_and_starts_once(self):
+        self.page.set_content('''<style>
+            @keyframes slide { from { transform:translateX(0) } to { transform:translateX(300px) } }
+            #mic { animation:slide 10s linear infinite }
+        </style><form onsubmit="return false">
+            <button type="button" id="mic" aria-label="Dictate" aria-busy="true" disabled onclick="
+                window.clickCount++; window.busyAtClick=this.getAttribute('aria-busy');
+                this.hidden=true; document.querySelector('#done').hidden=false">Dictate</button>
+            <button type="button" id="done" aria-label="Stop dictation" hidden>Stop</button>
+        </form>''')
+        self.page.evaluate('''() => {
+            window.clickCount=0;
+            setTimeout(() => {
+                const mic=document.querySelector('#mic');
+                mic.disabled=false; mic.setAttribute('aria-busy', 'false');
+            }, 350);
+        }''')
+        monitor = BrowserMonitor()
+        monitor._start_browser_dictation(self.page)
+        self.assertEqual(self.page.evaluate("window.clickCount"), 1)
+        self.assertEqual(self.page.evaluate("window.busyAtClick"), "false")
+
+    def test_release_while_screenshot_is_preparing_never_clicks_microphone(self):
+        from unittest.mock import patch
+        from playwright.sync_api import Error
+
+        html = '''<form onsubmit="return false">
+            <div id="prompt-textarea" contenteditable="true">Keep this text</div>
+            <div data-composer-attachments></div>
+            <input type="file" accept="image/*" onchange="
+                document.querySelector('[data-composer-attachments]').innerHTML =
+                    '<span class=&quot;group/composer-attachment&quot;>Uploading'
+                    + '<button type=&quot;button&quot; aria-label=&quot;Remove attachment&quot; onclick=&quot;this.parentElement.remove()&quot;>X</button></span>'">
+            <button type="button" aria-label="Dictate" onclick="window.clickCount++">Dictate</button>
+        </form>'''
+        self.page.route("https://chatgpt.com/c/cancel-start", lambda route: route.fulfill(
+            body=html, content_type="text/html",
+        ))
+        self.page.goto("https://chatgpt.com/c/cancel-start")
+        self.page.evaluate("window.clickCount=0")
+        monitor = BrowserMonitor()
+        finished, started = [], []
+        monitor.dictation_finished.connect(lambda *args: finished.append(args))
+        monitor.dictation_started.connect(lambda *args: started.append(args))
+        cancelled = monitor.request_start_dictation(str(id(self.page)), b"screenshot")
+        paste = monitor._paste_screenshot
+
+        def release_during_paste(page, screenshot):
+            paste(page, screenshot)
+            cancelled.set()
+
+        with patch.object(monitor, "_paste_screenshot", side_effect=release_during_paste):
+            monitor._process_dictation_requests(self.browser, Error)
+        self.assertEqual(self.page.evaluate("window.clickCount"), 0)
+        self.assertEqual(monitor._screenshot_upload_state(self.page), "missing")
+        self.assertEqual(started, [])
+        self.assertEqual(finished, [(True, "Keep this text", "Dictation cancelled")])
+
     def test_empty_dictation_finishes_when_idle_microphone_returns(self):
         from unittest.mock import patch
 
@@ -952,7 +1051,10 @@ class BrowserLocalizationTests(unittest.TestCase):
         fixtures = Path(__file__).parent / "fixtures"
         idle = (fixtures / "chatgpt_dictate_controls.html").read_text(encoding="utf-8")
         active = (fixtures / "chatgpt_active_dictation_controls.html").read_text(encoding="utf-8")
-        self.page.set_content('<form onsubmit="return false">'
+        self.page.set_content('''<style>
+            @keyframes moveControls { from { transform:translateX(0) } to { transform:translateX(200px) } }
+            #active button { animation:moveControls 10s linear infinite }
+            </style><form onsubmit="return false">'''
             '<div id="prompt-textarea" contenteditable="true">Original text</div>'
             + idle + '<div id="active" hidden>' + active + '</div></form>'
             '<button aria-label="Done" onclick="window.wrongControl=true">Unrelated Done</button>')
@@ -961,14 +1063,27 @@ class BrowserLocalizationTests(unittest.TestCase):
             window.wrongControl = false;
             document.querySelector('[aria-label="Dictate"]').onclick = () => {
                 document.querySelector('#active').hidden = false;
+                for (const label of ['Stop dictation', 'Cancel dictation']) {
+                    const button = document.querySelector(`[aria-label="${label}"]`);
+                    button.disabled = true;
+                    button.setAttribute('aria-busy', 'true');
+                    setTimeout(() => {
+                        button.disabled = false;
+                        button.setAttribute('aria-busy', 'false');
+                    }, 300);
+                }
             };
             document.querySelector('[aria-label="Stop dictation"]').onclick = () => {
+                window.stopCount = (window.stopCount || 0) + 1;
+                window.stopWasBusy = document.querySelector('[aria-label="Stop dictation"]').getAttribute('aria-busy');
                 document.querySelector('#active').hidden = true;
                 setTimeout(() => {
                     document.querySelector('#prompt-textarea').textContent = 'Original text with transcription';
                 }, 400);
             };
             document.querySelector('[aria-label="Cancel dictation"]').onclick = () => {
+                window.cancelCount = (window.cancelCount || 0) + 1;
+                window.cancelWasBusy = document.querySelector('[aria-label="Cancel dictation"]').getAttribute('aria-busy');
                 document.querySelector('#active').hidden = true;
             };
             document.querySelector('[aria-label="Transcribe and send"]').onclick = () => {
@@ -987,6 +1102,10 @@ class BrowserLocalizationTests(unittest.TestCase):
         self.assertEqual(monitor._cancel_browser_dictation(self.page, "Original text"), "Original text")
         self.assertFalse(self.page.evaluate('window.sentEarly'))
         self.assertFalse(self.page.evaluate('window.wrongControl'))
+        self.assertEqual(self.page.evaluate('window.stopCount'), 1)
+        self.assertEqual(self.page.evaluate('window.cancelCount'), 1)
+        self.assertEqual(self.page.evaluate('window.stopWasBusy'), 'false')
+        self.assertEqual(self.page.evaluate('window.cancelWasBusy'), 'false')
 
     def test_chinese_attachment_removal(self):
         self.page.set_content('''

@@ -4922,6 +4922,8 @@ class TrayController:
         self._dictation_listening_since: float | None = None
         self._dictation_press_generation = 0
         self._dictation_attachment_tab_id: str | None = None
+        self._browser_dictation_start_requested = False
+        self._browser_dictation_start_cancelled: threading.Event | None = None
         self._pending_dictation_capture: _PendingDictationCapture | None = None
         self._hotkey_sequences = self._load_hotkey_sequences()
         bindings = self._bindings_for_sequences(self._hotkey_sequences)
@@ -5555,14 +5557,23 @@ class TrayController:
         logger.info(f"Starting ChatGPT dictation tab_id={tab_id!r}")
         self.dictation_tab_id = tab_id
         self._dictation_state = "starting"
+        self._browser_dictation_start_requested = False
+        self._browser_dictation_start_cancelled = None
         self._dictation_listening_since = None
         self.window.begin_dictation_waiting()
         self.window.set_microphone_state(
             "recording",
             tr("Waiting for the browser to start listening…"),
         )
-        self._schedule_dictation_screenshot_upload()
-        self.browser_monitor.request_start_dictation(tab_id)
+        selected_source = self.window.capture_source_combo.currentData()
+        if include_screenshot and isinstance(selected_source, CaptureSource):
+            self._schedule_dictation_screenshot_upload(before_browser_dictation=True)
+        else:
+            self._pending_dictation_capture = _PendingDictationCapture(
+                source=None, screenshot=None,
+            )
+            self._browser_dictation_start_requested = True
+            self._browser_dictation_start_cancelled = self.browser_monitor.request_start_dictation(tab_id)
 
     def _stop_reply_playback(self) -> None:
         self._local_voice_interrupted = True
@@ -5583,19 +5594,51 @@ class TrayController:
             worker.request_stop()
             self.window.finish_reading(False, tr("Playback stopped for recording"))
 
-    def _schedule_dictation_screenshot_upload(self) -> None:
+    def _schedule_dictation_screenshot_upload(
+        self, *, before_browser_dictation: bool = False,
+    ) -> None:
         generation = self._dictation_press_generation
         pressed_since = self._dictation_pressed_since or time.monotonic()
         remaining_ms = max(
             0,
             round((0.5 - (time.monotonic() - pressed_since)) * 1_000),
         )
+        on_hold = (
+            self._prepare_browser_dictation_after_hold
+            if before_browser_dictation
+            else self._upload_dictation_screenshot_after_hold
+        )
         QTimer.singleShot(
             remaining_ms,
-            lambda: self._upload_dictation_screenshot_after_hold(generation),
+            lambda: on_hold(generation),
         )
 
-    def _upload_dictation_screenshot_after_hold(self, generation: int) -> None:
+    def _prepare_browser_dictation_after_hold(self, generation: int) -> None:
+        if (
+            generation != getattr(self, "_dictation_press_generation", 0)
+            or not getattr(self, "_dictation_input_held", False)
+            or getattr(self, "_dictation_state", "idle") != "starting"
+            or self._browser_dictation_start_requested
+        ):
+            return
+        self._upload_dictation_screenshot_after_hold(generation, queue_upload=False)
+        capture = self._pending_dictation_capture
+        if capture is not None and capture.error is not None:
+            self._on_dictation_started(
+                False,
+                tr("Could not capture screenshot before dictation: {error}", error=capture.error),
+            )
+            return
+        self._browser_dictation_start_requested = True
+        screenshot = capture.screenshot if capture is not None else None
+        if screenshot is None:
+            self._browser_dictation_start_cancelled = self.browser_monitor.request_start_dictation(self.dictation_tab_id)
+        else:
+            self._browser_dictation_start_cancelled = self.browser_monitor.request_start_dictation(self.dictation_tab_id, screenshot)
+
+    def _upload_dictation_screenshot_after_hold(
+        self, generation: int, *, queue_upload: bool = True,
+    ) -> None:
         if (
             generation != getattr(self, "_dictation_press_generation", 0)
             or not getattr(self, "_dictation_input_held", False)
@@ -5620,7 +5663,10 @@ class TrayController:
             )
             return
 
-        tab_id = self.selected_chatgpt_tab_id
+        tab_id = (
+            self.selected_chatgpt_tab_id
+            if queue_upload else self.dictation_tab_id
+        )
         if tab_id is None:
             return
         try:
@@ -5646,7 +5692,8 @@ class TrayController:
             "Captured and queued dictation screenshot after 0.5-second hold "
             f"source={source.key!r} tab_id={tab_id!r}"
         )
-        self.browser_monitor.request_replace_attachment(tab_id, screenshot)
+        if queue_upload:
+            self.browser_monitor.request_replace_attachment(tab_id, screenshot)
 
     def _discard_preuploaded_dictation_screenshot(self) -> None:
         tab_id = getattr(self, "_dictation_attachment_tab_id", None)
@@ -5717,6 +5764,12 @@ class TrayController:
             if local_thread is not None:
                 self._dictation_state = "cancelling"
                 local_thread.stop_recording(cancel=True)
+            elif getattr(self, "_browser_dictation_start_cancelled", None) is not None:
+                self._dictation_state = "cancelling"
+                self._browser_dictation_start_cancelled.set()
+            elif not getattr(self, "_browser_dictation_start_requested", False):
+                self._dictation_state = "cancelling"
+                self._on_dictation_finished(True, "", tr("Dictation cancelled"))
             return
         if state != "listening":
             return
@@ -5764,11 +5817,21 @@ class TrayController:
     def _on_dictation_started(self, success: bool, message: str) -> None:
         if success:
             if (
+                self.dictation_tab_id is not None
+                and getattr(self, "_dictation_state", "idle") == "cancelling"
+                and getattr(self, "_browser_dictation_start_cancelled", None) is not None
+            ):
+                # The worker may have emitted success just before release
+                # set its cancellation event. Stop that listening session.
+                self.browser_monitor.request_cancel_dictation(self.dictation_tab_id)
+                return
+            if (
                 self.dictation_tab_id is None
                 or getattr(self, "_dictation_state", "idle") != "starting"
             ):
                 return
             self._dictation_state = "listening"
+            self._browser_dictation_start_cancelled = None
             self._dictation_listening_since = time.monotonic()
             if not getattr(self, "_dictation_input_held", False):
                 self._cancel_dictation(self.dictation_tab_id)
@@ -5778,6 +5841,7 @@ class TrayController:
             return
 
         self._dictation_state = "idle"
+        self._browser_dictation_start_cancelled = None
         self._dictation_input_held = False
         self._dictation_pressed_since = None
         self._dictation_listening_since = None
@@ -5802,6 +5866,7 @@ class TrayController:
             else 0.0
         )
         self._dictation_state = "idle"
+        self._browser_dictation_start_cancelled = None
         self._dictation_pressed_since = None
         self._dictation_listening_since = None
         self.dictation_tab_id = None

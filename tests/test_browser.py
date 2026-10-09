@@ -1131,12 +1131,156 @@ class BrowserMonitorTests(unittest.TestCase):
         monitor._process_dictation_requests(browser, FakePlaywrightError)
 
         page.bring_to_front.assert_not_called()
-        microphone.click.assert_called_once_with(timeout=5_000, no_wait_after=True)
+        microphone.click.assert_called_once_with(timeout=1_000, force=True, no_wait_after=True)
         self.assertEqual(
             monitor._dictation_initial_text[str(id(page))],
             "Existing text",
         )
         self.assertEqual(results, [(True, "Browser dictation is listening")])
+
+    def test_dictation_pastes_screenshot_and_waits_for_upload_to_start_before_microphone(self) -> None:
+        monitor = BrowserMonitor()
+        page = Mock(url="https://chatgpt.com/c/conversation")
+        page.is_closed.return_value = False
+        browser = Mock(contexts=[Mock(pages=[page])])
+        events = []
+        states = iter(("missing", "pending"))
+        results = []
+        monitor.dictation_started.connect(lambda *args: results.append(args))
+
+        def upload_state(page: Mock) -> str:
+            state = next(states)
+            events.append(state)
+            return state
+
+        with (
+            patch.object(monitor, "_cancel_existing_dictation"),
+            patch.object(monitor, "_read_composer_text", return_value="Original text"),
+            patch.object(monitor, "_clear_chatgpt_attachments", side_effect=lambda _page: events.append("clear")),
+            patch.object(monitor, "_paste_screenshot", side_effect=lambda _page, _bytes: events.append("paste")) as paste,
+            patch.object(monitor, "_usage_limit_message", return_value=""),
+            patch.object(monitor, "_screenshot_upload_state", side_effect=upload_state),
+            patch.object(monitor, "_start_browser_dictation", side_effect=lambda _page: events.append("start")),
+        ):
+            monitor.request_clear_attachments(str(id(page)))
+            monitor.request_start_dictation(str(id(page)), b"screenshot")
+            monitor._process_dictation_requests(browser, FakePlaywrightError)
+            monitor._process_attachment_requests(browser, FakePlaywrightError)
+        self.assertEqual(events, ["clear", "clear", "paste", "missing", "pending", "start"])
+        paste.assert_called_once_with(page, b"screenshot")
+        self.assertEqual(results, [(True, "Browser dictation is listening")])
+        self.assertEqual(monitor._dictation_initial_text[str(id(page))], "Original text")
+
+    def test_failed_or_missing_screenshot_does_not_start_microphone(self) -> None:
+        for state, error in (("failed", "Screenshot upload failed"), ("missing", "Screenshot attachment did not appear")):
+            with self.subTest(state=state):
+                monitor = BrowserMonitor()
+                page = Mock(url="https://chatgpt.com/c/conversation")
+                page.is_closed.return_value = False
+                browser = Mock(contexts=[Mock(pages=[page])])
+                results = []
+                monitor.dictation_started.connect(lambda *args: results.append(args))
+                with (
+                    patch.object(monitor, "_cancel_existing_dictation"),
+                    patch.object(monitor, "_read_composer_text", return_value=""),
+                    patch.object(monitor, "_clear_chatgpt_attachments"),
+                    patch.object(monitor, "_paste_screenshot"),
+                    patch.object(monitor, "_usage_limit_message", return_value=""),
+                    patch.object(monitor, "_screenshot_upload_state", return_value=state),
+                    patch.object(monitor, "_start_browser_dictation") as start,
+                ):
+                    monitor.request_start_dictation(str(id(page)), b"screenshot")
+                    monitor._process_dictation_requests(browser, FakePlaywrightError)
+                start.assert_not_called()
+                self.assertEqual(results, [(False, f"Could not start browser dictation: {error}")])
+
+    def test_screenshot_attachment_wait_accepts_already_uploaded_image(self) -> None:
+        monitor = BrowserMonitor()
+        page = Mock()
+        with (
+            patch.object(monitor, "_usage_limit_message", return_value=""),
+            patch.object(monitor, "_screenshot_upload_state", return_value="ready"),
+        ):
+            monitor._wait_for_screenshot_attachment(page)
+        page.wait_for_timeout.assert_not_called()
+
+    def test_cancelled_queued_start_does_not_touch_browser(self) -> None:
+        monitor = BrowserMonitor()
+        browser = Mock()
+        results = []
+        monitor.dictation_finished.connect(lambda *args: results.append(args))
+        cancelled = monitor.request_start_dictation("tab", b"screenshot")
+        cancelled.set()
+        monitor._process_dictation_requests(browser, FakePlaywrightError)
+        self.assertEqual(results, [(True, "", "Dictation cancelled")])
+        self.assertEqual(browser.mock_calls, [])
+
+    def test_release_during_paste_cancels_start_and_cleans_screenshot(self) -> None:
+        monitor = BrowserMonitor()
+        page = Mock(url="https://chatgpt.com/c/conversation")
+        page.is_closed.return_value = False
+        browser = Mock(contexts=[Mock(pages=[page])])
+        started, finished = [], []
+        monitor.dictation_started.connect(lambda *args: started.append(args))
+        monitor.dictation_finished.connect(lambda *args: finished.append(args))
+        cancelled = monitor.request_start_dictation(str(id(page)), b"screenshot")
+        with (
+            patch.object(monitor, "_cancel_existing_dictation", return_value=False),
+            patch.object(monitor, "_read_composer_text", return_value="Original text"),
+            patch.object(monitor, "_clear_chatgpt_attachments") as clear,
+            patch.object(monitor, "_paste_screenshot", side_effect=lambda *_args: cancelled.set()),
+            patch.object(monitor, "_start_browser_dictation") as start,
+            patch.object(monitor, "_usage_limit_message", return_value=""),
+        ):
+            monitor._process_dictation_requests(browser, FakePlaywrightError)
+        start.assert_not_called()
+        self.assertEqual(clear.call_count, 2)
+        self.assertEqual(started, [])
+        self.assertEqual(finished, [(True, "Original text", "Dictation cancelled")])
+        self.assertIsNone(monitor._dictation_start_cancelled)
+        self.assertNotIn(str(id(page)), monitor._dictation_initial_text)
+
+    def test_release_while_microphone_becomes_ready_skips_click(self) -> None:
+        monitor = BrowserMonitor()
+        page = Mock(url="https://chatgpt.com/c/conversation")
+        page.is_closed.return_value = False
+        browser = Mock(contexts=[Mock(pages=[page])])
+        microphone = Mock()
+        cancelled = monitor.request_start_dictation(str(id(page)))
+
+        def ready(_script: str) -> bool:
+            cancelled.set()
+            return True
+
+        microphone.evaluate.side_effect = ready
+        results = []
+        monitor.dictation_finished.connect(lambda *args: results.append(args))
+        with (
+            patch.object(monitor, "_cancel_existing_dictation", return_value=False),
+            patch.object(monitor, "_read_composer_text", return_value=""),
+            patch.object(monitor, "_first_visible_locator", return_value=microphone),
+        ):
+            monitor._process_dictation_requests(browser, FakePlaywrightError)
+        microphone.click.assert_not_called()
+        self.assertEqual(results, [(True, "", "Dictation cancelled")])
+
+    def test_release_after_microphone_click_cancels_and_restores_composer(self) -> None:
+        monitor = BrowserMonitor()
+        page = Mock(url="https://chatgpt.com/c/conversation")
+        page.is_closed.return_value = False
+        browser = Mock(contexts=[Mock(pages=[page])])
+        cancelled = monitor.request_start_dictation(str(id(page)))
+        results = []
+        monitor.dictation_finished.connect(lambda *args: results.append(args))
+        with (
+            patch.object(monitor, "_cancel_existing_dictation", side_effect=[False, True]) as cancel,
+            patch.object(monitor, "_read_composer_text", return_value="Original text"),
+            patch.object(monitor, "_start_browser_dictation", side_effect=lambda _page: cancelled.set()),
+        ):
+            monitor._process_dictation_requests(browser, FakePlaywrightError)
+        self.assertEqual(cancel.call_count, 2)
+        page.locator.return_value.first.fill.assert_called_once_with("Original text", timeout=5_000)
+        self.assertEqual(results, [(True, "Original text", "Dictation cancelled")])
 
     def test_start_clears_stale_dictation_before_clicking_microphone(self) -> None:
         cancel = Mock()
@@ -1164,8 +1308,8 @@ class BrowserMonitorTests(unittest.TestCase):
         monitor._cancel_existing_dictation(page)
         monitor._start_browser_dictation(page)
 
-        cancel.click.assert_called_once_with(timeout=5_000, no_wait_after=True)
-        microphone.click.assert_called_once_with(timeout=5_000, no_wait_after=True)
+        cancel.click.assert_called_once_with(timeout=1_000, force=True, no_wait_after=True)
+        microphone.click.assert_called_once_with(timeout=1_000, force=True, no_wait_after=True)
 
     def test_dictation_click_still_requires_listening_controls(self) -> None:
         monitor = BrowserMonitor()
@@ -1173,7 +1317,7 @@ class BrowserMonitorTests(unittest.TestCase):
         with patch.object(monitor, "_first_visible_locator", side_effect=[microphone, None]):
             with self.assertRaisesRegex(RuntimeError, "ChatGPT did not start listening"):
                 monitor._start_browser_dictation(Mock())
-        microphone.click.assert_called_once_with(timeout=5_000, no_wait_after=True)
+        microphone.click.assert_called_once_with(timeout=1_000, force=True, no_wait_after=True)
 
     def test_cancel_dictation_restores_original_composer_text(self) -> None:
         composer = Mock()
@@ -1195,9 +1339,29 @@ class BrowserMonitorTests(unittest.TestCase):
 
         text = monitor._cancel_browser_dictation(page, "Original text")
 
-        cancel.click.assert_called_once_with(timeout=5_000, no_wait_after=True)
+        cancel.click.assert_called_once_with(timeout=1_000, force=True, no_wait_after=True)
         composer.fill.assert_called_once_with("Original text")
         self.assertEqual(text, "Original text")
+
+    def test_finish_failure_resets_browser_recording_and_preserves_original_text(self) -> None:
+        monitor = BrowserMonitor()
+        page = Mock(url="https://chatgpt.com/c/conversation")
+        page.is_closed.return_value = False
+        browser = Mock(contexts=[Mock(pages=[page])])
+        tab_id = str(id(page))
+        monitor._dictation_initial_text[tab_id] = "Original text"
+        results = []
+        monitor.dictation_finished.connect(lambda *args: results.append(args))
+        with (
+            patch.object(monitor, "_finish_browser_dictation", side_effect=FakePlaywrightError("Stop failed")),
+            patch.object(monitor, "_cancel_existing_dictation", return_value=True) as cancel,
+        ):
+            monitor.request_finish_dictation(tab_id)
+            monitor._process_dictation_requests(browser, FakePlaywrightError)
+        cancel.assert_called_once_with(page)
+        page.locator.return_value.first.fill.assert_called_once_with("Original text", timeout=5_000)
+        self.assertNotIn(tab_id, monitor._dictation_initial_text)
+        self.assertEqual(results, [(False, "", "Could not finish browser dictation: Stop failed")])
 
     def test_clear_request_empties_background_chatgpt_composer(self) -> None:
         composer = Mock()
@@ -1261,7 +1425,7 @@ class BrowserMonitorTests(unittest.TestCase):
         monitor.request_finish_dictation(str(id(page)))
         monitor._process_dictation_requests(browser, FakePlaywrightError)
 
-        done.click.assert_called_once_with(timeout=5_000, no_wait_after=True)
+        done.click.assert_called_once_with(timeout=1_000, force=True, no_wait_after=True)
         page.locator.assert_any_call(
             'button[aria-label="Submit dictation"]'
         )
@@ -1303,7 +1467,7 @@ class BrowserMonitorTests(unittest.TestCase):
         text = monitor._finish_browser_dictation(page, "Existing text")
 
         self.assertEqual(text, "Existing text")
-        done.click.assert_called_once_with(timeout=5_000, no_wait_after=True)
+        done.click.assert_called_once_with(timeout=1_000, force=True, no_wait_after=True)
         self.assertEqual(page.wait_for_timeout.call_count, 2)
 
     def test_empty_dictation_emits_finished_when_browser_is_ready(self) -> None:

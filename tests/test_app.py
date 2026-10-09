@@ -2501,7 +2501,7 @@ class TrayControllerBrowserTests(unittest.TestCase):
         )
 
     @patch("live_gpt.app.capture_webp", return_value=b"hold-screenshot")
-    def test_screenshot_is_uploaded_after_half_second_hold(
+    def test_screenshot_is_queued_with_browser_dictation_after_half_second_hold(
         self,
         capture: Mock,
     ) -> None:
@@ -2534,7 +2534,8 @@ class TrayControllerBrowserTests(unittest.TestCase):
         controller.browser_monitor = Mock()
         controller.selected_chatgpt_tab_id = "selected-tab"
         controller.dictation_tab_id = "selected-tab"
-        controller._dictation_state = "listening"
+        controller._dictation_state = "starting"
+        controller._browser_dictation_start_requested = False
         controller._dictation_input_held = True
         controller._dictation_pressed_since = time.monotonic() - 0.6
         controller._dictation_listening_since = time.monotonic() - 0.6
@@ -2542,13 +2543,15 @@ class TrayControllerBrowserTests(unittest.TestCase):
         controller._dictation_attachment_tab_id = None
         controller._pending_dictation_capture = None
 
-        controller._upload_dictation_screenshot_after_hold(1)
+        controller._prepare_browser_dictation_after_hold(1)
 
         capture.assert_called_once_with(release_source, include_cursor=False)
-        controller.browser_monitor.request_replace_attachment.assert_called_once_with(
+        controller.browser_monitor.request_start_dictation.assert_called_once_with(
             "selected-tab",
             b"hold-screenshot",
         )
+        controller.browser_monitor.request_replace_attachment.assert_not_called()
+        controller._on_dictation_started(True, "Listening")
         controller.finish_dictation()
 
         controller.browser_monitor.request_finish_dictation.assert_called_once_with(
@@ -2564,6 +2567,113 @@ class TrayControllerBrowserTests(unittest.TestCase):
             b"hold-screenshot",
             preserve_attachments=True,
         )
+
+    @patch("live_gpt.app.QTimer.singleShot")
+    @patch("live_gpt.app.capture_webp", return_value=b"screenshot")
+    def test_browser_microphone_waits_for_capture_and_cancelled_hold_starts_nothing(
+        self, capture: Mock, single_shot: Mock,
+    ) -> None:
+        controller = TrayController.__new__(TrayController)
+        controller.window = Mock()
+        controller.browser_monitor = Mock()
+        controller.config = {"capture_cursor": False}
+        controller.selected_chatgpt_tab_id = "selected-tab"
+        controller.dictation_tab_id = None
+        controller.window.capture_source_combo.currentData.return_value = CaptureSource(
+            key="display:1", label="Desktop", kind="display",
+            left=0, top=0, width=1920, height=1080,
+        )
+        controller.start_dictation()
+        callback = single_shot.call_args.args[1]
+        self.assertGreater(single_shot.call_args.args[0], 0)
+        capture.assert_not_called()
+        controller.browser_monitor.request_start_dictation.assert_not_called()
+
+        controller.finish_dictation()
+        callback()
+        capture.assert_not_called()
+        controller.browser_monitor.request_start_dictation.assert_not_called()
+        controller.browser_monitor.request_cancel_dictation.assert_not_called()
+        controller.window.end_dictation_display.assert_called_once_with()
+        self.assertEqual(controller._dictation_state, "idle")
+
+        controller.start_dictation()
+        callback = single_shot.call_args.args[1]
+        # Tab selection can change during preparation; attach to the tab
+        # this recording started on.
+        controller.selected_chatgpt_tab_id = "different-tab"
+        callback()
+        callback()
+        capture.assert_called_once()
+        controller.browser_monitor.request_start_dictation.assert_called_once_with(
+            "selected-tab", b"screenshot",
+        )
+        controller.browser_monitor.request_replace_attachment.assert_not_called()
+        self.assertEqual(controller._dictation_attachment_tab_id, "selected-tab")
+
+    @patch("live_gpt.app.QTimer.singleShot")
+    @patch("live_gpt.app.capture_webp", side_effect=RuntimeError("Capture unavailable"))
+    def test_capture_failure_returns_to_idle_without_starting_browser_dictation(
+        self, capture: Mock, single_shot: Mock,
+    ) -> None:
+        controller = TrayController.__new__(TrayController)
+        controller.window = Mock()
+        controller.browser_monitor = Mock()
+        controller.config = {"capture_cursor": False}
+        controller.selected_chatgpt_tab_id = "selected-tab"
+        controller.dictation_tab_id = None
+        controller.window.capture_source_combo.currentData.return_value = CaptureSource(
+            key="display:1", label="Desktop", kind="display",
+            left=0, top=0, width=1920, height=1080,
+        )
+        controller.start_dictation()
+        single_shot.call_args.args[1]()
+        capture.assert_called_once()
+        controller.browser_monitor.request_start_dictation.assert_not_called()
+        controller.window.end_dictation_display.assert_called_once_with()
+        self.assertEqual(controller._dictation_state, "idle")
+
+    @patch("live_gpt.app.QTimer.singleShot")
+    @patch("live_gpt.app.capture_webp")
+    def test_browser_dictation_without_screenshot_starts_immediately(
+        self, capture: Mock, single_shot: Mock,
+    ) -> None:
+        controller = TrayController.__new__(TrayController)
+        controller.window = Mock()
+        controller.browser_monitor = Mock()
+        controller.selected_chatgpt_tab_id = "selected-tab"
+        controller.dictation_tab_id = None
+        controller.window.capture_source_combo.currentData.return_value = CaptureSource(
+            key="display:1", label="Desktop", kind="display",
+            left=0, top=0, width=1920, height=1080,
+        )
+        controller.start_dictation(include_screenshot=False)
+        controller.browser_monitor.request_start_dictation.assert_called_once_with("selected-tab")
+        capture.assert_not_called()
+        single_shot.assert_not_called()
+        self.assertIsNone(controller._pending_dictation_capture.screenshot)
+
+    @patch("live_gpt.app.capture_webp", return_value=b"screenshot")
+    def test_local_recording_still_uploads_screenshot_while_listening(self, capture: Mock) -> None:
+        controller = TrayController.__new__(TrayController)
+        controller.window = Mock()
+        controller.browser_monitor = Mock()
+        controller.config = {"capture_cursor": False}
+        controller.selected_chatgpt_tab_id = "selected-tab"
+        controller.dictation_tab_id = "local"
+        controller._dictation_press_generation = 1
+        controller._dictation_input_held = True
+        controller._dictation_state = "listening"
+        controller.window.capture_source_combo.currentData.return_value = CaptureSource(
+            key="display:1", label="Desktop", kind="display",
+            left=0, top=0, width=1920, height=1080,
+        )
+        controller._upload_dictation_screenshot_after_hold(1)
+        capture.assert_called_once()
+        controller.browser_monitor.request_replace_attachment.assert_called_once_with(
+            "selected-tab", b"screenshot",
+        )
+        controller.browser_monitor.request_start_dictation.assert_not_called()
 
     def test_new_recording_removes_the_previous_pending_screenshot(self) -> None:
         controller = TrayController.__new__(TrayController)
@@ -2684,11 +2794,13 @@ class TrayControllerBrowserTests(unittest.TestCase):
         self.assertEqual(controller._dictation_state, "cancelling")
         controller.window.clear_transcript.assert_not_called()
 
-    def test_release_before_browser_listens_cancels_when_ready(self) -> None:
+    def test_release_before_browser_listens_cancels_startup_immediately(self) -> None:
         controller = TrayController.__new__(TrayController)
         controller.window = Mock()
         controller.window.transcript_area.is_showing_response = False
         controller.browser_monitor = Mock()
+        cancelled = threading.Event()
+        controller.browser_monitor.request_start_dictation.return_value = cancelled
         controller.selected_chatgpt_tab_id = "selected-tab"
         controller.dictation_tab_id = None
         controller._dictation_state = "idle"
@@ -2697,11 +2809,29 @@ class TrayControllerBrowserTests(unittest.TestCase):
 
         controller.start_dictation()
         controller.finish_dictation()
-        controller._on_dictation_started(True, "Listening")
 
-        controller.browser_monitor.request_cancel_dictation.assert_called_once_with(
-            "selected-tab"
-        )
+        self.assertTrue(cancelled.is_set())
+        self.assertEqual(controller._dictation_state, "cancelling")
+        controller.browser_monitor.request_cancel_dictation.assert_not_called()
+        controller._on_dictation_finished(True, "", "Dictation cancelled")
+        self.assertEqual(controller._dictation_state, "idle")
+        controller.window.end_dictation_display.assert_called_once_with()
+
+    def test_late_listening_signal_after_release_cancels_browser_session(self) -> None:
+        controller = TrayController.__new__(TrayController)
+        controller.window = Mock()
+        controller.browser_monitor = Mock()
+        cancelled = threading.Event()
+        controller.browser_monitor.request_start_dictation.return_value = cancelled
+        controller.selected_chatgpt_tab_id = "selected-tab"
+        controller.dictation_tab_id = None
+        controller.start_dictation(include_screenshot=False)
+        controller.finish_dictation()
+        controller._on_dictation_started(True, "Listening")
+        controller.browser_monitor.request_cancel_dictation.assert_called_once_with("selected-tab")
+        controller.window.set_dictation_listening.assert_not_called()
+        controller._on_dictation_finished(True, "", "Dictation cancelled")
+        self.assertEqual(controller._dictation_state, "idle")
 
     def test_press_during_cancel_restarts_only_if_still_held(self) -> None:
         controller = TrayController.__new__(TrayController)

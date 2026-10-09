@@ -86,7 +86,15 @@ available even with an empty prompt. If the editor also contains text, a
 paper-plane **No Screenshot** action appears so the prompt can be sent without
 changing the selector. For dictated prompts, Live GPT
 captures and pastes the selected screenshot into ChatGPT after the microphone
-has remained pressed for 0.5 seconds. A cancelled short press uploads nothing.
+has remained pressed for 0.5 seconds. With browser dictation, it waits for the
+image attachment to appear and begin uploading before clicking ChatGPT's
+dictation microphone. The image can finish uploading while you speak; sending
+still waits for upload completion. A cancelled short press uploads nothing.
+Releasing while the browser is still preparing cancels startup and removes
+the pending screenshot. Moving dictation controls (microphone, stop, and cancel)
+are clicked only after they are visible, enabled, and no longer busy. If a
+dictation operation fails, Live GPT cancels any remaining browser recording
+and restores the original composer text when possible.
 Starting another recording before the pending prompt is sent removes the
 previously uploaded screenshot before preparing the new one.
 
