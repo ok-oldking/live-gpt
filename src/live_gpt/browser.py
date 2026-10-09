@@ -90,6 +90,13 @@ DICTATION_RESULT_POLL_INTERVAL_MS = 200
 DICTATION_RESULT_POLL_COUNT = (
     DICTATION_RESULT_TIMEOUT_MS // DICTATION_RESULT_POLL_INTERVAL_MS
 )
+DICTATION_START_SELECTORS = (
+    'button[aria-label="Dictate"]',
+    'button[aria-label="Start dictation"]',
+    _label_selectors("button", "听写", "聽寫", "开始听写", "開始聽寫"),
+    'button[data-testid="composer-speech-button"]',
+    'button[data-testid="dictation-button"]',
+)
 DICTATION_END_SELECTORS = (
     'button[aria-label="Submit dictation"]',
     'button[aria-label="Stop dictation"]',
@@ -1533,13 +1540,7 @@ class BrowserMonitor(QThread):
     def _start_browser_dictation(self, page: Any) -> None:
         button = self._first_visible_locator(
             page,
-            (
-                'button[aria-label="Dictate"]',
-                'button[aria-label="Start dictation"]',
-                _label_selectors("button", "听写", "聽寫", "开始听写", "開始聽寫"),
-                'button[data-testid="composer-speech-button"]',
-                'button[data-testid="dictation-button"]',
-            ),
+            DICTATION_START_SELECTORS,
             timeout=5_000,
         )
         if button is None:
@@ -1631,37 +1632,64 @@ class BrowserMonitor(QThread):
             raise RuntimeError("ChatGPT's dictation Done button was not found")
         button.click(timeout=5_000, no_wait_after=True)
 
-        text = initial_text.strip()
-        changed = False
+        initial_text = initial_text.strip()
+        text = initial_text
         stable_polls = 0
-        end_hidden_polls = 0
-        for _ in range(DICTATION_RESULT_POLL_COUNT):
-            if self._stop_requested:
-                break
-            page.wait_for_timeout(DICTATION_RESULT_POLL_INTERVAL_MS)
-            current_text = self._read_composer_text(
-                page,
-                timeout=DICTATION_RESULT_TIMEOUT_MS,
-            )
-            if current_text == text:
-                stable_polls += 1
-            else:
-                text = current_text
-                changed = text != initial_text.strip()
-                stable_polls = 0
-            if not self._any_visible_locator(page, DICTATION_END_SELECTORS):
-                end_hidden_polls += 1
-            else:
-                end_hidden_polls = 0
-
-            if changed and stable_polls >= 2:
-                return text
-            if (
-                not changed
-                and end_hidden_polls >= DICTATION_RESULT_POLL_COUNT
-            ):
-                return text
+        ready_polls = 0
+        deadline = time.monotonic() + DICTATION_RESULT_TIMEOUT_MS / 1_000
+        with self._browser_operation(DICTATION_RESULT_TIMEOUT_MS / 1_000):
+            for _ in range(DICTATION_RESULT_POLL_COUNT):
+                if self._stop_requested or time.monotonic() >= deadline:
+                    break
+                page.wait_for_timeout(DICTATION_RESULT_POLL_INTERVAL_MS)
+                current_text, ready = self._dictation_result_snapshot(page)
+                if current_text is None:
+                    stable_polls = ready_polls = 0
+                    continue
+                if current_text == text:
+                    stable_polls += 1
+                else:
+                    text = current_text
+                    stable_polls = 0
+                ready_polls = ready_polls + 1 if ready else 0
+                if stable_polls >= 2 and (text != initial_text or ready_polls >= 2):
+                    return text
         return text
+
+    @staticmethod
+    def _dictation_result_snapshot(page: Any) -> tuple[str | None, bool]:
+        # Inspect text and controls together, without waiting for a composer
+        # that may be temporarily absent or making a CDP call per selector.
+        controls = ", ".join(
+            f"{selector}:visible"
+            for group in (
+                DICTATION_START_SELECTORS
+                + DICTATION_CANCEL_SELECTORS
+                + DICTATION_END_SELECTORS
+            )
+            for selector in group.split(", ")
+        )
+        snapshot = page.locator(
+            f"{CHATGPT_COMPOSER_SELECTOR}, {controls}"
+        ).evaluate_all(
+            """(elements, startSelector) => {
+                const composer = elements.find(element =>
+                    element.matches('textarea, [contenteditable="true"]'));
+                const start = elements.find(element => element.matches(startSelector));
+                const active = elements.some(element =>
+                    element.matches('button') && !element.matches(startSelector));
+                return {
+                    text: composer ? (typeof composer.value === 'string'
+                        ? composer.value : composer.innerText || composer.textContent || '') : null,
+                    ready: !!start && !active && !start.disabled
+                        && start.getAttribute('aria-disabled') !== 'true'
+                        && start.getAttribute('aria-busy') !== 'true'
+                };
+            }""",
+            ", ".join(DICTATION_START_SELECTORS),
+        )
+        text = snapshot["text"]
+        return (str(text).strip() if text is not None else None, snapshot["ready"])
 
     def _first_visible_locator(
         self,

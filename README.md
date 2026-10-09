@@ -47,7 +47,9 @@ capture method and broadcast software.
 Press and hold the microphone button to start ChatGPT's browser dictation
 through Playwright. Releasing it clicks ChatGPT's **Done** control, waits for
 the dictated text to appear in ChatGPT's composer, and copies that text into
-the Live GPT input. The ChatGPT tab owns microphone capture and speech
+the Live GPT input. If ChatGPT returns no words, the overlay leaves the finishing
+state when the browser microphone is ready again. The transcription wait is
+limited to 20 seconds. The ChatGPT tab owns microphone capture and speech
 recognition, so the browser may ask for microphone permission the first time.
 Live GPT does not record audio locally or download a speech-recognition model.
 While the button is held, the input area is replaced by a waiting state until

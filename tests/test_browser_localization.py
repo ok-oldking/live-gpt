@@ -834,6 +834,44 @@ class BrowserLocalizationTests(unittest.TestCase):
         self.assertEqual(monitor._cancel_browser_dictation(self.page, "原文"), "原文")
         self.assertIsNone(self.page.evaluate("window.wrongControl"))
 
+    def test_empty_dictation_finishes_when_idle_microphone_returns(self):
+        from unittest.mock import patch
+
+        for label in ("Dictate", "開始聽寫"):
+            with self.subTest(label=label):
+                self.page.set_content(f'''<form onsubmit="return false">
+                    <div id="prompt-textarea" contenteditable="true"><p><br></p></div>
+                    <button type="button" id="mic" aria-label="{label}" hidden>Dictate</button>
+                    <button type="button" aria-label="Stop dictation" onclick="
+                        this.hidden=true; document.querySelector('#mic').hidden=false">Stop</button>
+                    <button type="button" aria-label="Cancel dictation" hidden>Cancel</button>
+                </form>''')
+                monitor = BrowserMonitor()
+                with patch.object(self.page, "wait_for_timeout", wraps=self.page.wait_for_timeout) as wait:
+                    self.assertEqual(monitor._finish_browser_dictation(self.page, ""), "")
+                self.assertEqual(wait.call_count, 2)
+
+    def test_dictation_snapshot_waits_for_processing_and_ignores_hidden_controls(self):
+        self.page.set_content('''<form>
+            <div id="prompt-textarea" contenteditable="true"></div>
+            <button aria-label="Dictate" aria-busy="true">Dictate</button>
+            <button aria-label="Cancel dictation" hidden>Cancel</button>
+            <button aria-label="Stop dictation" hidden>Stop</button>
+        </form>''')
+        monitor = BrowserMonitor()
+        self.assertEqual(monitor._dictation_result_snapshot(self.page), ("", False))
+        mic = self.page.locator('button[aria-label="Dictate"]')
+        mic.evaluate("button => { button.setAttribute('aria-busy', 'false'); button.disabled=true; }")
+        self.assertEqual(monitor._dictation_result_snapshot(self.page), ("", False))
+        mic.evaluate("button => { button.disabled=false; button.setAttribute('aria-disabled', 'true'); }")
+        self.assertEqual(monitor._dictation_result_snapshot(self.page), ("", False))
+        mic.evaluate("button => button.removeAttribute('aria-disabled')")
+        self.assertEqual(monitor._dictation_result_snapshot(self.page), ("", True))
+        self.page.locator('button[aria-label="Cancel dictation"]').evaluate("button => button.hidden=false")
+        self.assertEqual(monitor._dictation_result_snapshot(self.page), ("", False))
+        self.page.locator('#prompt-textarea').evaluate("element => element.remove()")
+        self.assertEqual(monitor._dictation_result_snapshot(self.page), (None, False))
+
     def test_pasted_dictate_button_starts_dictation_instead_of_voice_chat(self):
         controls = (Path(__file__).parent / "fixtures" / "chatgpt_dictate_controls.html").read_text(encoding="utf-8")
         for label in ("Dictate", "Start dictation", "听写", "聽寫", "开始听写", "開始聽寫"):

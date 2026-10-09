@@ -1237,6 +1237,10 @@ class BrowserMonitorTests(unittest.TestCase):
         unavailable.is_visible.return_value = False
 
         def locate(selector: str) -> Mock:
+            if selector.startswith(CHATGPT_COMPOSER_SELECTOR + ", "):
+                return Mock(evaluate_all=Mock(return_value={
+                    "text": "Dictated in ChatGPT", "ready": False,
+                }))
             if selector == CHATGPT_COMPOSER_SELECTOR:
                 return Mock(first=composer)
             if selector == 'button[aria-label="Submit dictation"]':
@@ -1283,6 +1287,10 @@ class BrowserMonitorTests(unittest.TestCase):
         page = Mock()
 
         def locate(selector: str) -> Mock:
+            if selector.startswith(CHATGPT_COMPOSER_SELECTOR + ", "):
+                return Mock(evaluate_all=Mock(return_value={
+                    "text": "Existing text", "ready": True,
+                }))
             if selector == CHATGPT_COMPOSER_SELECTOR:
                 return Mock(first=composer)
             if selector == 'button[aria-label="Submit dictation"]':
@@ -1296,14 +1304,65 @@ class BrowserMonitorTests(unittest.TestCase):
 
         self.assertEqual(text, "Existing text")
         done.click.assert_called_once_with(timeout=5_000, no_wait_after=True)
-        composer.wait_for.assert_called_with(
-            state="visible",
-            timeout=DICTATION_RESULT_TIMEOUT_MS,
-        )
-        self.assertEqual(
-            page.wait_for_timeout.call_count,
-            DICTATION_RESULT_POLL_COUNT,
-        )
+        self.assertEqual(page.wait_for_timeout.call_count, 2)
+
+    def test_empty_dictation_emits_finished_when_browser_is_ready(self) -> None:
+        monitor = BrowserMonitor()
+        page = Mock(url="https://chatgpt.com/c/conversation")
+        page.is_closed.return_value = False
+        browser = Mock(contexts=[Mock(pages=[page])])
+        results = []
+        monitor.dictation_finished.connect(lambda *args: results.append(args))
+        with (
+            patch.object(monitor, "_first_visible_locator", return_value=Mock()),
+            patch.object(monitor, "_dictation_result_snapshot", return_value=("", True)),
+        ):
+            monitor.request_finish_dictation(str(id(page)))
+            monitor._process_dictation_requests(browser, FakePlaywrightError)
+        self.assertEqual(results, [(True, "", "Dictation copied from ChatGPT")])
+        self.assertEqual(page.wait_for_timeout.call_count, 2)
+
+    def test_dictation_waits_for_delayed_text_while_browser_is_processing(self) -> None:
+        monitor = BrowserMonitor()
+        page = Mock()
+        with (
+            patch.object(monitor, "_first_visible_locator", return_value=Mock()),
+            patch.object(monitor, "_dictation_result_snapshot", side_effect=[
+                ("", False), ("", False), ("", False),
+                (None, False), ("Delayed words", True),
+                ("Delayed words", True), ("Delayed words", True),
+            ]),
+        ):
+            self.assertEqual(monitor._finish_browser_dictation(page, ""), "Delayed words")
+        self.assertEqual(page.wait_for_timeout.call_count, 7)
+
+    def test_dictation_timeout_includes_slow_browser_calls(self) -> None:
+        monitor = BrowserMonitor()
+        page = Mock()
+        elapsed = 0.0
+
+        def slow_snapshot(page: Mock) -> tuple[str, bool]:
+            nonlocal elapsed
+            elapsed += 11.0
+            return "", False
+
+        with (
+            patch.object(monitor, "_first_visible_locator", return_value=Mock()),
+            patch.object(monitor, "_dictation_result_snapshot", side_effect=slow_snapshot),
+            patch("live_gpt.browser.time.monotonic", side_effect=lambda: elapsed),
+        ):
+            self.assertEqual(monitor._finish_browser_dictation(page, ""), "")
+        self.assertEqual(page.wait_for_timeout.call_count, 2)
+
+    def test_missing_composer_does_not_finish_before_timeout(self) -> None:
+        monitor = BrowserMonitor()
+        page = Mock()
+        with (
+            patch.object(monitor, "_first_visible_locator", return_value=Mock()),
+            patch.object(monitor, "_dictation_result_snapshot", return_value=(None, True)),
+        ):
+            self.assertEqual(monitor._finish_browser_dictation(page, "Existing text"), "Existing text")
+        self.assertEqual(page.wait_for_timeout.call_count, DICTATION_RESULT_POLL_COUNT)
 
     def test_stopping_monitor_cancels_dictation_wait(self) -> None:
         monitor = BrowserMonitor()

@@ -2991,15 +2991,30 @@ class TrayControllerBrowserTests(unittest.TestCase):
     def test_empty_dictation_returns_to_auto_hidden_state(self) -> None:
         controller = TrayController.__new__(TrayController)
         controller.window = Mock()
+        controller.browser_monitor = Mock()
+        controller._dictation_state = "finishing"
+        controller.dictation_tab_id = "selected-tab"
+        controller._dictation_input_held = False
+        controller._dictation_send_on_finish = True
+        controller._dictation_attachment_tab_id = "selected-tab"
+        controller._pending_dictation_capture = Mock()
 
         controller._on_dictation_finished(
             True,
             "",
-            "No dictated text",
+            "Dictation copied from ChatGPT",
         )
 
         controller.window.show_for_auto_hide.assert_not_called()
         controller.window.schedule_auto_hide.assert_called_once_with()
+        controller.window.end_dictation_display.assert_called_once_with()
+        controller.window.set_transcript.assert_called_once_with("")
+        controller.window.set_microphone_state.assert_called_once_with("idle")
+        controller.window.request_send_from_hotkey.assert_not_called()
+        controller.browser_monitor.request_clear_attachments.assert_called_once_with("selected-tab")
+        self.assertEqual(controller._dictation_state, "idle")
+        self.assertIsNone(controller.dictation_tab_id)
+        self.assertIsNone(controller._pending_dictation_capture)
 
     @patch("live_gpt.app.open_remote_debugging_settings")
     @patch("live_gpt.app.discover_cdp_endpoint")

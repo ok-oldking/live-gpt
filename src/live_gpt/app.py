@@ -5830,14 +5830,17 @@ class TrayController:
                 recognized_text if voice_text_too_short else None
             )
             self.window.set_transcript(recognized_text)
-            self.window.set_microphone_state(
-                "saved",
-                (
-                    tr("Voice input must contain at least 2 characters to send")
-                    if voice_text_too_short
-                    else message
-                ),
-            )
+            if recognized_text:
+                self.window.set_microphone_state(
+                    "saved",
+                    (
+                        tr("Voice input must contain at least 2 characters to send")
+                        if voice_text_too_short
+                        else message
+                    ),
+                )
+            else:
+                self.window.set_microphone_state("idle")
         should_send = (
             getattr(self, "_dictation_send_on_finish", False)
             and not was_cancelled and not restart
