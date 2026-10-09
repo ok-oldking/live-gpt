@@ -11,6 +11,7 @@ requires-python = ">=3.12"
 license = "AGPL-3.0-only"
 dependencies = [
     "playwright>=1.62",
+    "websockets>=15,<17",
     "PySide6-Essentials",
 ]
 

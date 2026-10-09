@@ -270,6 +270,157 @@ class LocalSpeechThreadTests(unittest.TestCase):
             ["Rewritten first.", "Rewritten second.", "Final remainder"],
         )
 
+    def test_stream_revisions_do_not_repeat_unchanged_sentences(self) -> None:
+        controller = TrayController.__new__(TrayController)
+        controller._local_voice_longest_text = ""
+        controller._local_voice_queued_sentences = []
+        worker = _QueuedLocalSpeechThread(Mock(), "model", "speaker", "en")
+        controller._local_speech_thread = worker
+
+        controller._update_local_voice("First.\n- Shared history. Last.", False)
+        controller._update_local_voice("Revised first.\nShared history. Last. Extra.", False)
+        controller._update_local_voice("First.\n- Shared history. Last. Extra. Final.", True)
+
+        queued = []
+        while not worker._sentences.empty():
+            queued.append(worker._sentences.get_nowait())
+        self.assertEqual(queued[:-1], [
+            "First.", "- Shared history.", "Last.", "Revised first.", "Extra.", "Final.",
+        ])
+        self.assertIs(queued[-1], worker._FINISHED)
+
+    def test_intentional_sentence_repetition_is_still_read(self) -> None:
+        controller = TrayController.__new__(TrayController)
+        controller._local_voice_longest_text = ""
+        controller._local_voice_queued_sentences = []
+        worker = _QueuedLocalSpeechThread(Mock(), "model", "speaker", "en")
+        controller._local_speech_thread = worker
+        controller._update_local_voice("Again.", False)
+        controller._update_local_voice("Again. Again.", False)
+        controller._update_local_voice("Again. Again.", True)
+        self.assertEqual(worker._sentences.get_nowait(), "Again.")
+        self.assertEqual(worker._sentences.get_nowait(), "Again.")
+        self.assertIs(worker._sentences.get_nowait(), worker._FINISHED)
+        self.assertTrue(worker._sentences.empty())
+
+    def test_late_final_snapshot_does_not_restart_finished_playback(self) -> None:
+        controller = TrayController.__new__(TrayController)
+        controller._local_voice_longest_text = ""
+        controller._local_voice_queued_sentences = []
+        worker = _QueuedLocalSpeechThread(Mock(), "model", "speaker", "en")
+        controller._local_speech_thread = worker
+        controller._update_local_voice("The answer.", True)
+        controller._local_speech_finished()
+        with patch.object(controller, "_ensure_local_speech_worker") as create:
+            controller._update_local_voice("The answer.", True)
+        create.assert_not_called()
+
+        controller.window = Mock()
+        controller.browser_monitor = Mock()
+        controller.selected_chatgpt_tab_id = "selected-tab"
+        controller._handle_send_requested("Next question", None)
+        next_worker = _QueuedLocalSpeechThread(Mock(), "model", "speaker", "en")
+        controller._local_speech_thread = next_worker
+        controller._update_local_voice("The answer.", True)
+        self.assertEqual(next_worker._sentences.get_nowait(), "The answer.")
+
+    def test_audio_without_word_timestamps_advances_subtitles_during_sentence(self) -> None:
+        import numpy as np
+
+        manager = Mock()
+        manager.continuous_audio_stream = True
+        manager.synthesize_stream.return_value = [
+            (np.ones(1000, dtype=np.float32), 1000, ""),
+            (np.ones(1000, dtype=np.float32), 1000, ""),
+        ]
+        text = "A long sentence with enough words to span several subtitle lines."
+        worker = _QueuedLocalSpeechThread(manager, "model", "speaker", "en")
+        worker.enqueue(text, text)
+        worker.finish_queue()
+        progress = []
+        events = []
+        worker.progress.connect(lambda update: progress.append(update))
+        worker.completed.connect(lambda *_args: events.append("completed"))
+        output = Mock()
+        output.latency = 0.16
+        output.stop.side_effect = lambda: events.append("drained")
+        with patch.dict("sys.modules", {"sounddevice": SimpleNamespace(OutputStream=Mock(return_value=output))}):
+            worker.run()
+
+        intermediate = [update["spoken_characters"] for update in progress[:-1]]
+        self.assertGreater(len(intermediate), 10)
+        self.assertEqual(intermediate, sorted(intermediate))
+        self.assertTrue(any(0 < character < len(text) for character in intermediate))
+        self.assertEqual(progress[-1]["fraction"], 1.0)
+        self.assertLess(events.index("drained"), events.index("completed"))
+        self.assertLessEqual(max(len(call.args[0]) for call in output.write.call_args_list), 80)
+
+    def test_replaced_intermediate_text_does_not_offset_final_subtitles(self) -> None:
+        import numpy as np
+
+        manager = Mock()
+        manager.continuous_audio_stream = True
+        manager.synthesize_stream.side_effect = lambda *_args: [
+            (np.ones(20, dtype=np.float32), 24000, ""),
+        ]
+        worker = _QueuedLocalSpeechThread(manager, "model", "speaker", "en")
+        worker.enqueue("An obsolete intermediate sentence with a lot of text.", "Intermediate.")
+        final_text = "Final first.\n\nFinal second."
+        worker.enqueue("Final first.", final_text)
+        worker.enqueue("Final second.", final_text)
+        worker.finish_queue()
+        progress = []
+        worker.progress.connect(lambda update: progress.append(update))
+        output = Mock()
+        with patch.dict("sys.modules", {"sounddevice": SimpleNamespace(OutputStream=Mock(return_value=output))}):
+            worker.run()
+        self.assertEqual(progress[0]["spoken_characters"], len("Final first."))
+        self.assertTrue(all(update["spoken_characters"] <= len(final_text) for update in progress))
+        self.assertEqual(progress[-1]["spoken_characters"], len(final_text))
+
+    def test_repeated_sentence_audio_tracks_each_occurrence(self) -> None:
+        import numpy as np
+
+        manager = Mock()
+        manager.continuous_audio_stream = True
+        manager.synthesize_stream.side_effect = lambda *_args: [
+            (np.ones(20, dtype=np.float32), 24000, ""),
+        ]
+        worker = _QueuedLocalSpeechThread(manager, "model", "speaker", "en")
+        worker.enqueue("Echo.", "Echo.\n\nEcho.")
+        worker.enqueue("Echo.", "Echo.\n\nEcho.")
+        worker.finish_queue()
+        progress = []
+        worker.progress.connect(lambda update: progress.append(update))
+        with patch.dict("sys.modules", {"sounddevice": SimpleNamespace(OutputStream=Mock())}):
+            worker.run()
+        self.assertEqual([update["spoken_characters"] for update in progress[:2]], [5, 12])
+
+    def test_stopping_long_sentence_aborts_without_playing_remaining_blocks(self) -> None:
+        import numpy as np
+
+        manager = Mock()
+        manager.continuous_audio_stream = True
+        manager.synthesize_stream.side_effect = lambda *_args: [
+            (np.ones(1000, dtype=np.float32), 1000, ""),
+        ]
+        worker = _QueuedLocalSpeechThread(manager, "model", "speaker", "en")
+        for index in range(10):
+            worker.enqueue(f"Sentence {index}.", "Sentence 0.")
+        worker.finish_queue()
+        completed = []
+        progress = []
+        worker.completed.connect(lambda ok, _message: completed.append(ok))
+        worker.progress.connect(lambda update: progress.append(update))
+        output = Mock()
+        output.write.side_effect = lambda _samples: worker.request_stop()
+        with patch.dict("sys.modules", {"sounddevice": SimpleNamespace(OutputStream=Mock(return_value=output))}):
+            worker.run()
+        self.assertEqual(output.write.call_count, 1)
+        output.abort.assert_called_once()
+        self.assertEqual(completed, [False])
+        self.assertFalse(any(update["fraction"] == 1 for update in progress))
+
     def test_response_rewrite_preserves_unchanged_prefix(self) -> None:
         controller = TrayController.__new__(TrayController)
         controller._local_voice_longest_text = "First. Original second."
@@ -1854,6 +2005,53 @@ class TrayControllerBrowserTests(unittest.TestCase):
                 previous_second_line,
             )
             self.assertEqual(window._subtitle_line_index, 1)
+        finally:
+            window.close()
+
+    def test_local_subtitles_follow_source_offsets_past_short_headings(self) -> None:
+        window = OverlayWindow()
+        try:
+            window.show()
+            window.begin_reading("Reading aloud…")
+            QApplication.processEvents()
+            text = "A\n\nB\n\n" + " ".join(f"spoken-word-{index}" for index in range(80))
+            window.set_reading_subtitle({"text": text, "spoken_characters": 0})
+            lines = window._subtitle_lines()
+            target_index = 5
+            position = text.index(lines[target_index])
+            window.set_reading_subtitle({
+                "text": text,
+                "spoken_characters": position,
+                "fraction": position / len(text),
+            })
+            self.assertEqual(window._subtitle_line_index, target_index)
+            self.assertEqual(window.subtitle_line_one.text(), lines[target_index])
+            window.resize(window.width() - 100, window.height())
+            window._render_reading_subtitle(resized=True)
+            self.assertIn(window.subtitle_line_one.text().split()[0], text[position:position + 100])
+        finally:
+            window.close()
+
+    def test_local_subtitle_offsets_handle_cjk_and_collapsed_spaces(self) -> None:
+        window = OverlayWindow()
+        try:
+            window.show()
+            window.begin_reading("Reading aloud…")
+            QApplication.processEvents()
+            text = "短标题\n\n" + "一二三四五六七八九十" * 60
+            window.set_reading_subtitle({"text": text, "spoken_characters": 0})
+            lines = window._subtitle_lines()
+            position = len("短标题\n\n") + sum(len(line) for line in lines[1:4])
+            window.set_reading_subtitle({"text": text, "spoken_characters": position})
+            self.assertEqual(window._subtitle_line_index, 4)
+            self.assertEqual(window.subtitle_line_one.text(), lines[4])
+
+            text = "A\n\nB\n\n" + "  \t".join(f"word-{index}" for index in range(80))
+            window.set_reading_subtitle({"text": text, "spoken_characters": 0})
+            lines = window._subtitle_lines()
+            position = text.index(lines[5].split()[0])
+            window.set_reading_subtitle({"text": text, "spoken_characters": position})
+            self.assertEqual(window._subtitle_line_index, 5)
         finally:
             window.close()
 

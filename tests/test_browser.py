@@ -121,6 +121,17 @@ class BrowserDiscoveryTests(unittest.TestCase):
 
 
 class BrowserMonitorTests(unittest.TestCase):
+    def setUp(self):
+        bridge_patch = patch("live_gpt.browser.ChatGPTCDPBridge")
+        factory = bridge_patch.start()
+        self.addCleanup(bridge_patch.stop)
+        settings_patch = patch("live_gpt.browser.open_remote_debugging_settings")
+        settings_patch.start()
+        self.addCleanup(settings_patch.stop)
+        factory.side_effect = lambda endpoint: Mock(
+            start=Mock(return_value=endpoint), connected=Mock(is_set=Mock(return_value=False)),
+        )
+
     def test_image_only_reply_finishes_without_reading_empty_text(self):
         for browser_voice in (True, False):
             with self.subTest(browser_voice=browser_voice):
@@ -532,7 +543,7 @@ class BrowserMonitorTests(unittest.TestCase):
         page.title.assert_not_called()
         page.emulate_media.assert_not_called()
         playwright.chromium.connect_over_cdp.assert_called_once_with(
-            "http://127.0.0.1:9222", timeout=0, no_defaults=True,
+            "http://127.0.0.1:9222", timeout=60_000, no_defaults=True,
         )
 
     def test_browser_target_title_changes_are_published(self):
@@ -608,7 +619,7 @@ class BrowserMonitorTests(unittest.TestCase):
         self.assertEqual(chromium.connect_over_cdp.call_count, 2)
         chromium.connect_over_cdp.assert_called_with(
             "http://127.0.0.1:9222",
-            timeout=0,
+            timeout=60_000,
             no_defaults=True,
         )
 
@@ -714,6 +725,83 @@ class BrowserMonitorTests(unittest.TestCase):
         monitor.request_stop()
 
         loop.call_soon_threadsafe.assert_called_once_with(stop_transport)
+
+    def test_retry_interrupts_pending_browser_approval(self) -> None:
+        monitor = BrowserMonitor()
+        loop, stop_transport = Mock(), Mock()
+        monitor._playwright_cancellation = (loop, stop_transport)
+        monitor._connection_pending.set()
+        monitor.request_retry_connection()
+        loop.call_soon_threadsafe.assert_called_once_with(stop_transport)
+        self.assertTrue(monitor._retry_connection_requested)
+
+    def test_retry_tolerates_driver_loop_already_closed(self) -> None:
+        monitor = BrowserMonitor()
+        loop = Mock()
+        loop.call_soon_threadsafe.side_effect = RuntimeError("Event loop is closed")
+        monitor._playwright_cancellation = (loop, Mock())
+        monitor._connection_pending.set()
+        monitor.request_retry_connection()
+        self.assertTrue(monitor._retry_connection_requested)
+
+    @patch("live_gpt.browser.discover_cdp_endpoint", return_value="ws://127.0.0.1:9222/devtools/browser/id")
+    def test_pending_retry_leaves_dead_driver_for_outer_session_restart(self, discover):
+        monitor = BrowserMonitor()
+        state = _MonitorState()
+        playwright = Mock()
+        def interrupted(*args, **kwargs):
+            monitor.request_retry_connection()
+            raise FakePlaywrightError("Driver stopped")
+        playwright.chromium.connect_over_cdp.side_effect = interrupted
+        with self.assertRaises(FakePlaywrightError):
+            monitor._try_connect(playwright, FakePlaywrightError, state)
+        self.assertTrue(monitor._retry_connection_requested)
+        self.assertFalse(monitor._connection_pending.is_set())
+        self.assertIsNone(state.bridge)
+
+    @patch("live_gpt.browser.open_remote_debugging_settings")
+    @patch("live_gpt.browser.discover_cdp_endpoint", return_value="ws://127.0.0.1:9222/devtools/browser/id")
+    def test_approved_initialization_failure_does_not_request_more_approval(self, discover, settings):
+        monitor = BrowserMonitor()
+        state = _MonitorState()
+        playwright = Mock()
+        def fail(*args, **kwargs):
+            state.bridge.connected.is_set.return_value = True
+            raise FakePlaywrightError("Initialization timed out")
+        playwright.chromium.connect_over_cdp.side_effect = fail
+        monitor._try_connect(playwright, FakePlaywrightError, state)
+        monitor._try_connect(playwright, FakePlaywrightError, state)
+        settings.assert_not_called()
+        playwright.chromium.connect_over_cdp.assert_called_once()
+        self.assertIn("failed after approval", monitor._last_status)
+        self.assertIsNone(state.bridge)
+        monitor.request_retry_connection()
+        playwright.chromium.connect_over_cdp.side_effect = None
+        monitor._try_connect(playwright, FakePlaywrightError, state)
+        self.assertIsNotNone(state.browser)
+
+    @patch("live_gpt.browser.open_remote_debugging_settings")
+    @patch("live_gpt.browser.discover_cdp_endpoint", return_value="ws://127.0.0.1:9222/devtools/browser/id")
+    def test_crashed_driver_after_approval_stays_gated_across_session_cleanup(self, discover, settings):
+        monitor = BrowserMonitor()
+        state = _MonitorState()
+        playwright = Mock()
+        def crash(*args, **kwargs):
+            state.bridge.connected.is_set.return_value = True
+            raise Exception("Connection closed while reading from the driver")
+        playwright.chromium.connect_over_cdp.side_effect = crash
+        with self.assertRaisesRegex(Exception, "Connection closed"):
+            monitor._try_connect(playwright, FakePlaywrightError, state)
+        monitor._handle_disconnect(state)
+        for _ in range(3):
+            monitor._try_connect(playwright, FakePlaywrightError, state)
+        playwright.chromium.connect_over_cdp.assert_called_once()
+        settings.assert_not_called()
+        self.assertIn("failed after approval", monitor._last_status)
+        monitor.request_retry_connection()
+        playwright.chromium.connect_over_cdp.side_effect = None
+        monitor._try_connect(playwright, FakePlaywrightError, state)
+        self.assertIsNotNone(state.browser)
 
     def test_missing_browser_title_keeps_previous_title_without_page_calls(self) -> None:
         page = Mock()
@@ -1043,7 +1131,7 @@ class BrowserMonitorTests(unittest.TestCase):
         monitor._process_dictation_requests(browser, FakePlaywrightError)
 
         page.bring_to_front.assert_not_called()
-        microphone.click.assert_called_once_with(timeout=5_000)
+        microphone.click.assert_called_once_with(timeout=5_000, no_wait_after=True)
         self.assertEqual(
             monitor._dictation_initial_text[str(id(page))],
             "Existing text",
@@ -1076,8 +1164,16 @@ class BrowserMonitorTests(unittest.TestCase):
         monitor._cancel_existing_dictation(page)
         monitor._start_browser_dictation(page)
 
-        cancel.click.assert_called_once_with(timeout=5_000)
-        microphone.click.assert_called_once_with(timeout=5_000)
+        cancel.click.assert_called_once_with(timeout=5_000, no_wait_after=True)
+        microphone.click.assert_called_once_with(timeout=5_000, no_wait_after=True)
+
+    def test_dictation_click_still_requires_listening_controls(self) -> None:
+        monitor = BrowserMonitor()
+        microphone = Mock()
+        with patch.object(monitor, "_first_visible_locator", side_effect=[microphone, None]):
+            with self.assertRaisesRegex(RuntimeError, "ChatGPT did not start listening"):
+                monitor._start_browser_dictation(Mock())
+        microphone.click.assert_called_once_with(timeout=5_000, no_wait_after=True)
 
     def test_cancel_dictation_restores_original_composer_text(self) -> None:
         composer = Mock()
@@ -1099,7 +1195,7 @@ class BrowserMonitorTests(unittest.TestCase):
 
         text = monitor._cancel_browser_dictation(page, "Original text")
 
-        cancel.click.assert_called_once_with(timeout=5_000)
+        cancel.click.assert_called_once_with(timeout=5_000, no_wait_after=True)
         composer.fill.assert_called_once_with("Original text")
         self.assertEqual(text, "Original text")
 
@@ -1161,7 +1257,7 @@ class BrowserMonitorTests(unittest.TestCase):
         monitor.request_finish_dictation(str(id(page)))
         monitor._process_dictation_requests(browser, FakePlaywrightError)
 
-        done.click.assert_called_once_with(timeout=5_000)
+        done.click.assert_called_once_with(timeout=5_000, no_wait_after=True)
         page.locator.assert_any_call(
             'button[aria-label="Submit dictation"]'
         )
@@ -1199,7 +1295,7 @@ class BrowserMonitorTests(unittest.TestCase):
         text = monitor._finish_browser_dictation(page, "Existing text")
 
         self.assertEqual(text, "Existing text")
-        done.click.assert_called_once_with(timeout=5_000)
+        done.click.assert_called_once_with(timeout=5_000, no_wait_after=True)
         composer.wait_for.assert_called_with(
             state="visible",
             timeout=DICTATION_RESULT_TIMEOUT_MS,

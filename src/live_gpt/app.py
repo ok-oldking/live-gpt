@@ -7,7 +7,7 @@ import sys
 import threading
 import time
 import webbrowser
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -506,6 +506,20 @@ class _LocalSpeechAnnouncement:
     text: str
 
 
+def _speech_text_positions(text: str) -> tuple[str, list[int]]:
+    """Ignore stream-only spacing/bullet changes while retaining source offsets."""
+    bullets = {
+        index
+        for match in re.finditer(r"(?m)^\s*[-*•]\s+", text)
+        for index in range(match.start(), match.end())
+    }
+    positions = [
+        index for index, character in enumerate(text)
+        if not character.isspace() and index not in bullets
+    ]
+    return "".join(text[index] for index in positions), positions
+
+
 class _QueuedLocalSpeechThread(QThread):
     """Synthesize growing response sentences through one audio output stream."""
 
@@ -514,7 +528,6 @@ class _QueuedLocalSpeechThread(QThread):
     completed = Signal(bool, str)
 
     _FINISHED = object()
-    _SENTENCE_DONE = object()
 
     def __init__(
         self,
@@ -536,7 +549,7 @@ class _QueuedLocalSpeechThread(QThread):
 
     def enqueue(self, sentence: str, full_text: str) -> None:
         self._full_text = full_text
-        if sentence.strip():
+        if sentence.strip() and not self._queue_finished:
             self._sentences.put(sentence.strip())
 
     def update_full_text(self, full_text: str) -> None:
@@ -565,160 +578,178 @@ class _QueuedLocalSpeechThread(QThread):
         output = None
         sample_rate = 0
         audio_seconds = 0.0
-        spoken_characters = 0
         started_at = time.perf_counter()
         first_audio_at: float | None = None
         try:
             import numpy as np
             import sounddevice as sd
 
-            continuous = (
-                getattr(self.manager, "continuous_audio_stream", False) is True
-            )
-            generated: queue.Queue[object] = queue.Queue(maxsize=16)
+            continuous = getattr(self.manager, "continuous_audio_stream", False) is True
+            generated: queue.Queue[object] = queue.Queue(maxsize=2)
+
+            def put_generated(item: object) -> bool:
+                while not self._cancel_event.is_set():
+                    try:
+                        generated.put(item, timeout=0.05)
+                        return True
+                    except queue.Full:
+                        pass
+                return False
 
             def produce() -> None:
-                sentence_index = 0
+                occurrences: Counter[str] = Counter()
                 try:
-                    while True:
-                        if self._cancel_event.is_set():
-                            generated.put(self._FINISHED)
-                            return
+                    while not self._cancel_event.is_set():
                         item = self._sentences.get()
                         if item is self._FINISHED:
-                            logger.debug(
-                                "Local TTS sentence queue complete "
-                                f"sentences={sentence_index}"
-                            )
-                            generated.put(self._FINISHED)
+                            put_generated(self._FINISHED)
                             return
                         announcement = isinstance(item, _LocalSpeechAnnouncement)
                         sentence = item.text if announcement else str(item)
-                        sentence_index += 1
-                        logger.debug(
-                            "Sending sentence to local TTS "
-                            f"index={sentence_index} "
-                            f"characters={len(sentence)} "
-                            f"text={sentence!r}"
-                        )
-                        produced = False
-                        for chunk in self.manager.synthesize_stream(
-                            self.tts_model,
-                            sentence,
-                            self.speaker,
-                            self.language,
+                        key = _speech_text_positions(sentence)[0]
+                        occurrence = occurrences[key]
+                        if not announcement:
+                            occurrences[key] += 1
+                        logger.debug(f"Sending sentence to local TTS text={sentence!r}")
+                        # A sentence's duration is needed to advance subtitles even
+                        # when the provider supplies audio without word timestamps.
+                        waveforms = []
+                        sentence_rate = None
+                        for samples, chunk_rate, _chunk_text in self.manager.synthesize_stream(
+                            self.tts_model, sentence, self.speaker, self.language,
                         ):
                             if self._cancel_event.is_set():
-                                generated.put(self._FINISHED)
                                 return
-                            generated.put((chunk, sentence, announcement))
-                            produced = True
-                        if not produced:
-                            raise RuntimeError(
-                                "The local TTS model generated no audio"
+                            if sentence_rate is not None and chunk_rate != sentence_rate:
+                                raise RuntimeError("The local TTS model changed sample rate while queued")
+                            sentence_rate = chunk_rate
+                            waveform = (
+                                np.asarray(samples, dtype=np.float32).reshape(-1, 1)
+                                if continuous else
+                                _LocalSpeechThread._prepare_streaming_waveform(np, samples, chunk_rate)
                             )
-                        generated.put((self._SENTENCE_DONE, sentence, announcement))
+                            if len(waveform):
+                                waveforms.append(waveform)
+                        if not waveforms:
+                            raise RuntimeError("The local TTS model generated no audio")
+                        if not put_generated((waveforms, sentence_rate, key, occurrence, announcement)):
+                            return
                 except Exception as error:
-                    generated.put(error)
-                    generated.put(self._FINISHED)
+                    put_generated(error)
 
             producer = threading.Thread(
-                target=produce,
-                name="queued-local-tts-generator",
-                daemon=True,
+                target=produce, name="queued-local-tts-generator", daemon=True,
             )
             producer.start()
-            progress_sentence = ""
-            sentence_characters_reported = 0
-            while True:
-                item = generated.get()
-                if self._cancel_event.is_set():
-                    self.completed.emit(False, tr("Playback stopped for recording"))
+            timeline: list[tuple[float, float, str, int]] = []
+            last_write_at = time.perf_counter()
+            last_progress: tuple[str, int] | None = None
+            last_played = 0.0
+            output_latency = 0.0
+
+            def report_progress(*, drained: bool = False) -> None:
+                nonlocal last_progress, last_played
+                played = audio_seconds if drained else min(
+                    audio_seconds,
+                    max(0.0, audio_seconds - output_latency + time.perf_counter() - last_write_at),
+                )
+                played = max(last_played, played)
+                last_played = played
+                if not timeline:
                     return
+                current = timeline[0]
+                for entry in timeline:
+                    if played < entry[0]:
+                        break
+                    current = entry
+                start, end, key, occurrence = current
+                full_text = self._full_text
+                sentences, _ = TrayController._completed_response_sentences(full_text, final=True)
+                search_start = 0
+                found = 0
+                positions = []
+                for sentence in sentences:
+                    offset = full_text.find(sentence, search_start)
+                    search_start = offset + len(sentence)
+                    normalized, source_positions = _speech_text_positions(sentence)
+                    if normalized != key:
+                        continue
+                    if found == occurrence:
+                        positions = [offset + position for position in source_positions]
+                        break
+                    found += 1
+                if not positions:
+                    return  # This intermediate sentence has been replaced.
+                fraction = min(1.0, max(0.0, (played - start) / max(end - start, 1e-9)))
+                count = min(len(key), int(len(key) * fraction))
+                character = positions[count - 1] + 1 if count else positions[0]
+                marker = (full_text, character)
+                if marker == last_progress:
+                    return
+                last_progress = marker
+                self.progress.emit({
+                    "text": full_text,
+                    "spoken_characters": character,
+                    "fraction": min(character / max(1, len(full_text)), 0.99),
+                })
+
+            while not self._cancel_event.is_set():
+                try:
+                    item = generated.get(timeout=0.05)
+                except queue.Empty:
+                    report_progress()
+                    continue
                 if item is self._FINISHED:
                     break
                 if isinstance(item, Exception):
                     raise item
-                if item[0] is self._SENTENCE_DONE:
-                    if item[2]:
-                        continue
-                    sentence = item[1]
-                    already_reported = (
-                        sentence_characters_reported
-                        if sentence == progress_sentence
-                        else 0
-                    )
-                    spoken_characters += max(0, len(sentence) - already_reported)
-                    progress_sentence = ""
-                    sentence_characters_reported = 0
-                    self.progress.emit(
-                        {
-                            "text": self._full_text,
-                            "spoken_characters": spoken_characters,
-                            "fraction": min(
-                                spoken_characters / max(1, len(self._full_text)),
-                                0.99,
-                            ),
-                        }
-                    )
-                    continue
-                chunk, sentence, announcement = item
-                samples, chunk_rate, chunk_text = chunk
+                waveforms, sentence_rate, key, occurrence, announcement = item
                 if output is None:
-                    sample_rate = chunk_rate
-                    output = sd.OutputStream(
-                        samplerate=sample_rate,
-                        channels=1,
-                        dtype="float32",
-                    )
+                    sample_rate = sentence_rate
+                    output = sd.OutputStream(samplerate=sample_rate, channels=1, dtype="float32")
                     self._output = output
                     output.start()
+                    try:
+                        output_latency = float(output.latency)
+                    except (AttributeError, TypeError, ValueError):
+                        output_latency = 0.0
                     first_audio_at = time.perf_counter()
                     provider = getattr(self.manager, "display_name", "local TTS")
                     self.started.emit(f"Playing with streaming {provider}…")
-                elif chunk_rate != sample_rate:
-                    raise RuntimeError(
-                        "The local TTS model changed sample rate while queued"
-                    )
-                if continuous:
-                    waveform = np.asarray(samples, dtype=np.float32).reshape(-1, 1)
-                else:
-                    waveform = _LocalSpeechThread._prepare_streaming_waveform(
-                        np, samples, sample_rate
-                    )
-                if len(waveform):
-                    output.write(waveform)
-                    audio_seconds += len(waveform) / sample_rate
-                if chunk_text and not announcement:
-                    if sentence != progress_sentence:
-                        progress_sentence = sentence
-                        sentence_characters_reported = 0
-                    added = min(
-                        len(str(chunk_text)),
-                        len(sentence) - sentence_characters_reported,
-                    )
-                    sentence_characters_reported += max(0, added)
-                    spoken_characters += max(0, added)
-                    self.progress.emit(
-                        {
-                            "text": self._full_text,
-                            "spoken_characters": spoken_characters,
-                            "fraction": min(
-                                spoken_characters / max(1, len(self._full_text)),
-                                0.99,
-                            ),
-                        }
-                    )
+                elif sentence_rate != sample_rate:
+                    raise RuntimeError("The local TTS model changed sample rate while queued")
+                duration = sum(len(waveform) for waveform in waveforms) / sample_rate
+                if not announcement:
+                    timeline.append((audio_seconds, audio_seconds + duration, key, occurrence))
+                block_size = max(1, int(sample_rate * 0.08))
+                for waveform in waveforms:
+                    for offset in range(0, len(waveform), block_size):
+                        if self._cancel_event.is_set():
+                            break
+                        block = waveform[offset:offset + block_size]
+                        output.write(block)
+                        audio_seconds += len(block) / sample_rate
+                        last_write_at = time.perf_counter()
+                        report_progress()
+                    if self._cancel_event.is_set():
+                        break
+            if self._cancel_event.is_set():
+                self.completed.emit(False, tr("Playback stopped for recording"))
+                return
             producer.join(timeout=1)
             if output is None or first_audio_at is None:
                 raise RuntimeError("The local TTS queue received no speech")
-            self.progress.emit(
-                {
-                    "text": self._full_text,
-                    "spoken_characters": len(self._full_text),
-                    "fraction": 1.0,
-                }
-            )
+            # Drain the device before reporting the last subtitle and completion.
+            output.stop()
+            if self._cancel_event.is_set():
+                self.completed.emit(False, tr("Playback stopped for recording"))
+                return
+            report_progress(drained=True)
+            self.progress.emit({
+                "text": self._full_text,
+                "spoken_characters": len(self._full_text),
+                "fraction": 1.0,
+            })
             self.completed.emit(
                 True,
                 f"First audio in {(first_audio_at - started_at) * 1000:.0f} ms · "
@@ -731,6 +762,8 @@ class _QueuedLocalSpeechThread(QThread):
             logger.error("Queued local voice playback failed", error)
             self.completed.emit(False, f"Local voice playback failed: {error}")
         finally:
+            self._cancel_event.set()
+            self._sentences.put(self._FINISHED)
             if output is not None:
                 try:
                     output.stop()
@@ -2847,7 +2880,8 @@ class ReplyDisplay(QTextBrowser):
             code { font-family: Consolas, monospace; }
             blockquote { margin-left: 16px; color: #c1cbe0; }
         """)
-        self.viewport().setStyleSheet("background: transparent;")
+        self.viewport().setObjectName("replyViewport")
+        self.viewport().setStyleSheet("QWidget#replyViewport { background: transparent; }")
         self.verticalScrollBar().valueChanged.connect(self._position_copy_buttons)
         self.horizontalScrollBar().valueChanged.connect(self._position_copy_buttons)
         self._copy_position_timer = QTimer(self)
@@ -3254,7 +3288,7 @@ class OverlayWindow(QMainWindow):
         self._response_html = ""
         self._response_links: object = ()
         self._displayed_reply_content: tuple[str, str] | None = None
-        self.reply_close_button = QPushButton()
+        self.reply_close_button = QPushButton(self.subtitle_full_text.viewport())
         self.reply_close_button.setObjectName("replyCloseButton")
         self.reply_close_button.setIcon(QIcon(str(EXIT_ICON_PATH)))
         self.reply_close_button.setIconSize(QSize(16, 16))
@@ -3266,6 +3300,7 @@ class OverlayWindow(QMainWindow):
         self._reading_full_text = ""
         self._reading_fraction = 0.0
         self._reading_spoken_characters = 0
+        self._reading_character_progress = False
         self._subtitle_line_index = -1
         self._subtitle_mode_active = False
         self._subtitle_dismissed = False
@@ -3278,7 +3313,6 @@ class OverlayWindow(QMainWindow):
         self._subtitle_hover_origin: QPoint | None = None
         subtitle_layout.addWidget(self.subtitle_line_one, 1)
         subtitle_layout.addWidget(self.subtitle_line_two, 1)
-        subtitle_layout.addWidget(self.reply_close_button, 0, Qt.AlignmentFlag.AlignRight)
         subtitle_layout.addWidget(self.subtitle_full_text, 1)
         self.subtitle_panel.hide()
         self._subtitle_hover_widgets = (
@@ -3813,6 +3847,7 @@ class OverlayWindow(QMainWindow):
         self._response_links = ()
         self._reading_fraction = 0.0
         self._reading_spoken_characters = 0
+        self._reading_character_progress = False
         self._subtitle_line_index = -1
         self.transcript_area.begin_response()
         self.transcript_area.hide()
@@ -3880,6 +3915,7 @@ class OverlayWindow(QMainWindow):
         self._subtitle_hover_origin = None
         self._reading_fraction = 0.0
         self._reading_spoken_characters = 0
+        self._reading_character_progress = False
         self._subtitle_line_index = -1
         self._subtitle_mode_active = True
         self.transcript_area.hide()
@@ -3896,6 +3932,7 @@ class OverlayWindow(QMainWindow):
         if isinstance(update, dict):
             self._reading_full_text = str(update.get("text") or "")
             spoken_characters = update.get("spoken_characters")
+            self._reading_character_progress = isinstance(spoken_characters, int)
             if isinstance(spoken_characters, int):
                 self._reading_spoken_characters = max(0, spoken_characters)
             try:
@@ -3906,6 +3943,7 @@ class OverlayWindow(QMainWindow):
             except (TypeError, ValueError):
                 self._reading_fraction = 0.0
         else:
+            self._reading_character_progress = False
             self._reading_full_text = str(update or "")
             self._reading_fraction = 0.0
             self._reading_spoken_characters = 0
@@ -3963,6 +4001,20 @@ class OverlayWindow(QMainWindow):
     def _subtitle_index_at_progress(self, lines: list[str]) -> int:
         if not lines:
             return 0
+        if getattr(self, "_reading_character_progress", False):
+            source, positions = _speech_text_positions(self._reading_full_text)
+            search_start = 0
+            current_index = 0
+            for index, line in enumerate(lines):
+                key = _speech_text_positions(line)[0]
+                offset = source.find(key, search_start)
+                if offset < 0 or not key:
+                    continue
+                if positions[offset] > self._reading_spoken_characters:
+                    break
+                current_index = index
+                search_start = offset + len(key)
+            return current_index
         weights = [max(len(line), 12) for line in lines]
         target = self._reading_fraction * sum(weights)
         cumulative = 0
@@ -3987,6 +4039,7 @@ class OverlayWindow(QMainWindow):
         target_index = self._subtitle_index_at_progress(lines)
         if (
             not resized
+            and not getattr(self, "_reading_character_progress", False)
             and self._subtitle_line_index >= 0
             and target_index > self._subtitle_line_index + 1
         ):
@@ -4070,10 +4123,21 @@ class OverlayWindow(QMainWindow):
         self._render_full_reply()
         self.subtitle_line_one.hide()
         self.subtitle_line_two.hide()
+        self.subtitle_panel.layout().setContentsMargins(12, 12, 12, 12)
         self.subtitle_full_text.show()
         self.reply_close_button.show()
         self.subtitle_panel.layout().activate()
         self._fit_expanded_subtitle_height()
+        self._position_reply_close_button()
+
+    def _position_reply_close_button(self) -> None:
+        viewport = self.subtitle_full_text.viewport()
+        button = self.reply_close_button
+        button.move(
+            max(0, viewport.width() - button.width() - 4),
+            max(0, viewport.height() - button.height() - 4),
+        )
+        button.raise_()
 
     def _fit_expanded_subtitle_height(self) -> None:
         if (
@@ -4090,7 +4154,12 @@ class OverlayWindow(QMainWindow):
         document.setTextWidth(content_width)
         text_height = int(document.size().height())
         document.deleteLater()
-        panel_height = max(text_height, metrics.lineSpacing()) + 32 + self.reply_close_button.height()
+        margins = self.subtitle_panel.layout().contentsMargins()
+        viewport_chrome = self.subtitle_full_text.height() - self.subtitle_full_text.viewport().height()
+        panel_height = (
+            max(text_height, metrics.lineSpacing())
+            + margins.top() + margins.bottom() + viewport_chrome + 2
+        )
         fixed_chrome_height = max(
             self.height() - self.subtitle_panel.height(),
             0,
@@ -4120,6 +4189,7 @@ class OverlayWindow(QMainWindow):
         self._subtitle_expanded = False
         self.subtitle_full_text.hide()
         self.reply_close_button.hide()
+        self.subtitle_panel.layout().setContentsMargins(16, 8, 16, 8)
         self.subtitle_line_one.show()
         self.subtitle_line_two.show()
         if self._subtitle_collapsed_geometry is not None:
@@ -4616,6 +4686,8 @@ class OverlayWindow(QMainWindow):
         subtitle_widgets = getattr(self, "_subtitle_hover_widgets", ())
         if watched in subtitle_widgets:
             event_type = event.type()
+            if watched is self.subtitle_full_text.viewport() and event_type == QEvent.Type.Resize:
+                self._position_reply_close_button()
             if event_type == QEvent.Type.Enter:
                 self._subtitle_hover_origin = (
                     event.globalPosition().toPoint()
@@ -4818,6 +4890,7 @@ class TrayController:
         ) = None
         self._local_voice_longest_text = ""
         self._local_voice_queued_sentences: list[str] = []
+        self._local_voice_seen_sentences: Counter[str] = Counter()
         self._local_voice_interrupted = False
         self._local_voice_error: str | None = None
         self._pending_local_announcements: list[tuple[str, bool]] = []
@@ -5310,31 +5383,33 @@ class TrayController:
             text, final=final
         )
         queued_sentences = self._local_voice_queued_sentences
-        matched_count = 0
-        for sentence, queued_sentence in zip(sentences, queued_sentences):
-            if sentence != queued_sentence:
-                break
-            matched_count += 1
-        # ChatGPT can replace an intermediate reply with a separate final answer.
-        # Only skip sentences whose text still matches the current response.
-        response_replaced = matched_count < min(len(sentences), len(queued_sentences))
-        new_sentences = sentences[matched_count:]
+        seen = getattr(self, "_local_voice_seen_sentences", None)
+        if seen is None:
+            seen = Counter(_speech_text_positions(sentence)[0] for sentence in queued_sentences)
+            self._local_voice_seen_sentences = seen
+        # Track occurrences across revisions, rather than re-queuing a suffix
+        # whenever an earlier sentence changes. Repeated sentences in one reply
+        # still have separate occurrences and are spoken normally.
+        occurrences: Counter[str] = Counter()
+        new_sentences = []
+        for sentence in sentences:
+            key = _speech_text_positions(sentence)[0]
+            occurrences[key] += 1
+            if occurrences[key] > seen[key]:
+                new_sentences.append(sentence)
         if new_sentences and self._local_speech_thread is None:
             if self._ensure_local_speech_worker() is None:
                 return
 
         worker = self._local_speech_thread
         if isinstance(worker, _QueuedLocalSpeechThread):
-            if response_replaced:
-                logger.debug(
-                    "Local voice response replaced; queuing changed sentences "
-                    f"matching_prefix={matched_count} sentences={len(sentences)}"
-                )
-                del queued_sentences[matched_count:]
+            if worker._queue_finished:
+                return
             worker.update_full_text(text)
             for sentence in new_sentences:
                 worker.enqueue(sentence, text)
-            self._local_voice_queued_sentences.extend(new_sentences)
+                seen[_speech_text_positions(sentence)[0]] += 1
+            self._local_voice_queued_sentences = sentences
             if final:
                 worker.finish_queue()
 
@@ -5408,8 +5483,8 @@ class TrayController:
     def _local_speech_finished(self) -> None:
         worker = self._local_speech_thread
         self._local_speech_thread = None
-        self._local_voice_longest_text = ""
-        self._local_voice_queued_sentences = []
+        # Keep the reply's speech history until the next send; late snapshots
+        # must not start playback again after the audio thread has finished.
         if worker is not None:
             worker.deleteLater()
         pending = getattr(self, "_pending_local_announcements", [])
@@ -5872,6 +5947,9 @@ class TrayController:
         self.window.set_status(tr("Sending to ChatGPT…"))
         self._local_voice_interrupted = False
         self._local_voice_error = None
+        self._local_voice_longest_text = ""
+        self._local_voice_queued_sentences = []
+        self._local_voice_seen_sentences = Counter()
         preserve_attachments = bool(
             pending_capture is not None and pending_capture.preuploaded
         )

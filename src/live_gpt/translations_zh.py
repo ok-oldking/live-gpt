@@ -40,6 +40,8 @@ TRANSLATIONS = {
     "Approve remote debugging in the browser before sending": "发送前请在浏览器中批准远程调试",
     "Remote debugging was not approved; click Enable Debugging to retry": "远程调试未获批准；点击“启用调试”重试",
     "Approve remote debugging in the browser…": "请在浏览器中批准远程调试…",
+    "Browser connection failed after approval; click Enable Debugging to retry": "浏览器批准后连接失败；点击“启用调试”重试",
+    "Browser connection failed; click Enable Debugging to retry": "浏览器连接失败；点击“启用调试”重试",
     "Browser connected": "浏览器已连接",
     "Browser disconnected": "浏览器已断开连接",
     "Browser is not connected": "浏览器未连接",

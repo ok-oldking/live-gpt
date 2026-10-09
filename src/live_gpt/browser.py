@@ -25,6 +25,7 @@ from .browser_windows import (
     windows_default_browser_executable,
 )
 from .logger import Logger
+from .cdp_bridge import ChatGPTCDPBridge
 from .response_content import RESPONSE_CONTENT_SCRIPT
 
 
@@ -91,17 +92,20 @@ DICTATION_RESULT_POLL_COUNT = (
 )
 DICTATION_END_SELECTORS = (
     'button[aria-label="Submit dictation"]',
-    'button[aria-label="Done"]',
     'button[aria-label="Stop dictation"]',
     'button[aria-label="Finish dictation"]',
     'button[aria-label="Stop recording"]',
     'button[data-testid="composer-dictation-done-button"]',
     'button[data-testid="dictation-done-button"]',
-    'button:text-is("Done")',
     _label_selectors(
-        "button", "提交听写", "提交聽寫", "完成", "停止听写", "停止聽寫",
+        "button", "提交听写", "提交聽寫", "停止听写", "停止聽寫",
         "结束听写", "結束聽寫", "停止录音", "停止錄音",
     ),
+    # Keep generic completion buttons confined to the composer, after the
+    # dedicated recording controls, so other page dialogs do not match.
+    'form button[aria-label="Done"]',
+    'form button:text-is("Done")',
+    _label_selectors("form button", "完成"),
     'form button:text-is("完成")',
 )
 DICTATION_CANCEL_SELECTORS = (
@@ -212,10 +216,12 @@ _MEDIA_PROGRESS_SCRIPT = """
 @dataclass
 class _MonitorState:
     browser: Any | None = None
+    bridge: ChatGPTCDPBridge | None = None
     discovery_session: Any | None = None
     settings_opened: bool = False
     settings_attempted: bool = False
     retry_endpoint: str | None = None
+    connection_error: str | None = None
     last_tabs: list[dict[str, str]] | None = None
     active_response: _ActiveResponse | None = None
     active_reading: _ActiveReading | None = None
@@ -334,14 +340,22 @@ class BrowserMonitor(QThread):
     def request_stop(self) -> None:
         self._stop_requested = True
         self._wake_event.set()
+        self._interrupt_pending_connection()
+
+    def request_retry_connection(self) -> None:
+        logger.info("Browser connection retry requested")
+        self._retry_connection_requested = True
+        self._wake_event.set()
+        self._interrupt_pending_connection()
+
+    def _interrupt_pending_connection(self) -> None:
         cancellation = self._playwright_cancellation
         if self._connection_pending.is_set() and cancellation is not None:
             loop, stop_transport = cancellation
-            loop.call_soon_threadsafe(stop_transport)
-
-    def request_retry_connection(self) -> None:
-        self._retry_connection_requested = True
-        self._wake_event.set()
+            try:
+                loop.call_soon_threadsafe(stop_transport)
+            except RuntimeError:
+                pass  # The pending driver has already stopped.
 
     def request_stop_reading(self, *, message: str = "Playback stopped for recording") -> None:
         self._stop_reading_message = message
@@ -422,7 +436,8 @@ class BrowserMonitor(QThread):
             try:
                 self._run_session(sync_playwright, PlaywrightError, state)
             except Exception as error:
-                if not self._stop_requested:
+                if (not self._stop_requested and not self._retry_connection_requested
+                        and not state.connection_error):
                     logger.error("Browser monitor failed; reconnecting", error)
             finally:
                 self._playwright_cancellation = None
@@ -486,8 +501,8 @@ class BrowserMonitor(QThread):
     ) -> None:
         with sync_playwright() as playwright:
             connection = playwright._impl_obj._connection
-            # An unlimited CDP approval wait still needs to be cancellable when
-            # the application exits. Playwright exposes no public cancellation
+            # CDP approval waits need to be cancellable for retry and exit.
+            # Playwright exposes no public cancellation
             # token for connect_over_cdp, so terminate its driver safely on the
             # Playwright event loop. The operation watchdog uses this same
             # cancellation path for unresponsive established connections.
@@ -588,14 +603,18 @@ class BrowserMonitor(QThread):
         if self._retry_connection_requested:
             self._retry_connection_requested = False
             state.retry_endpoint = None
-            if not state.settings_opened:
-                state.settings_attempted = False
+            state.connection_error = None
+            state.settings_opened = False
+            state.settings_attempted = False
 
         if endpoint is None:
             self._prepare_remote_debugging(state)
             return
 
         if endpoint == state.retry_endpoint:
+            if state.connection_error:
+                self._set_status(state.connection_error)
+                return
             if self._prepare_remote_debugging(state):
                 state.retry_endpoint = None
                 return
@@ -609,21 +628,43 @@ class BrowserMonitor(QThread):
         self._connection_pending.set()
         self._fail_pending_requests(playwright_error, state)
         try:
+            logger.info(f"Connecting to browser endpoint={endpoint!r}")
+            state.bridge = ChatGPTCDPBridge(endpoint)
+            relay_endpoint = state.bridge.start()
             state.browser = playwright.chromium.connect_over_cdp(
-                endpoint,
-                timeout=0,
+                relay_endpoint,
+                timeout=60_000,
                 no_defaults=True,
             )
         except Exception as error:
+            approved = state.bridge is not None and state.bridge.connected.is_set()
+            if state.bridge is not None:
+                state.bridge.close()
+                state.bridge = None
             if self._stop_requested:
                 return
-            if not isinstance(error, playwright_error):
+            if self._retry_connection_requested:
+                # The interrupted transport cannot be reused. Leave this
+                # session so run() creates a fresh driver before retrying.
                 raise
+            state.retry_endpoint = endpoint
+            if approved or not isinstance(error, playwright_error):
+                state.connection_error = (
+                    "Browser connection failed after approval; click Enable Debugging to retry"
+                    if approved else "Browser connection failed; click Enable Debugging to retry"
+                )
+                logger.error("Browser connection failed; waiting for explicit retry", error)
+                self._set_status(state.connection_error)
+                state.settings_attempted = True
+                if not isinstance(error, playwright_error):
+                    # A crashed driver raises a plain Exception. Preserve the
+                    # retry gate while run() discards that dead transport.
+                    raise
+                return
             logger.warning(
                 "Unable to connect to remote-debug browser "
                 f"endpoint={endpoint!r}: {error}"
             )
-            state.retry_endpoint = endpoint
             # A live marker/port does not mean Chrome will accept CDP. Open
             # settings even when discovery succeeded, then retry once after
             # setup. Keep subsequent rejections gated on an explicit retry.
@@ -639,6 +680,7 @@ class BrowserMonitor(QThread):
             self._connection_pending.clear()
 
         state.retry_endpoint = None
+        state.connection_error = None
         state.settings_opened = False
         state.settings_attempted = False
         self.debug_connection_changed.emit(True)
@@ -733,6 +775,9 @@ class BrowserMonitor(QThread):
         return tabs
 
     def _handle_disconnect(self, state: _MonitorState) -> None:
+        if state.bridge is not None:
+            state.bridge.close()
+            state.bridge = None
         if state.active_response is not None:
             if not self._use_browser_voice:
                 self.local_voice_announcement.emit("Browser disconnected")
@@ -744,7 +789,7 @@ class BrowserMonitor(QThread):
         state.browser = None
         state.discovery_session = None
         self.debug_connection_changed.emit(False)
-        self._set_status("Browser disconnected")
+        self._set_status(state.connection_error or "Browser disconnected")
         if state.last_tabs != []:
             state.last_tabs = []
             self.tabs_changed.emit([])
@@ -1489,8 +1534,9 @@ class BrowserMonitor(QThread):
         button = self._first_visible_locator(
             page,
             (
+                'button[aria-label="Dictate"]',
                 'button[aria-label="Start dictation"]',
-                _label_selectors("button", "开始听写", "開始聽寫"),
+                _label_selectors("button", "听写", "聽寫", "开始听写", "開始聽寫"),
                 'button[data-testid="composer-speech-button"]',
                 'button[data-testid="dictation-button"]',
             ),
@@ -1498,7 +1544,9 @@ class BrowserMonitor(QThread):
         )
         if button is None:
             raise RuntimeError("ChatGPT's dictation microphone was not found")
-        button.click(timeout=5_000)
+        # The composer can schedule unrelated navigation after this click.
+        # Confirm listening through the dictation controls below instead.
+        button.click(timeout=5_000, no_wait_after=True)
 
         end_button = self._first_visible_locator(
             page,
@@ -1522,7 +1570,7 @@ class BrowserMonitor(QThread):
             return False
 
         logger.info("Cancelling stale ChatGPT dictation before starting")
-        cancel_button.click(timeout=5_000)
+        cancel_button.click(timeout=5_000, no_wait_after=True)
         if not self._wait_for_dictation_controls_hidden(page):
             raise RuntimeError("ChatGPT's stale dictation did not cancel")
         return True
@@ -1544,7 +1592,7 @@ class BrowserMonitor(QThread):
                 timeout=2_000,
             )
         if button is not None:
-            button.click(timeout=5_000)
+            button.click(timeout=5_000, no_wait_after=True)
             if not self._wait_for_dictation_controls_hidden(page):
                 raise RuntimeError("ChatGPT's dictation did not cancel")
         elif not self._stop_requested:
@@ -1581,7 +1629,7 @@ class BrowserMonitor(QThread):
             if self._stop_requested:
                 return initial_text
             raise RuntimeError("ChatGPT's dictation Done button was not found")
-        button.click(timeout=5_000)
+        button.click(timeout=5_000, no_wait_after=True)
 
         text = initial_text.strip()
         changed = False

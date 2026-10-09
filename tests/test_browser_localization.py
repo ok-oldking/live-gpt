@@ -834,6 +834,122 @@ class BrowserLocalizationTests(unittest.TestCase):
         self.assertEqual(monitor._cancel_browser_dictation(self.page, "原文"), "原文")
         self.assertIsNone(self.page.evaluate("window.wrongControl"))
 
+    def test_pasted_dictate_button_starts_dictation_instead_of_voice_chat(self):
+        controls = (Path(__file__).parent / "fixtures" / "chatgpt_dictate_controls.html").read_text(encoding="utf-8")
+        for label in ("Dictate", "Start dictation", "听写", "聽寫", "开始听写", "開始聽寫"):
+            with self.subTest(label=label):
+                self.page.set_content('<form onsubmit="return false">'
+                    '<div id="prompt-textarea" contenteditable="true"></div>'
+                    + controls + '''
+                    <button type="button" id="done" aria-label="Submit dictation" hidden>Done</button>
+                    <button type="button" id="cancel" aria-label="Cancel dictation" hidden>Cancel</button>
+                    </form>''')
+                self.page.locator('button[aria-label="Dictate"]').evaluate('''(button, label) => {
+                    button.setAttribute('aria-label', label);
+                    button.onclick = () => {
+                        window.dictateClicked = true;
+                        document.querySelector('#done').hidden = false;
+                        document.querySelector('#cancel').hidden = false;
+                    };
+                }''', label)
+                self.page.locator('button[aria-label="Start Voice"]').evaluate('''button => {
+                    button.onclick = () => { window.voiceChatClicked = true; };
+                }''')
+                self.page.evaluate('''() => {
+                    window.dictateClicked = false;
+                    window.voiceChatClicked = false;
+                    document.querySelector('#done').onclick = () => {
+                        document.querySelector('#done').hidden = true;
+                        document.querySelector('#cancel').hidden = true;
+                        document.querySelector('#prompt-textarea').textContent = 'Dictated text';
+                    };
+                    document.querySelector('#cancel').onclick = () => {
+                        document.querySelector('#done').hidden = true;
+                        document.querySelector('#cancel').hidden = true;
+                    };
+                }''')
+                monitor = BrowserMonitor()
+                monitor._start_browser_dictation(self.page)
+                self.assertTrue(self.page.evaluate('window.dictateClicked'))
+                self.assertFalse(self.page.evaluate('window.voiceChatClicked'))
+                self.assertEqual(monitor._finish_browser_dictation(self.page, ""), "Dictated text")
+                monitor._start_browser_dictation(self.page)
+                self.assertEqual(monitor._cancel_browser_dictation(self.page, "Original text"), "Original text")
+                self.assertFalse(self.page.evaluate('window.voiceChatClicked'))
+
+    def test_dictation_click_returns_with_a_pending_navigation(self):
+        from unittest.mock import Mock, patch
+        from live_gpt.browser import DICTATION_END_SELECTORS
+        from playwright.sync_api import Error
+
+        controls = (Path(__file__).parent / "fixtures" / "chatgpt_dictate_controls.html").read_text(encoding="utf-8")
+        self.page.set_content(controls)
+        pending = []
+        self.page.route('https://navigation.example/dictation', lambda route: pending.append(route))
+        microphone = self.page.locator('button[aria-label="Dictate"]')
+        microphone.evaluate('''button => {
+            button.onclick = () => { location.href = 'https://navigation.example/dictation'; };
+        }''')
+        monitor = BrowserMonitor()
+        try:
+            # Isolate the post-click navigation wait from the application's
+            # separate listening check, already covered by the fixture above.
+            with patch.object(monitor, '_first_visible_locator', side_effect=[microphone, Mock()]) as find:
+                monitor._start_browser_dictation(self.page)
+            self.assertEqual(find.call_args.args[1], DICTATION_END_SELECTORS)
+        finally:
+            # Keep the pending navigation from blocking later page operations.
+            session = self.page.context.new_cdp_session(self.page)
+            session.send('Page.stopLoading')
+            session.detach()
+            for route in pending:
+                try:
+                    route.abort()
+                except Error:
+                    pass
+
+    def test_pasted_active_dictation_footer_stops_and_cancels_without_sending(self):
+        from live_gpt.browser import DICTATION_END_SELECTORS
+
+        fixtures = Path(__file__).parent / "fixtures"
+        idle = (fixtures / "chatgpt_dictate_controls.html").read_text(encoding="utf-8")
+        active = (fixtures / "chatgpt_active_dictation_controls.html").read_text(encoding="utf-8")
+        self.page.set_content('<form onsubmit="return false">'
+            '<div id="prompt-textarea" contenteditable="true">Original text</div>'
+            + idle + '<div id="active" hidden>' + active + '</div></form>'
+            '<button aria-label="Done" onclick="window.wrongControl=true">Unrelated Done</button>')
+        self.page.evaluate('''() => {
+            window.sentEarly = false;
+            window.wrongControl = false;
+            document.querySelector('[aria-label="Dictate"]').onclick = () => {
+                document.querySelector('#active').hidden = false;
+            };
+            document.querySelector('[aria-label="Stop dictation"]').onclick = () => {
+                document.querySelector('#active').hidden = true;
+                setTimeout(() => {
+                    document.querySelector('#prompt-textarea').textContent = 'Original text with transcription';
+                }, 400);
+            };
+            document.querySelector('[aria-label="Cancel dictation"]').onclick = () => {
+                document.querySelector('#active').hidden = true;
+            };
+            document.querySelector('[aria-label="Transcribe and send"]').onclick = () => {
+                window.sentEarly = true;
+            };
+        }''')
+        monitor = BrowserMonitor()
+        monitor._start_browser_dictation(self.page)
+        stop = monitor._first_visible_locator(self.page, DICTATION_END_SELECTORS, timeout=1000)
+        self.assertEqual(stop.get_attribute('aria-label'), 'Stop dictation')
+        self.assertEqual(
+            monitor._finish_browser_dictation(self.page, "Original text"),
+            "Original text with transcription",
+        )
+        monitor._start_browser_dictation(self.page)
+        self.assertEqual(monitor._cancel_browser_dictation(self.page, "Original text"), "Original text")
+        self.assertFalse(self.page.evaluate('window.sentEarly'))
+        self.assertFalse(self.page.evaluate('window.wrongControl'))
+
     def test_chinese_attachment_removal(self):
         self.page.set_content('''
             <button aria-label="移除附件" onclick="this.remove()">移除</button>

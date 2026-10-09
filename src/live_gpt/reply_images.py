@@ -246,10 +246,13 @@ class ImagePreviewDialog(QDialog):
         self._drag_offset = None
         self.setMinimumSize(360, 240)
         self.setStyleSheet("QDialog { background: #0c1224; } QLabel { color: #f5f7ff; }"
-                           "QPushButton { color: #f5f7ff; background: #243352; border: none; border-radius: 10px; padding: 10px; }")
+                           "QPushButton { color: #f5f7ff; background: #243352; border: none; border-radius: 10px; padding: 10px; }"
+                           "QPushButton:hover { background: #344768; }"
+                           "QPushButton#imageWindowButton { min-width: 40px; max-width: 40px; min-height: 40px; max-height: 40px; padding: 0; }")
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 16, 20, 20)
         self.title_bar = QWidget(self)
+        self.title_bar.setMinimumHeight(40)
         self.title_bar.installEventFilter(self)
         toolbar = QHBoxLayout(self.title_bar)
         toolbar.setContentsMargins(0, 0, 0, 0)
@@ -259,11 +262,13 @@ class ImagePreviewDialog(QDialog):
         title.installEventFilter(self)
         toolbar.addWidget(title, 1)
         self.maximize_button = QPushButton()
+        self.maximize_button.setObjectName("imageWindowButton")
         self.maximize_button.setIconSize(QSize(18, 18))
         self.maximize_button.setFixedSize(40, 40)
         self.maximize_button.clicked.connect(self._toggle_maximize)
         toolbar.addWidget(self.maximize_button)
         close = QPushButton()
+        close.setObjectName("imageWindowButton")
         close.setIcon(QIcon(str(Path(__file__).parent / "assets" / "exit.svg")))
         close.setIconSize(QSize(18, 18))
         close.setToolTip(tr("Close image"))
